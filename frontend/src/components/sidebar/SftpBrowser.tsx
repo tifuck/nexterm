@@ -14,6 +14,8 @@ import {
   ClipboardCopy,
   FilePlus,
   Home,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import { apiGet, apiDelete, apiPost, apiUpload } from '@/api/client';
 import { useTabStore } from '@/store/tabStore';
@@ -492,6 +494,9 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
   // New folder dialog
   const [showNewFolder, setShowNewFolder] = useState(false);
 
+  // Hidden files toggle (hidden by default)
+  const [showHidden, setShowHidden] = useState(false);
+
   // Refs to avoid stale closures in callbacks/intervals
   const currentPathRef = useRef(currentPath);
   currentPathRef.current = currentPath;
@@ -589,6 +594,10 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
   }, [connectionId, initialized, fetchDirectory]);
 
   const breadcrumbParts = currentPath.split('/').filter(Boolean);
+
+  const visibleEntries = showHidden
+    ? entries
+    : entries.filter((e) => !e.name.startsWith('.'));
 
   const handleBreadcrumbClick = useCallback(
     (index: number) => {
@@ -915,14 +924,53 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
         </div>
       )}
 
+      {/* Action bar */}
+      <div className="flex items-center gap-0.5 px-2 py-1 border-b border-[var(--border-primary)] min-h-[28px]">
+        <button
+          onClick={() => {
+            apiGet<{ path: string }>(`/api/sftp/${connectionId}/home`)
+              .then((res) => fetchDirectory(res.path))
+              .catch(() => {});
+          }}
+          className="text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors flex-shrink-0 p-1 rounded hover:bg-[var(--bg-hover)]"
+          title="Go to home directory"
+        >
+          <Home size={13} />
+        </button>
+        <button
+          onClick={() => setShowHidden((prev) => !prev)}
+          className={`transition-colors flex-shrink-0 p-1 rounded hover:bg-[var(--bg-hover)] ${
+            showHidden ? 'text-[var(--accent)]' : 'text-[var(--text-muted)] hover:text-[var(--accent)]'
+          }`}
+          title={showHidden ? 'Hide hidden files' : 'Show hidden files'}
+        >
+          {showHidden ? <Eye size={13} /> : <EyeOff size={13} />}
+        </button>
+        <div className="flex-1" />
+        <button
+          onClick={() => setShowNewFolder(true)}
+          className="text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors flex-shrink-0 p-1 rounded hover:bg-[var(--bg-hover)]"
+          title="New folder"
+        >
+          <FolderPlus size={13} />
+        </button>
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors flex-shrink-0 p-1 rounded hover:bg-[var(--bg-hover)]"
+          title="Upload file"
+        >
+          <Upload size={13} />
+        </button>
+      </div>
+
       {/* Breadcrumb path bar */}
-      <div className="flex items-center gap-0.5 px-2 py-1.5 border-b border-[var(--border-primary)] overflow-x-auto min-h-[28px]">
+      <div className="flex items-center gap-0.5 px-2 py-1 border-b border-[var(--border-primary)] overflow-x-auto min-h-[24px]">
         <button
           onClick={() => fetchDirectory('/')}
-          className="text-[10px] text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors flex-shrink-0"
+          className="text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors flex-shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)]"
           title="Go to root"
         >
-          /
+          <HardDrive size={11} />
         </button>
         {breadcrumbParts.map((part, idx) => (
           <React.Fragment key={idx}>
@@ -939,19 +987,7 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
             </button>
           </React.Fragment>
         ))}
-        {/* Home button */}
         <div className="flex-1" />
-        <button
-          onClick={() => {
-            apiGet<{ path: string }>(`/api/sftp/${connectionId}/home`)
-              .then((res) => fetchDirectory(res.path))
-              .catch(() => {});
-          }}
-          className="text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors flex-shrink-0 p-0.5"
-          title="Go to home directory"
-        >
-          <Home size={12} />
-        </button>
         <button
           onClick={() => fetchDirectory(currentPath)}
           className="text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors flex-shrink-0 p-0.5"
@@ -977,16 +1013,20 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
               Retry
             </button>
           </div>
-        ) : entries.length === 0 ? (
+        ) : visibleEntries.length === 0 ? (
           <div className="px-3 py-4 text-center">
-            <p className="text-xs text-[var(--text-muted)]">Empty directory</p>
+            <p className="text-xs text-[var(--text-muted)]">
+              {entries.length > 0 ? 'Only hidden files in this directory' : 'Empty directory'}
+            </p>
             <p className="text-[10px] text-[var(--text-muted)] mt-1">
-              Right-click for options or drag files to upload
+              {entries.length > 0
+                ? 'Toggle hidden files to view them'
+                : 'Right-click for options or drag files to upload'}
             </p>
           </div>
         ) : (
           <div className="py-1">
-            {entries.map((entry) => {
+            {visibleEntries.map((entry) => {
               const fullPath = buildFullPath(currentPath, entry.name);
               return (
                 <EntryRow

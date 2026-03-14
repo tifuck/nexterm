@@ -1,7 +1,8 @@
 """Server tools REST API for remote server management."""
 import json
 import logging
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from backend.config import config
 from backend.middleware.auth import get_current_user
 from backend.models.user import User
 from backend.services.ssh_proxy import ssh_proxy
@@ -24,16 +25,36 @@ from backend.schemas.tools import (
     FailedLogin,
     UserPrivilege,
     MalwareScanResponse,
-    FirewallStatus,
-    FirewallRule,
-    FirewallRuleAdd,
-    FirewallRuleDelete,
+    FirewallOverview,
+    FirewallBackendInfo,
+    ClientIpResponse,
+    UfwRule,
+    UfwStatus,
+    UfwRuleAdd,
+    UfwRuleEdit,
+    UfwRuleDelete,
+    UfwDefaultsUpdate,
+    IptablesRule,
+    IptablesStatus,
+    IptablesRuleAdd,
+    IptablesRuleDelete,
+    IptablesPolicyUpdate,
+    FirewalldRule,
+    FirewalldStatus,
+    FirewalldRuleAdd,
+    FirewalldRuleDelete,
+    FirewallSafetyWarning,
+    FirewallSafetyCheck,
+    FirewallSafetyRequest,
     PackageManagerInfo,
     PackageUpdatesResponse,
     PackageUpdateInfo,
     PackageSearchResult,
     PackageInfo,
     PackageActionRequest,
+    PackageCheckRequest,
+    PackageCheckResponse,
+    DockerInstallCheck,
     DockerInfo,
     DockerContainer,
     DockerContainersResponse,
@@ -41,17 +62,38 @@ from backend.schemas.tools import (
     DockerImage,
     DockerImagesResponse,
     DockerLogsRequest,
+    DockerPullImage,
+    DockerNetwork,
+    DockerNetworksResponse,
+    DockerNetworkCreate,
+    DockerVolume,
+    DockerVolumesResponse,
+    DockerVolumeCreate,
+    DockerComposeProject,
+    DockerComposeProjectsResponse,
+    DockerComposeAction,
+    DockerComposeFileRequest,
+    DockerComposeFileSave,
     WireGuardStatusResponse,
-    WireGuardInterface,
-    WireGuardPeer,
+    WireGuardClient,
+    WireGuardInstallCheck,
+    WireGuardAddClient,
+    WireGuardClientConfig,
+    WireGuardRemoveClient,
+    WireGuardToggleClient,
     WireGuardKeyPair,
-    WireGuardCreateConfig,
-    WireGuardAddPeer,
-    WireGuardRemovePeer,
     CronJob,
     CronListResponse,
     CronJobAdd,
+    CronJobUpdate,
     CronJobDelete,
+    CronJobToggle,
+    CronHistoryEntry,
+    CronHistoryResponse,
+    ServiceDetailResponse,
+    ServiceLogEntry,
+    ServiceLogsResponse,
+    ServiceUnitFileResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -184,8 +226,9 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   gpu_info=$(nvidia-smi --query-gpu=name,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)
 fi
 
-# Escape strings for JSON (backslashes first, then quotes, then control chars)
-_json_esc() { printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/ /g'; }
+# Escape strings for JSON — use double-quoted sed to avoid breaking
+# the outer sh -c single-quoted block (single quotes cannot be nested).
+_json_esc() { printf "%s" "$1" | sed "s/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g" | tr "\t" " "; }
 hn_esc=$(_json_esc "$hostname")
 km_esc=$(_json_esc "$kernel")
 on_esc=$(_json_esc "$os_name")
@@ -311,14 +354,75 @@ async def kill_process(
 SERVICES_SCRIPT = r"""
 if command -v systemctl >/dev/null 2>&1; then
   echo "INIT:systemd"
-  systemctl list-units --type=service --all --no-pager --plain --no-legend 2>/dev/null | awk '{
-    name=$1; load=$2; active=$3; sub=$4
-    desc=""
-    for(i=5;i<=NF;i++){desc=desc (i>5?" ":"") $i}
-    gsub(/\\/, "\\\\", desc)
-    gsub(/"/, "\\\"", desc)
-    printf "{\"name\":\"%s\",\"load_state\":\"%s\",\"active_state\":\"%s\",\"sub_state\":\"%s\",\"description\":\"%s\"}\n", name, load, active, sub, desc
-  }'
+  # Get list of all service units with their properties in one pass
+  systemctl list-units --type=service --all --no-pager --plain --no-legend 2>/dev/null | while IFS= read -r line; do
+    name=$(echo "$line" | awk '{print $1}')
+    load=$(echo "$line" | awk '{print $2}')
+    active=$(echo "$line" | awk '{print $3}')
+    sub=$(echo "$line" | awk '{print $4}')
+    desc=$(echo "$line" | awk '{for(i=5;i<=NF;i++) printf "%s ",$i; print ""}' | sed 's/ $//')
+    desc=$(printf '%s' "$desc" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+    # Get extra properties for this service
+    props=$(systemctl show "$name" --no-pager --property=UnitFileState,Type,MainPID,MemoryCurrent,CPUUsageNSec,ActiveEnterTimestamp 2>/dev/null)
+    enabled=$(echo "$props" | grep '^UnitFileState=' | cut -d= -f2-)
+    stype=$(echo "$props" | grep '^Type=' | cut -d= -f2-)
+    mpid=$(echo "$props" | grep '^MainPID=' | cut -d= -f2-)
+    memraw=$(echo "$props" | grep '^MemoryCurrent=' | cut -d= -f2-)
+    cpuraw=$(echo "$props" | grep '^CPUUsageNSec=' | cut -d= -f2-)
+    started=$(echo "$props" | grep '^ActiveEnterTimestamp=' | cut -d= -f2-)
+
+    # Convert memory from bytes to human-readable
+    mem=""
+    if [ -n "$memraw" ] && [ "$memraw" != "[not set]" ] && [ "$memraw" -gt 0 ] 2>/dev/null; then
+      if [ "$memraw" -ge 1073741824 ]; then
+        mem="$(awk "BEGIN{printf \"%.1f\", $memraw/1073741824}")G"
+      elif [ "$memraw" -ge 1048576 ]; then
+        mem="$(awk "BEGIN{printf \"%.1f\", $memraw/1048576}")M"
+      elif [ "$memraw" -ge 1024 ]; then
+        mem="$(awk "BEGIN{printf \"%.0f\", $memraw/1024}")K"
+      else
+        mem="${memraw}B"
+      fi
+    fi
+
+    # Convert CPU from nanoseconds to human-readable
+    cpu=""
+    if [ -n "$cpuraw" ] && [ "$cpuraw" != "[not set]" ] && [ "$cpuraw" -gt 0 ] 2>/dev/null; then
+      cpu_ms=$(awk "BEGIN{printf \"%.0f\", $cpuraw/1000000}")
+      if [ "$cpu_ms" -ge 60000 ]; then
+        cpu="$(awk "BEGIN{printf \"%.1f\", $cpu_ms/60000}")min"
+      elif [ "$cpu_ms" -ge 1000 ]; then
+        cpu="$(awk "BEGIN{printf \"%.1f\", $cpu_ms/1000}")s"
+      else
+        cpu="${cpu_ms}ms"
+      fi
+    fi
+
+    # Compute uptime if active
+    uptime=""
+    if [ "$active" = "active" ] && [ -n "$started" ] && [ "$started" != "" ]; then
+      start_epoch=$(date -d "$started" +%s 2>/dev/null)
+      if [ -n "$start_epoch" ]; then
+        now_epoch=$(date +%s)
+        diff=$((now_epoch - start_epoch))
+        if [ "$diff" -ge 86400 ]; then
+          uptime="$(( diff / 86400 ))d $(( (diff % 86400) / 3600 ))h"
+        elif [ "$diff" -ge 3600 ]; then
+          uptime="$(( diff / 3600 ))h $(( (diff % 3600) / 60 ))m"
+        elif [ "$diff" -ge 60 ]; then
+          uptime="$(( diff / 60 ))m $(( diff % 60 ))s"
+        else
+          uptime="${diff}s"
+        fi
+      fi
+    fi
+
+    started_esc=$(printf '%s' "$started" | sed 's/"/\\"/g')
+
+    printf '{"name":"%s","load_state":"%s","active_state":"%s","sub_state":"%s","description":"%s","enabled":"%s","service_type":"%s","main_pid":%s,"memory":"%s","cpu":"%s","started_at":"%s","uptime":"%s"}\n' \
+      "$name" "$load" "$active" "$sub" "$desc" "$enabled" "$stype" "${mpid:-0}" "$mem" "$cpu" "$started_esc" "$uptime"
+  done
 elif command -v service >/dev/null 2>&1; then
   echo "INIT:sysvinit"
   service --status-all 2>/dev/null | while read -r bracket status bracket2 name; do
@@ -329,7 +433,7 @@ elif command -v service >/dev/null 2>&1; then
     else
       active="unknown"; sub="unknown"
     fi
-    printf '{"name":"%s.service","load_state":"loaded","active_state":"%s","sub_state":"%s","description":""}\n' \
+    printf '{"name":"%s.service","load_state":"loaded","active_state":"%s","sub_state":"%s","description":"","enabled":"","service_type":"","main_pid":0,"memory":"","cpu":"","started_at":"","uptime":""}\n' \
       "$name" "$active" "$sub"
   done
 else
@@ -338,15 +442,22 @@ fi
 """
 
 
+SERVICE_DETAIL_SCRIPT_TEMPLATE = 'systemctl show {name} --no-pager 2>/dev/null'
+
+SERVICE_LOGS_SCRIPT_TEMPLATE = 'journalctl -u {name} --no-pager -n {lines} --output=short-iso 2>/dev/null || echo "JOURNALCTL_UNAVAILABLE"'
+
+SERVICE_UNIT_FILE_SCRIPT_TEMPLATE = 'systemctl cat {name} 2>/dev/null; echo "UNIT_EXIT:$?"'
+
+
 @router.get("/{connection_id}/services", response_model=ServiceListResponse)
 async def list_services(
     connection_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    """List system services."""
+    """List system services with extended info."""
     await _verify_connection(connection_id, current_user)
 
-    result = await _run(connection_id, SERVICES_SCRIPT, timeout=15)
+    result = await _run(connection_id, SERVICES_SCRIPT, timeout=30)
     stdout = result.get("stdout", "").strip()
 
     services = []
@@ -366,7 +477,20 @@ async def list_services(
             except (json.JSONDecodeError, Exception):
                 continue
 
-    return ServiceListResponse(services=services, init_system=init_system)
+    running = sum(1 for s in services if s.active_state == "active")
+    failed = sum(1 for s in services if s.active_state == "failed")
+    inactive = sum(1 for s in services if s.active_state == "inactive")
+    enabled_count = sum(1 for s in services if s.enabled in ("enabled", "enabled-runtime"))
+
+    return ServiceListResponse(
+        services=services,
+        init_system=init_system,
+        total=len(services),
+        running=running,
+        failed=failed,
+        inactive=inactive,
+        enabled_count=enabled_count,
+    )
 
 
 @router.post("/{connection_id}/services/{service_name}/{action}")
@@ -407,6 +531,142 @@ async def service_action(
         raise HTTPException(status_code=400, detail=error_msg)
 
     return {"message": f"Service {service_name} {action} successful"}
+
+
+@router.get("/{connection_id}/services/{service_name}/detail", response_model=ServiceDetailResponse)
+async def get_service_detail(
+    connection_id: str,
+    service_name: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Get detailed information about a specific systemd service."""
+    await _verify_connection(connection_id, current_user)
+
+    if not service_name.replace(".", "").replace("-", "").replace("_", "").replace("@", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid service name")
+
+    cmd = SERVICE_DETAIL_SCRIPT_TEMPLATE.format(name=_sanitize_shell(service_name))
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    props = {}
+    for line in stdout.split("\n"):
+        if "=" in line:
+            key, _, value = line.partition("=")
+            props[key.strip()] = value.strip()
+
+    def split_list(val: str) -> list[str]:
+        return [v.strip() for v in val.split() if v.strip()] if val else []
+
+    return ServiceDetailResponse(
+        name=service_name,
+        description=props.get("Description", ""),
+        load_state=props.get("LoadState", ""),
+        active_state=props.get("ActiveState", ""),
+        sub_state=props.get("SubState", ""),
+        enabled=props.get("UnitFileState", ""),
+        service_type=props.get("Type", ""),
+        main_pid=int(props.get("MainPID", "0") or "0"),
+        exec_main_pid=int(props.get("ExecMainPID", "0") or "0"),
+        memory_current=props.get("MemoryCurrent", ""),
+        cpu_usage=props.get("CPUUsageNSec", ""),
+        tasks_current=props.get("TasksCurrent", ""),
+        restart_policy=props.get("Restart", ""),
+        restart_count=int(props.get("NRestarts", "0") or "0"),
+        started_at=props.get("ActiveEnterTimestamp", ""),
+        active_enter=props.get("ActiveEnterTimestamp", ""),
+        inactive_enter=props.get("InactiveEnterTimestamp", ""),
+        unit_file_path=props.get("UnitFilePreset", ""),
+        fragment_path=props.get("FragmentPath", ""),
+        wants=split_list(props.get("Wants", "")),
+        required_by=split_list(props.get("RequiredBy", "")),
+        after=split_list(props.get("After", "")),
+        before=split_list(props.get("Before", "")),
+        environment=split_list(props.get("Environment", "")),
+        exec_start=props.get("ExecStart", ""),
+        user=props.get("User", ""),
+        group=props.get("Group", ""),
+        working_directory=props.get("WorkingDirectory", ""),
+        root_directory=props.get("RootDirectory", ""),
+        properties=props,
+    )
+
+
+@router.get("/{connection_id}/services/{service_name}/logs", response_model=ServiceLogsResponse)
+async def get_service_logs(
+    connection_id: str,
+    service_name: str,
+    lines: int = Query(default=100, ge=1, le=1000),
+    current_user: User = Depends(get_current_user),
+):
+    """Get recent journal log entries for a service."""
+    await _verify_connection(connection_id, current_user)
+
+    if not service_name.replace(".", "").replace("-", "").replace("_", "").replace("@", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid service name")
+
+    cmd = SERVICE_LOGS_SCRIPT_TEMPLATE.format(
+        name=_sanitize_shell(service_name),
+        lines=min(lines, 1000),
+    )
+    result = await _run(connection_id, cmd, timeout=15)
+    stdout = result.get("stdout", "").strip()
+
+    log_entries: list[ServiceLogEntry] = []
+    if stdout and "JOURNALCTL_UNAVAILABLE" not in stdout:
+        for line in stdout.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # Parse ISO format: 2024-01-15T10:30:00+0000 hostname unit[pid]: message
+            parts = line.split(" ", 3)
+            timestamp = parts[0] if len(parts) > 0 else ""
+            message = parts[3] if len(parts) > 3 else parts[-1] if parts else line
+            log_entries.append(ServiceLogEntry(
+                timestamp=timestamp,
+                message=message,
+                priority="",
+            ))
+
+    return ServiceLogsResponse(
+        lines=log_entries,
+        unit=service_name,
+        total=len(log_entries),
+    )
+
+
+@router.get("/{connection_id}/services/{service_name}/unit-file", response_model=ServiceUnitFileResponse)
+async def get_service_unit_file(
+    connection_id: str,
+    service_name: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Get the unit file contents for a service."""
+    await _verify_connection(connection_id, current_user)
+
+    if not service_name.replace(".", "").replace("-", "").replace("_", "").replace("@", "").isalnum():
+        raise HTTPException(status_code=400, detail="Invalid service name")
+
+    cmd = SERVICE_UNIT_FILE_SCRIPT_TEMPLATE.format(name=_sanitize_shell(service_name))
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    content = ""
+    path = ""
+    for line in stdout.split("\n"):
+        if line.startswith("UNIT_EXIT:"):
+            continue
+        if line.startswith("# /") and not content:
+            path = line[2:].strip()
+            content += line + "\n"
+        else:
+            content += line + "\n"
+
+    return ServiceUnitFileResponse(
+        path=path,
+        content=content.strip(),
+        unit=service_name,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -871,255 +1131,1088 @@ async def malware_scan(
 
 
 # ---------------------------------------------------------------------------
-# Firewall
+# Firewall: Client IP
 # ---------------------------------------------------------------------------
 
-FIREWALL_STATUS_SCRIPT = r"""
+@router.get("/client-ip", response_model=ClientIpResponse)
+async def get_client_ip(request: Request):
+    """Return the IP address of the visitor making the request."""
+    ip = ""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        ip = forwarded.split(",")[0].strip()
+    if not ip:
+        ip = request.headers.get("x-real-ip", "").strip()
+    if not ip and request.client:
+        ip = request.client.host
+    return ClientIpResponse(ip=ip or "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Firewall: Overview
+# ---------------------------------------------------------------------------
+
+FIREWALL_OVERVIEW_SCRIPT = r"""
 sh -c '
+# --- UFW ---
 if command -v ufw >/dev/null 2>&1; then
-  echo "BACKEND:ufw"
-  status=$(sudo ufw status verbose 2>/dev/null)
-  if echo "$status" | grep -q "Status: active"; then
-    echo "ACTIVE:true"
-  else
-    echo "ACTIVE:false"
+  ufw_ver=$(ufw version 2>/dev/null | head -1 | grep -oP "[0-9]+\.[0-9]+[0-9.]*" || echo "")
+  ufw_status=$(sudo ufw status verbose 2>/dev/null)
+  ufw_active="false"
+  ufw_rules=0
+  ufw_def_in=""
+  ufw_def_out=""
+  if echo "$ufw_status" | grep -q "Status: active"; then
+    ufw_active="true"
   fi
-  # Extract defaults
-  def_in=$(echo "$status" | grep "Default:" | head -1 | grep -oP "incoming\)\s*\K\w+" || echo "")
-  def_out=$(echo "$status" | grep "Default:" | head -1 | grep -oP "outgoing\)\s*\K\w+" || echo "")
-  [ -z "$def_in" ] && def_in=$(echo "$status" | grep -oP "Default:.*deny \(incoming\)" >/dev/null && echo "deny" || echo "")
-  echo "DEFAULTS:${def_in}:${def_out}"
-  # Rules
-  echo "RULES_START"
-  sudo ufw status numbered 2>/dev/null | grep "^\[" | while IFS= read -r line; do
-    num=$(echo "$line" | grep -oP "^\[\s*\K\d+")
-    rest=$(echo "$line" | sed 's/^\[\s*[0-9]*\]\s*//')
-    action=$(echo "$rest" | awk "{print \$1}")
-    direction=$(echo "$rest" | awk "{print \$2}")
-    raw_esc=$(printf "%s" "$rest" | sed "s/\"/\\\\\"/g")
-    printf "{\"number\":%s,\"action\":\"%s\",\"direction\":\"%s\",\"raw\":\"%s\"}\n" "$num" "$action" "$direction" "$raw_esc"
-  done
-  echo "RULES_END"
-elif command -v firewall-cmd >/dev/null 2>&1; then
-  echo "BACKEND:firewalld"
-  state=$(sudo firewall-cmd --state 2>/dev/null)
-  if [ "$state" = "running" ]; then
-    echo "ACTIVE:true"
-  else
-    echo "ACTIVE:false"
-  fi
-  echo "DEFAULTS::"
-  echo "RULES_START"
-  sudo firewall-cmd --list-all 2>/dev/null | grep -E "^\s+(services|ports|rich rules):" | while IFS= read -r line; do
-    raw_esc=$(printf "%s" "$line" | sed "s/^\s*//;s/\"/\\\\\"/g")
-    printf "{\"number\":0,\"action\":\"allow\",\"direction\":\"in\",\"raw\":\"%s\"}\n" "$raw_esc"
-  done
-  echo "RULES_END"
-elif command -v iptables >/dev/null 2>&1; then
-  echo "BACKEND:iptables"
-  echo "ACTIVE:true"
-  echo "DEFAULTS::"
-  echo "RULES_START"
-  sudo iptables -L -n --line-numbers 2>/dev/null | grep -E "^[0-9]" | while IFS= read -r line; do
-    num=$(echo "$line" | awk "{print \$1}")
-    action=$(echo "$line" | awk "{print \$2}")
-    raw_esc=$(printf "%s" "$line" | sed "s/\"/\\\\\"/g")
-    printf "{\"number\":%s,\"action\":\"%s\",\"direction\":\"in\",\"raw\":\"%s\"}\n" "$num" "$action" "$raw_esc"
-  done
-  echo "RULES_END"
+  ufw_rules=$(sudo ufw status numbered 2>/dev/null | grep -c "^\[" || echo "0")
+  ufw_def_in=$(echo "$ufw_status" | grep "Default:" | head -1 | sed -n "s/.*Default: \([a-z]*\) (incoming).*/\1/p")
+  ufw_def_out=$(echo "$ufw_status" | grep "Default:" | head -1 | sed -n "s/.*, \([a-z]*\) (outgoing).*/\1/p")
+  printf "UFW_INFO:%s|%s|%s|%s|%s\n" "$ufw_ver" "$ufw_active" "$ufw_rules" "$ufw_def_in" "$ufw_def_out"
 else
-  echo "BACKEND:none"
-  echo "ACTIVE:false"
-  echo "DEFAULTS::"
-  echo "RULES_START"
-  echo "RULES_END"
+  echo "UFW_INFO:not_installed"
 fi
+
+# --- iptables ---
+if command -v iptables >/dev/null 2>&1; then
+  ipt_ver=$(iptables --version 2>/dev/null | grep -oP "[0-9]+\.[0-9]+[0-9.]*" || echo "")
+  ipt_rules=$(sudo iptables -L INPUT -n --line-numbers 2>/dev/null | grep -c "^[0-9]" || echo "0")
+  ipt_rules=$((ipt_rules + $(sudo iptables -L OUTPUT -n --line-numbers 2>/dev/null | grep -c "^[0-9]" || echo "0")))
+  ipt_rules=$((ipt_rules + $(sudo iptables -L FORWARD -n --line-numbers 2>/dev/null | grep -c "^[0-9]" || echo "0")))
+  ipt_pol_in=$(sudo iptables -L INPUT -n 2>/dev/null | head -1 | grep -oP "\(policy \K[A-Z]+" || echo "")
+  ipt_pol_out=$(sudo iptables -L OUTPUT -n 2>/dev/null | head -1 | grep -oP "\(policy \K[A-Z]+" || echo "")
+  printf "IPTABLES_INFO:%s|%s|%s|%s\n" "$ipt_ver" "$ipt_rules" "$ipt_pol_in" "$ipt_pol_out"
+else
+  echo "IPTABLES_INFO:not_installed"
+fi
+
+# --- firewalld ---
+if command -v firewall-cmd >/dev/null 2>&1; then
+  fwd_ver=$(sudo firewall-cmd --version 2>/dev/null || echo "")
+  fwd_state=$(sudo firewall-cmd --state 2>/dev/null || echo "not running")
+  fwd_active="false"
+  [ "$fwd_state" = "running" ] && fwd_active="true"
+  fwd_rules=0
+  if [ "$fwd_active" = "true" ]; then
+    fwd_rules=$(sudo firewall-cmd --list-all 2>/dev/null | grep -cE "^\s+(services|ports|rich rules):" || echo "0")
+  fi
+  fwd_zone=$(sudo firewall-cmd --get-default-zone 2>/dev/null || echo "")
+  printf "FIREWALLD_INFO:%s|%s|%s|%s\n" "$fwd_ver" "$fwd_active" "$fwd_rules" "$fwd_zone"
+else
+  echo "FIREWALLD_INFO:not_installed"
+fi
+
+# --- Server IPs ---
+public_ip=$(wget -T 5 -t 1 -4qO- "http://ip1.dynupdate.no-ip.com/" 2>/dev/null || curl -m 5 -4Ls "http://ip1.dynupdate.no-ip.com/" 2>/dev/null || echo "")
+printf "PUBLIC_IP:%s\n" "$public_ip"
+
+echo "LOCAL_IPS_START"
+ip -4 addr show 2>/dev/null | grep "inet " | awk "{print \$2}" | cut -d/ -f1 | grep -v "^127\." | while read -r lip; do
+  echo "$lip"
+done
+echo "LOCAL_IPS_END"
+
+# --- SSH port ---
+ssh_port=$(ss -tlnp 2>/dev/null | grep -E "sshd|dropbear" | head -1 | grep -oP ":\K[0-9]+" | head -1 || echo "22")
+[ -z "$ssh_port" ] && ssh_port="22"
+printf "SSH_PORT:%s\n" "$ssh_port"
 ' 2>/dev/null
 """
 
 
-@router.get("/{connection_id}/firewall", response_model=FirewallStatus)
-async def get_firewall_status(
+@router.get("/{connection_id}/firewall/overview", response_model=FirewallOverview)
+async def get_firewall_overview(
     connection_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    """Get firewall status and rules."""
+    """Detect all firewall backends, their status, and server network info."""
     await _verify_connection(connection_id, current_user)
 
-    result = await _run(connection_id, FIREWALL_STATUS_SCRIPT, timeout=10)
+    result = await _run(connection_id, FIREWALL_OVERVIEW_SCRIPT, timeout=15)
     stdout = result.get("stdout", "").strip()
 
-    backend = ""
+    backends: list[FirewallBackendInfo] = []
+    server_public_ip = ""
+    server_local_ips: list[str] = []
+    ssh_port = 22
+    in_local_ips = False
+    primary_backend = ""
+
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if line.startswith("UFW_INFO:"):
+            val = line.split(":", 1)[1]
+            if val == "not_installed":
+                backends.append(FirewallBackendInfo(name="ufw", installed=False))
+            else:
+                parts = val.split("|")
+                active = parts[1] == "true" if len(parts) > 1 else False
+                b = FirewallBackendInfo(
+                    name="ufw",
+                    installed=True,
+                    active=active,
+                    version=parts[0] if parts else "",
+                    rules_count=int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0,
+                    default_incoming=parts[3] if len(parts) > 3 else "",
+                    default_outgoing=parts[4] if len(parts) > 4 else "",
+                )
+                backends.append(b)
+                if active and not primary_backend:
+                    primary_backend = "ufw"
+        elif line.startswith("IPTABLES_INFO:"):
+            val = line.split(":", 1)[1]
+            if val == "not_installed":
+                backends.append(FirewallBackendInfo(name="iptables", installed=False))
+            else:
+                parts = val.split("|")
+                rules_count = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                b = FirewallBackendInfo(
+                    name="iptables",
+                    installed=True,
+                    active=True,
+                    version=parts[0] if parts else "",
+                    rules_count=rules_count,
+                    default_incoming=parts[2] if len(parts) > 2 else "",
+                    default_outgoing=parts[3] if len(parts) > 3 else "",
+                )
+                backends.append(b)
+                if not primary_backend and rules_count > 0:
+                    primary_backend = "iptables"
+        elif line.startswith("FIREWALLD_INFO:"):
+            val = line.split(":", 1)[1]
+            if val == "not_installed":
+                backends.append(FirewallBackendInfo(name="firewalld", installed=False))
+            else:
+                parts = val.split("|")
+                active = parts[1] == "true" if len(parts) > 1 else False
+                b = FirewallBackendInfo(
+                    name="firewalld",
+                    installed=True,
+                    active=active,
+                    version=parts[0] if parts else "",
+                    rules_count=int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0,
+                    default_incoming=parts[3] if len(parts) > 3 else "",
+                )
+                backends.append(b)
+                if active and not primary_backend:
+                    primary_backend = "firewalld"
+        elif line.startswith("PUBLIC_IP:"):
+            server_public_ip = line.split(":", 1)[1]
+        elif line == "LOCAL_IPS_START":
+            in_local_ips = True
+        elif line == "LOCAL_IPS_END":
+            in_local_ips = False
+        elif in_local_ips and line:
+            server_local_ips.append(line)
+        elif line.startswith("SSH_PORT:"):
+            try:
+                ssh_port = int(line.split(":", 1)[1])
+            except ValueError:
+                ssh_port = 22
+
+    # If no primary backend was set, pick first active one
+    if not primary_backend:
+        for b in backends:
+            if b.installed and b.active:
+                primary_backend = b.name
+                break
+
+    return FirewallOverview(
+        backends=backends,
+        primary_backend=primary_backend,
+        server_public_ip=server_public_ip,
+        server_local_ips=server_local_ips,
+        dashboard_port=config.port,
+        ssh_port=ssh_port,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Firewall: UFW
+# ---------------------------------------------------------------------------
+
+UFW_STATUS_SCRIPT = r"""
+sh -c '
+if ! command -v ufw >/dev/null 2>&1; then
+  echo "ERROR:UFW is not installed"
+  exit 0
+fi
+ufw_ver=$(ufw version 2>/dev/null | head -1 | grep -oP "[0-9]+\.[0-9]+[0-9.]*" || echo "")
+printf "VERSION:%s\n" "$ufw_ver"
+
+status=$(sudo ufw status verbose 2>/dev/null)
+if echo "$status" | grep -q "Status: active"; then
+  echo "ACTIVE:true"
+else
+  echo "ACTIVE:false"
+fi
+
+# Logging level
+log_level=$(echo "$status" | grep "^Logging:" | sed "s/^Logging: //" || echo "")
+printf "LOGGING:%s\n" "$log_level"
+
+# Defaults
+def_in=$(echo "$status" | grep "Default:" | head -1 | sed -n "s/.*Default: \([a-z]*\) (incoming).*/\1/p")
+def_out=$(echo "$status" | grep "Default:" | head -1 | sed -n "s/.*, \([a-z]*\) (outgoing).*/\1/p")
+def_routed=$(echo "$status" | grep "Default:" | head -1 | sed -n "s/.*, \([a-z]*\) (routed).*/\1/p")
+printf "DEFAULTS:%s|%s|%s\n" "$def_in" "$def_out" "$def_routed"
+
+echo "RULES_START"
+sudo ufw status numbered 2>/dev/null | grep "^\[" | while IFS= read -r line; do
+  num=$(echo "$line" | grep -oP "^\[\s*\K\d+")
+  rest=$(echo "$line" | sed "s/^\[\s*[0-9]*\]\s*//")
+  v6="false"
+  echo "$rest" | grep -q "(v6)" && v6="true"
+
+  # Parse action
+  action=$(echo "$rest" | awk "{print \$1}" | tr "[:upper:]" "[:lower:]")
+
+  # Parse direction
+  direction="in"
+  echo "$rest" | grep -qi "out" && direction="out"
+
+  # Parse protocol from the raw line
+  proto=""
+  if echo "$rest" | grep -qi "/tcp"; then
+    proto="tcp"
+  elif echo "$rest" | grep -qi "/udp"; then
+    proto="udp"
+  fi
+
+  # Extract port
+  port=""
+  if echo "$rest" | grep -qP "\d+(/tcp|/udp)?"; then
+    port=$(echo "$rest" | grep -oP "\d+([:/]\d+)?(?=/tcp|/udp| )" | head -1)
+  fi
+  [ -z "$port" ] && port=$(echo "$rest" | grep -oP "^\S+" | grep -oP "\d+([:/]\d+)?" | head -1)
+
+  # Extract from IP
+  from_ip="Anywhere"
+  if echo "$rest" | grep -q "from"; then
+    from_ip=$(echo "$rest" | sed -n "s/.*from \([^ ]*\).*/\1/p")
+  fi
+
+  # Extract comment
+  comment=""
+  if echo "$rest" | grep -q "# "; then
+    comment=$(echo "$rest" | sed "s/.*# //")
+  fi
+
+  raw_esc=$(printf "%s" "$rest" | sed "s/\"/\\\\\"/g")
+  from_esc=$(printf "%s" "$from_ip" | sed "s/\"/\\\\\"/g")
+  comment_esc=$(printf "%s" "$comment" | sed "s/\"/\\\\\"/g")
+  printf "{\"number\":%s,\"action\":\"%s\",\"direction\":\"%s\",\"protocol\":\"%s\",\"port\":\"%s\",\"from_ip\":\"%s\",\"to_ip\":\"any\",\"v6\":%s,\"raw\":\"%s\",\"comment\":\"%s\"}\n" \
+    "$num" "$action" "$direction" "$proto" "$port" "$from_esc" "$v6" "$raw_esc" "$comment_esc"
+done
+echo "RULES_END"
+' 2>/dev/null
+"""
+
+
+@router.get("/{connection_id}/firewall/ufw/status", response_model=UfwStatus)
+async def get_ufw_status(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Get full UFW status and rules."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, UFW_STATUS_SCRIPT, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    if "ERROR:" in stdout:
+        raise HTTPException(status_code=400, detail=stdout.split("ERROR:", 1)[1])
+
+    version = ""
     active = False
-    rules: list[FirewallRule] = []
+    logging_level = ""
     default_incoming = ""
     default_outgoing = ""
+    default_routed = ""
+    rules: list[UfwRule] = []
     in_rules = False
 
     for line in stdout.split("\n"):
         line = line.strip()
-        if line.startswith("BACKEND:"):
-            backend = line.split(":", 1)[1]
+        if line.startswith("VERSION:"):
+            version = line.split(":", 1)[1]
         elif line.startswith("ACTIVE:"):
             active = line.split(":", 1)[1] == "true"
+        elif line.startswith("LOGGING:"):
+            logging_level = line.split(":", 1)[1]
         elif line.startswith("DEFAULTS:"):
-            parts = line.split(":", 2)
-            if len(parts) >= 3:
-                default_incoming = parts[1]
-                default_outgoing = parts[2]
+            parts = line.split(":", 1)[1].split("|")
+            default_incoming = parts[0] if len(parts) > 0 else ""
+            default_outgoing = parts[1] if len(parts) > 1 else ""
+            default_routed = parts[2] if len(parts) > 2 else ""
         elif line == "RULES_START":
             in_rules = True
         elif line == "RULES_END":
             in_rules = False
         elif in_rules and line:
             try:
-                rules.append(FirewallRule(**json.loads(line)))
+                rules.append(UfwRule(**json.loads(line)))
             except Exception:
                 continue
 
-    return FirewallStatus(
-        backend=backend,
+    return UfwStatus(
         active=active,
-        rules=rules,
+        version=version,
+        logging=logging_level,
         default_incoming=default_incoming,
         default_outgoing=default_outgoing,
+        default_routed=default_routed,
+        rules=rules,
     )
 
 
-@router.post("/{connection_id}/firewall/toggle")
-async def toggle_firewall(
+@router.post("/{connection_id}/firewall/ufw/toggle")
+async def toggle_ufw(
     connection_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    """Enable or disable the firewall."""
+    """Enable or disable UFW."""
     await _verify_connection(connection_id, current_user)
 
-    # Detect backend and current state
-    detect = await _run(
-        connection_id,
-        "command -v ufw >/dev/null 2>&1 && echo 'ufw' || (command -v firewall-cmd >/dev/null 2>&1 && echo 'firewalld' || echo 'none')",
-        timeout=5,
-    )
-    backend = detect.get("stdout", "").strip()
-
-    if backend == "ufw":
-        # Check current state
-        status = await _run(connection_id, "sudo ufw status 2>/dev/null", timeout=5)
-        is_active = "Status: active" in status.get("stdout", "")
-        if is_active:
-            cmd = "echo 'y' | sudo ufw disable 2>&1; echo EXIT:$?"
-        else:
-            cmd = "echo 'y' | sudo ufw enable 2>&1; echo EXIT:$?"
-    elif backend == "firewalld":
-        status = await _run(connection_id, "sudo firewall-cmd --state 2>/dev/null", timeout=5)
-        is_active = status.get("stdout", "").strip() == "running"
-        if is_active:
-            cmd = "sudo systemctl stop firewalld 2>&1; echo EXIT:$?"
-        else:
-            cmd = "sudo systemctl start firewalld 2>&1; echo EXIT:$?"
+    status = await _run(connection_id, "sudo ufw status 2>/dev/null", timeout=5)
+    is_active = "Status: active" in status.get("stdout", "")
+    if is_active:
+        cmd = "echo 'y' | sudo ufw disable 2>&1; echo EXIT:$?"
     else:
-        raise HTTPException(status_code=400, detail="No supported firewall found (ufw or firewalld)")
+        cmd = "echo 'y' | sudo ufw enable 2>&1; echo EXIT:$?"
 
     result = await _run(connection_id, cmd, timeout=10)
     stdout = result.get("stdout", "").strip()
-
-    exit_code = "1"
-    for line in stdout.split("\n"):
-        if line.startswith("EXIT:"):
-            exit_code = line.replace("EXIT:", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
 
     if exit_code != "0":
-        raise HTTPException(status_code=400, detail=f"Failed to toggle firewall: {stdout}")
+        raise HTTPException(status_code=400, detail=f"Failed to toggle UFW: {clean}")
 
-    return {"message": "Firewall toggled successfully"}
+    return {"message": f"UFW {'disabled' if is_active else 'enabled'} successfully"}
 
 
-@router.post("/{connection_id}/firewall/add-rule")
-async def add_firewall_rule(
+@router.post("/{connection_id}/firewall/ufw/add-rule")
+async def add_ufw_rule(
     connection_id: str,
-    request: FirewallRuleAdd,
+    request: UfwRuleAdd,
     current_user: User = Depends(get_current_user),
 ):
-    """Add a firewall rule."""
+    """Add a UFW rule."""
     await _verify_connection(connection_id, current_user)
 
-    # Sanitize inputs
     port = _sanitize_shell(request.port)
-    source = _sanitize_shell(request.source)
+    from_ip = _sanitize_shell(request.from_ip)
+    to_ip = _sanitize_shell(request.to_ip)
+    comment = _sanitize_shell(request.comment)
 
-    detect = await _run(
-        connection_id,
-        "command -v ufw >/dev/null 2>&1 && echo 'ufw' || (command -v firewall-cmd >/dev/null 2>&1 && echo 'firewalld' || echo 'none')",
-        timeout=5,
-    )
-    backend = detect.get("stdout", "").strip()
-
-    if backend == "ufw":
-        parts = ["sudo", "ufw"]
-        parts.append(request.action)
-        if request.direction == "out":
-            parts.append("out")
-        if source != "any":
-            parts.append(f"from {source}")
-        parts.append(f"to any port {port}")
+    parts = ["sudo", "ufw"]
+    parts.append(request.action)
+    if request.direction == "out":
+        parts.append("out")
+    if from_ip and from_ip != "any":
+        parts.append(f"from {from_ip}")
+    if port:
+        if to_ip and to_ip != "any":
+            parts.append(f"to {to_ip}")
+            parts.append(f"port {port}")
+        else:
+            parts.append(f"to any port {port}")
         if request.protocol != "any":
             parts.append(f"proto {request.protocol}")
-        cmd = " ".join(parts) + " 2>&1; echo EXIT:$?"
-    elif backend == "firewalld":
-        if request.action in ("allow",):
-            cmd = f"sudo firewall-cmd --permanent --add-port={port}/{request.protocol} 2>&1 && sudo firewall-cmd --reload 2>&1; echo EXIT:$?"
-        else:
-            cmd = f"sudo firewall-cmd --permanent --remove-port={port}/{request.protocol} 2>&1 && sudo firewall-cmd --reload 2>&1; echo EXIT:$?"
-    else:
-        raise HTTPException(status_code=400, detail="No supported firewall found")
+    elif to_ip and to_ip != "any":
+        parts.append(f"to {to_ip}")
+    if comment:
+        parts.append(f"comment '{comment}'")
+    cmd = " ".join(parts) + " 2>&1; echo EXIT:$?"
 
     result = await _run(connection_id, cmd, timeout=10)
     stdout = result.get("stdout", "").strip()
-
-    exit_code = "1"
-    for line in stdout.split("\n"):
-        if line.startswith("EXIT:"):
-            exit_code = line.replace("EXIT:", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
 
     if exit_code != "0":
-        raise HTTPException(status_code=400, detail=f"Failed to add rule: {stdout}")
+        raise HTTPException(status_code=400, detail=f"Failed to add rule: {clean}")
 
-    return {"message": "Firewall rule added"}
+    return {"message": "UFW rule added"}
 
 
-@router.post("/{connection_id}/firewall/delete-rule")
-async def delete_firewall_rule(
+@router.post("/{connection_id}/firewall/ufw/edit-rule")
+async def edit_ufw_rule(
     connection_id: str,
-    request: FirewallRuleDelete,
+    request: UfwRuleEdit,
     current_user: User = Depends(get_current_user),
 ):
-    """Delete a firewall rule by number."""
+    """Edit a UFW rule by deleting it and re-adding with new values."""
     await _verify_connection(connection_id, current_user)
 
-    detect = await _run(
-        connection_id,
-        "command -v ufw >/dev/null 2>&1 && echo 'ufw' || (command -v firewall-cmd >/dev/null 2>&1 && echo 'firewalld' || echo 'none')",
-        timeout=5,
-    )
-    backend = detect.get("stdout", "").strip()
+    port = _sanitize_shell(request.port)
+    from_ip = _sanitize_shell(request.from_ip)
+    to_ip = _sanitize_shell(request.to_ip)
+    comment = _sanitize_shell(request.comment)
 
-    if backend == "ufw":
-        cmd = f"echo 'y' | sudo ufw delete {request.rule_number} 2>&1; echo EXIT:$?"
+    # Step 1: Delete the old rule
+    del_cmd = f"echo 'y' | sudo ufw delete {request.rule_number} 2>&1; echo EXIT:$?"
+    del_result = await _run(connection_id, del_cmd, timeout=10)
+    del_stdout = del_result.get("stdout", "").strip()
+    del_exit, del_clean = _parse_exit_code(del_stdout)
+
+    if del_exit != "0":
+        raise HTTPException(status_code=400, detail=f"Failed to delete old rule: {del_clean}")
+
+    # Step 2: Add the new rule
+    parts = ["sudo", "ufw"]
+    parts.append(request.action)
+    if request.direction == "out":
+        parts.append("out")
+    if from_ip and from_ip != "any":
+        parts.append(f"from {from_ip}")
+    if port:
+        if to_ip and to_ip != "any":
+            parts.append(f"to {to_ip}")
+            parts.append(f"port {port}")
+        else:
+            parts.append(f"to any port {port}")
+        if request.protocol != "any":
+            parts.append(f"proto {request.protocol}")
+    elif to_ip and to_ip != "any":
+        parts.append(f"to {to_ip}")
+    if comment:
+        parts.append(f"comment '{comment}'")
+    add_cmd = " ".join(parts) + " 2>&1; echo EXIT:$?"
+
+    add_result = await _run(connection_id, add_cmd, timeout=10)
+    add_stdout = add_result.get("stdout", "").strip()
+    add_exit, add_clean = _parse_exit_code(add_stdout)
+
+    if add_exit != "0":
+        raise HTTPException(status_code=400, detail=f"Deleted old rule but failed to add new one: {add_clean}")
+
+    return {"message": "UFW rule updated"}
+
+
+@router.post("/{connection_id}/firewall/ufw/delete-rule")
+async def delete_ufw_rule(
+    connection_id: str,
+    request: UfwRuleDelete,
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a UFW rule by number."""
+    await _verify_connection(connection_id, current_user)
+
+    cmd = f"echo 'y' | sudo ufw delete {request.rule_number} 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=f"Failed to delete rule: {clean}")
+
+    return {"message": "UFW rule deleted"}
+
+
+@router.post("/{connection_id}/firewall/ufw/defaults")
+async def update_ufw_defaults(
+    connection_id: str,
+    request: UfwDefaultsUpdate,
+    current_user: User = Depends(get_current_user),
+):
+    """Update UFW default policies."""
+    await _verify_connection(connection_id, current_user)
+
+    cmd = f"sudo ufw default {request.incoming} incoming 2>&1 && sudo ufw default {request.outgoing} outgoing 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=f"Failed to update defaults: {clean}")
+
+    return {"message": "UFW defaults updated"}
+
+
+@router.post("/{connection_id}/firewall/ufw/reset")
+async def reset_ufw(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Reset UFW to factory defaults."""
+    await _verify_connection(connection_id, current_user)
+
+    cmd = "echo 'y' | sudo ufw reset 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=f"Failed to reset UFW: {clean}")
+
+    return {"message": "UFW reset to defaults"}
+
+
+# ---------------------------------------------------------------------------
+# Firewall: iptables
+# ---------------------------------------------------------------------------
+
+IPTABLES_STATUS_SCRIPT = r"""
+sh -c '
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "ERROR:iptables is not installed"
+  exit 0
+fi
+
+# Chain policies
+pol_in=$(sudo iptables -L INPUT -n 2>/dev/null | head -1 | grep -oP "\(policy \K[A-Z]+" || echo "ACCEPT")
+pol_out=$(sudo iptables -L OUTPUT -n 2>/dev/null | head -1 | grep -oP "\(policy \K[A-Z]+" || echo "ACCEPT")
+pol_fwd=$(sudo iptables -L FORWARD -n 2>/dev/null | head -1 | grep -oP "\(policy \K[A-Z]+" || echo "ACCEPT")
+printf "POLICIES:%s|%s|%s\n" "$pol_in" "$pol_out" "$pol_fwd"
+
+echo "RULES_START"
+for chain in INPUT OUTPUT FORWARD; do
+  sudo iptables -L "$chain" -n --line-numbers -v 2>/dev/null | tail -n +3 | while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    num=$(echo "$line" | awk "{print \$1}")
+    target=$(echo "$line" | awk "{print \$4}")
+    proto=$(echo "$line" | awk "{print \$5}")
+    in_if=$(echo "$line" | awk "{print \$7}")
+    out_if=$(echo "$line" | awk "{print \$8}")
+    src=$(echo "$line" | awk "{print \$9}")
+    dst=$(echo "$line" | awk "{print \$10}")
+    extra=$(echo "$line" | awk "{for(i=11;i<=NF;i++) printf \"%s \", \$i; print \"\"}" | sed "s/ *$//")
+    # Extract dport from extra
+    dport=$(echo "$extra" | grep -oP "dpt:\K[0-9:]+" || echo "")
+    raw_esc=$(printf "%s" "$line" | sed "s/\"/\\\\\"/g")
+    extra_esc=$(printf "%s" "$extra" | sed "s/\"/\\\\\"/g")
+    printf "{\"chain\":\"%s\",\"number\":%s,\"target\":\"%s\",\"protocol\":\"%s\",\"source\":\"%s\",\"destination\":\"%s\",\"port\":\"%s\",\"in_interface\":\"%s\",\"out_interface\":\"%s\",\"extra\":\"%s\",\"raw\":\"%s\"}\n" \
+      "$chain" "$num" "$target" "$proto" "$src" "$dst" "$dport" "$in_if" "$out_if" "$extra_esc" "$raw_esc"
+  done
+done
+echo "RULES_END"
+' 2>/dev/null
+"""
+
+
+@router.get("/{connection_id}/firewall/iptables/status", response_model=IptablesStatus)
+async def get_iptables_status(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Get iptables status for filter table (INPUT/OUTPUT/FORWARD)."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, IPTABLES_STATUS_SCRIPT, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    if "ERROR:" in stdout:
+        raise HTTPException(status_code=400, detail=stdout.split("ERROR:", 1)[1])
+
+    policy_input = "ACCEPT"
+    policy_output = "ACCEPT"
+    policy_forward = "ACCEPT"
+    rules: list[IptablesRule] = []
+    in_rules = False
+
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if line.startswith("POLICIES:"):
+            parts = line.split(":", 1)[1].split("|")
+            policy_input = parts[0] if len(parts) > 0 else "ACCEPT"
+            policy_output = parts[1] if len(parts) > 1 else "ACCEPT"
+            policy_forward = parts[2] if len(parts) > 2 else "ACCEPT"
+        elif line == "RULES_START":
+            in_rules = True
+        elif line == "RULES_END":
+            in_rules = False
+        elif in_rules and line:
+            try:
+                rules.append(IptablesRule(**json.loads(line)))
+            except Exception:
+                continue
+
+    return IptablesStatus(
+        active=True,
+        policy_input=policy_input,
+        policy_output=policy_output,
+        policy_forward=policy_forward,
+        rules=rules,
+    )
+
+
+@router.post("/{connection_id}/firewall/iptables/add-rule")
+async def add_iptables_rule(
+    connection_id: str,
+    request: IptablesRuleAdd,
+    current_user: User = Depends(get_current_user),
+):
+    """Add an iptables rule."""
+    await _verify_connection(connection_id, current_user)
+
+    source = _sanitize_shell(request.source)
+    destination = _sanitize_shell(request.destination)
+    port = _sanitize_shell(request.port)
+
+    parts = ["sudo", "iptables"]
+    if request.position > 0:
+        parts.extend(["-I", request.chain, str(request.position)])
     else:
-        raise HTTPException(status_code=400, detail="Rule deletion by number only supported for ufw")
+        parts.extend(["-A", request.chain])
+    parts.extend(["-p", request.protocol])
+    if source and source != "0.0.0.0/0":
+        parts.extend(["-s", source])
+    if destination and destination != "0.0.0.0/0":
+        parts.extend(["-d", destination])
+    if port and request.protocol in ("tcp", "udp"):
+        parts.extend(["--dport", port])
+    parts.extend(["-j", request.target])
+    cmd = " ".join(parts) + " 2>&1; echo EXIT:$?"
 
     result = await _run(connection_id, cmd, timeout=10)
     stdout = result.get("stdout", "").strip()
-
-    exit_code = "1"
-    for line in stdout.split("\n"):
-        if line.startswith("EXIT:"):
-            exit_code = line.replace("EXIT:", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
 
     if exit_code != "0":
-        raise HTTPException(status_code=400, detail=f"Failed to delete rule: {stdout}")
+        raise HTTPException(status_code=400, detail=f"Failed to add iptables rule: {clean}")
 
-    return {"message": "Firewall rule deleted"}
+    return {"message": "iptables rule added"}
+
+
+@router.post("/{connection_id}/firewall/iptables/delete-rule")
+async def delete_iptables_rule(
+    connection_id: str,
+    request: IptablesRuleDelete,
+    current_user: User = Depends(get_current_user),
+):
+    """Delete an iptables rule by chain and rule number."""
+    await _verify_connection(connection_id, current_user)
+
+    cmd = f"sudo iptables -D {request.chain} {request.rule_number} 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=f"Failed to delete iptables rule: {clean}")
+
+    return {"message": "iptables rule deleted"}
+
+
+@router.post("/{connection_id}/firewall/iptables/policy")
+async def set_iptables_policy(
+    connection_id: str,
+    request: IptablesPolicyUpdate,
+    current_user: User = Depends(get_current_user),
+):
+    """Set the default policy for an iptables chain."""
+    await _verify_connection(connection_id, current_user)
+
+    cmd = f"sudo iptables -P {request.chain} {request.policy} 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=f"Failed to set policy: {clean}")
+
+    return {"message": f"{request.chain} policy set to {request.policy}"}
+
+
+# ---------------------------------------------------------------------------
+# Firewall: firewalld
+# ---------------------------------------------------------------------------
+
+FIREWALLD_STATUS_SCRIPT = r"""
+sh -c '
+if ! command -v firewall-cmd >/dev/null 2>&1; then
+  echo "ERROR:firewalld is not installed"
+  exit 0
+fi
+
+fwd_ver=$(sudo firewall-cmd --version 2>/dev/null || echo "")
+printf "VERSION:%s\n" "$fwd_ver"
+
+fwd_state=$(sudo firewall-cmd --state 2>/dev/null || echo "not running")
+if [ "$fwd_state" = "running" ]; then
+  echo "ACTIVE:true"
+else
+  echo "ACTIVE:false"
+  exit 0
+fi
+
+default_zone=$(sudo firewall-cmd --get-default-zone 2>/dev/null || echo "")
+printf "DEFAULT_ZONE:%s\n" "$default_zone"
+
+echo "ZONES_START"
+sudo firewall-cmd --get-active-zones 2>/dev/null | grep -v "^\s" | while read -r zone; do
+  echo "$zone"
+done
+echo "ZONES_END"
+
+echo "RULES_START"
+# Get all rules from the default zone
+zone="$default_zone"
+# Services
+for svc in $(sudo firewall-cmd --zone="$zone" --list-services 2>/dev/null); do
+  svc_esc=$(printf "%s" "$svc" | sed "s/\"/\\\\\"/g")
+  printf "{\"zone\":\"%s\",\"type\":\"service\",\"value\":\"%s\",\"permanent\":true,\"raw\":\"service: %s\"}\n" "$zone" "$svc_esc" "$svc_esc"
+done
+# Ports
+for pt in $(sudo firewall-cmd --zone="$zone" --list-ports 2>/dev/null); do
+  pt_esc=$(printf "%s" "$pt" | sed "s/\"/\\\\\"/g")
+  printf "{\"zone\":\"%s\",\"type\":\"port\",\"value\":\"%s\",\"permanent\":true,\"raw\":\"port: %s\"}\n" "$zone" "$pt_esc" "$pt_esc"
+done
+# Rich rules
+sudo firewall-cmd --zone="$zone" --list-rich-rules 2>/dev/null | while IFS= read -r rr; do
+  [ -z "$rr" ] && continue
+  rr_esc=$(printf "%s" "$rr" | sed "s/\"/\\\\\"/g")
+  printf "{\"zone\":\"%s\",\"type\":\"rich-rule\",\"value\":\"%s\",\"permanent\":true,\"raw\":\"rich rule: %s\"}\n" "$zone" "$rr_esc" "$rr_esc"
+done
+# Sources
+for src in $(sudo firewall-cmd --zone="$zone" --list-sources 2>/dev/null); do
+  src_esc=$(printf "%s" "$src" | sed "s/\"/\\\\\"/g")
+  printf "{\"zone\":\"%s\",\"type\":\"source\",\"value\":\"%s\",\"permanent\":true,\"raw\":\"source: %s\"}\n" "$zone" "$src_esc" "$src_esc"
+done
+echo "RULES_END"
+' 2>/dev/null
+"""
+
+
+@router.get("/{connection_id}/firewall/firewalld/status", response_model=FirewalldStatus)
+async def get_firewalld_status(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Get firewalld status, zones, and rules."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, FIREWALLD_STATUS_SCRIPT, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    if "ERROR:" in stdout:
+        raise HTTPException(status_code=400, detail=stdout.split("ERROR:", 1)[1])
+
+    version = ""
+    active = False
+    default_zone = ""
+    active_zones: list[str] = []
+    rules: list[FirewalldRule] = []
+    in_zones = False
+    in_rules = False
+
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if line.startswith("VERSION:"):
+            version = line.split(":", 1)[1]
+        elif line.startswith("ACTIVE:"):
+            active = line.split(":", 1)[1] == "true"
+        elif line.startswith("DEFAULT_ZONE:"):
+            default_zone = line.split(":", 1)[1]
+        elif line == "ZONES_START":
+            in_zones = True
+        elif line == "ZONES_END":
+            in_zones = False
+        elif in_zones and line:
+            active_zones.append(line)
+        elif line == "RULES_START":
+            in_rules = True
+        elif line == "RULES_END":
+            in_rules = False
+        elif in_rules and line:
+            try:
+                rules.append(FirewalldRule(**json.loads(line)))
+            except Exception:
+                continue
+
+    return FirewalldStatus(
+        active=active,
+        version=version,
+        default_zone=default_zone,
+        active_zones=active_zones,
+        rules=rules,
+    )
+
+
+@router.post("/{connection_id}/firewall/firewalld/toggle")
+async def toggle_firewalld(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Start or stop firewalld."""
+    await _verify_connection(connection_id, current_user)
+
+    status = await _run(connection_id, "sudo firewall-cmd --state 2>/dev/null", timeout=5)
+    is_active = status.get("stdout", "").strip() == "running"
+
+    if is_active:
+        cmd = "sudo systemctl stop firewalld 2>&1; echo EXIT:$?"
+    else:
+        cmd = "sudo systemctl start firewalld 2>&1; echo EXIT:$?"
+
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=f"Failed to toggle firewalld: {clean}")
+
+    return {"message": f"firewalld {'stopped' if is_active else 'started'} successfully"}
+
+
+@router.post("/{connection_id}/firewall/firewalld/add-rule")
+async def add_firewalld_rule(
+    connection_id: str,
+    request: FirewalldRuleAdd,
+    current_user: User = Depends(get_current_user),
+):
+    """Add a firewalld rule (port, service, rich-rule, or source)."""
+    await _verify_connection(connection_id, current_user)
+
+    value = _sanitize_shell(request.value)
+    zone = _sanitize_shell(request.zone) if request.zone else ""
+    zone_flag = f"--zone={zone}" if zone else ""
+    permanent = "--permanent" if request.permanent else ""
+
+    if request.type == "port":
+        cmd = f"sudo firewall-cmd {zone_flag} {permanent} --add-port={value} 2>&1; echo EXIT:$?"
+    elif request.type == "service":
+        cmd = f"sudo firewall-cmd {zone_flag} {permanent} --add-service={value} 2>&1; echo EXIT:$?"
+    elif request.type == "rich-rule":
+        cmd = f'sudo firewall-cmd {zone_flag} {permanent} --add-rich-rule=\'{value}\' 2>&1; echo EXIT:$?'
+    elif request.type == "source":
+        cmd = f"sudo firewall-cmd {zone_flag} {permanent} --add-source={value} 2>&1; echo EXIT:$?"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid rule type")
+
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=f"Failed to add rule: {clean}")
+
+    # Reload if permanent
+    if request.permanent:
+        await _run(connection_id, "sudo firewall-cmd --reload 2>/dev/null", timeout=5)
+
+    return {"message": "firewalld rule added"}
+
+
+@router.post("/{connection_id}/firewall/firewalld/delete-rule")
+async def delete_firewalld_rule(
+    connection_id: str,
+    request: FirewalldRuleDelete,
+    current_user: User = Depends(get_current_user),
+):
+    """Remove a firewalld rule."""
+    await _verify_connection(connection_id, current_user)
+
+    value = _sanitize_shell(request.value)
+    zone = _sanitize_shell(request.zone) if request.zone else ""
+    zone_flag = f"--zone={zone}" if zone else ""
+
+    if request.type == "port":
+        cmd = f"sudo firewall-cmd {zone_flag} --permanent --remove-port={value} 2>&1; echo EXIT:$?"
+    elif request.type == "service":
+        cmd = f"sudo firewall-cmd {zone_flag} --permanent --remove-service={value} 2>&1; echo EXIT:$?"
+    elif request.type == "rich-rule":
+        cmd = f'sudo firewall-cmd {zone_flag} --permanent --remove-rich-rule=\'{value}\' 2>&1; echo EXIT:$?'
+    elif request.type == "source":
+        cmd = f"sudo firewall-cmd {zone_flag} --permanent --remove-source={value} 2>&1; echo EXIT:$?"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid rule type")
+
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=f"Failed to delete rule: {clean}")
+
+    # Reload
+    await _run(connection_id, "sudo firewall-cmd --reload 2>/dev/null", timeout=5)
+
+    return {"message": "firewalld rule deleted"}
+
+
+@router.post("/{connection_id}/firewall/firewalld/reload")
+async def reload_firewalld(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Reload firewalld configuration."""
+    await _verify_connection(connection_id, current_user)
+
+    cmd = "sudo firewall-cmd --reload 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=f"Failed to reload firewalld: {clean}")
+
+    return {"message": "firewalld reloaded"}
+
+
+# ---------------------------------------------------------------------------
+# Firewall: Safety checks
+# ---------------------------------------------------------------------------
+
+@router.post("/{connection_id}/firewall/safety-check", response_model=FirewallSafetyCheck)
+async def firewall_safety_check(
+    connection_id: str,
+    request: FirewallSafetyRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Validate a proposed firewall action for safety issues."""
+    await _verify_connection(connection_id, current_user)
+
+    warnings: list[FirewallSafetyWarning] = []
+    action = request.action
+    backend = request.backend
+    details = request.details
+
+    # Get current state for context
+    overview_result = await _run(connection_id, FIREWALL_OVERVIEW_SCRIPT, timeout=15)
+    overview_stdout = overview_result.get("stdout", "").strip()
+
+    # Parse minimal info from overview
+    ssh_port = 22
+    for line in overview_stdout.split("\n"):
+        line = line.strip()
+        if line.startswith("SSH_PORT:"):
+            try:
+                ssh_port = int(line.split(":", 1)[1])
+            except ValueError:
+                pass
+
+    dashboard_port = config.port
+
+    if action == "enable_firewall":
+        # Check: enabling firewall with no rules
+        rules_count = details.get("rules_count", 0)
+        if rules_count == 0:
+            warnings.append(FirewallSafetyWarning(
+                level="critical",
+                code="no_rules",
+                message="Enabling the firewall with no allow rules will block ALL incoming traffic.",
+                suggestion="Add whitelist rules for your IP and essential ports (SSH, dashboard) before enabling.",
+            ))
+
+        # Check: dashboard port not whitelisted
+        dashboard_port_allowed = details.get("dashboard_port_allowed", False)
+        if not dashboard_port_allowed:
+            warnings.append(FirewallSafetyWarning(
+                level="critical",
+                code="lockout_dashboard",
+                message=f"Port {dashboard_port} (dashboard) is not whitelisted. You may lose access to this panel.",
+                suggestion=f"Add an allow rule for port {dashboard_port} before enabling the firewall.",
+            ))
+
+        # Check: SSH port not whitelisted
+        ssh_port_allowed = details.get("ssh_port_allowed", False)
+        if not ssh_port_allowed:
+            warnings.append(FirewallSafetyWarning(
+                level="critical",
+                code="lockout_ssh",
+                message=f"Port {ssh_port} (SSH) is not whitelisted. SSH connections will be blocked.",
+                suggestion=f"Add an allow rule for port {ssh_port} before enabling the firewall.",
+            ))
+
+    elif action == "disable_firewall":
+        warnings.append(FirewallSafetyWarning(
+            level="warning",
+            code="disabling_firewall",
+            message="Disabling the firewall will expose all ports to the network.",
+            suggestion="Consider keeping the firewall active with appropriate rules instead.",
+        ))
+
+    elif action == "add_deny_rule":
+        deny_port = str(details.get("port", ""))
+        if deny_port == str(dashboard_port):
+            warnings.append(FirewallSafetyWarning(
+                level="critical",
+                code="deny_dashboard_port",
+                message=f"Adding a deny rule for port {dashboard_port} will block access to this dashboard.",
+                suggestion="Remove or modify this rule if you need continued access to the management panel.",
+            ))
+        if deny_port == str(ssh_port):
+            warnings.append(FirewallSafetyWarning(
+                level="critical",
+                code="deny_ssh_port",
+                message=f"Adding a deny rule for port {ssh_port} will block SSH access to this server.",
+                suggestion="Ensure you have alternative access (console, IPMI) before proceeding.",
+            ))
+
+    elif action == "delete_allow_rule":
+        del_port = str(details.get("port", ""))
+        remaining_rules = details.get("remaining_allow_rules", 1)
+        is_active = details.get("firewall_active", False)
+
+        if del_port == str(dashboard_port) and is_active:
+            warnings.append(FirewallSafetyWarning(
+                level="critical",
+                code="delete_dashboard_allow",
+                message=f"Deleting the allow rule for port {dashboard_port} may lock you out of this dashboard.",
+                suggestion="Ensure you have another way to access the server before deleting this rule.",
+            ))
+        if del_port == str(ssh_port) and is_active:
+            warnings.append(FirewallSafetyWarning(
+                level="critical",
+                code="delete_ssh_allow",
+                message=f"Deleting the allow rule for port {ssh_port} may block your SSH access.",
+                suggestion="Ensure you have console access before removing SSH allow rules.",
+            ))
+        if remaining_rules <= 1 and is_active:
+            warnings.append(FirewallSafetyWarning(
+                level="warning",
+                code="last_allow_rule",
+                message="This is the last allow rule. Deleting it will block all incoming traffic.",
+                suggestion="Consider disabling the firewall first or adding replacement rules.",
+            ))
+
+    elif action == "change_default_policy":
+        new_incoming = details.get("incoming", "")
+        allow_rules = details.get("allow_rules_count", 0)
+
+        if new_incoming in ("deny", "reject", "drop", "DROP"):
+            if allow_rules == 0:
+                warnings.append(FirewallSafetyWarning(
+                    level="critical",
+                    code="deny_all_no_allows",
+                    message="Setting default incoming to deny/drop with no allow rules will block ALL traffic.",
+                    suggestion="Add allow rules for SSH and the dashboard port before changing the default policy.",
+                ))
+
+            dashboard_allowed = details.get("dashboard_port_allowed", False)
+            if not dashboard_allowed:
+                warnings.append(FirewallSafetyWarning(
+                    level="critical",
+                    code="policy_lockout_dashboard",
+                    message=f"Default deny with no allow rule for port {dashboard_port} will lock you out.",
+                    suggestion=f"Add 'allow {dashboard_port}/tcp' before changing the default policy.",
+                ))
+
+            ssh_allowed = details.get("ssh_port_allowed", False)
+            if not ssh_allowed:
+                warnings.append(FirewallSafetyWarning(
+                    level="critical",
+                    code="policy_lockout_ssh",
+                    message=f"Default deny with no allow rule for port {ssh_port} will block SSH.",
+                    suggestion=f"Add 'allow {ssh_port}/tcp' before changing the default policy.",
+                ))
+
+    # General suggestion: SSH rate limiting
+    if action in ("enable_firewall", "add_allow_rule"):
+        ssh_rate_limited = details.get("ssh_rate_limited", False)
+        if not ssh_rate_limited:
+            warnings.append(FirewallSafetyWarning(
+                level="info",
+                code="ssh_no_rate_limit",
+                message=f"SSH port {ssh_port} does not have rate limiting enabled.",
+                suggestion=f"Consider using 'limit' instead of 'allow' for port {ssh_port} to protect against brute-force attacks.",
+            ))
+
+    return FirewallSafetyCheck(
+        safe=not any(w.level == "critical" for w in warnings),
+        warnings=warnings,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1435,10 +2528,13 @@ async def package_action(
     """Install, remove, or purge a package."""
     await _verify_connection(connection_id, current_user)
 
-    # Sanitize package name
+    # Sanitize package name(s) — supports space-separated bundles
     pkg = request.package_name
-    if not all(c.isalnum() or c in "-._+:" for c in pkg):
-        raise HTTPException(status_code=400, detail="Invalid package name")
+    pkg_parts = pkg.split()
+    for part in pkg_parts:
+        if not all(c.isalnum() or c in "-._+:" for c in part):
+            raise HTTPException(status_code=400, detail=f"Invalid package name: {part}")
+    pkg = " ".join(pkg_parts)
 
     detect = await _run(connection_id, DETECT_PKG_MANAGER_SCRIPT, timeout=5)
     manager = detect.get("stdout", "").strip().split("|")[0]
@@ -1489,6 +2585,96 @@ async def package_action(
         raise HTTPException(status_code=400, detail=f"Package {action} failed: {error_msg[-500:]}")
 
     return {"message": f"Package '{pkg}' {action} completed successfully"}
+
+
+@router.post("/{connection_id}/packages/check-installed", response_model=PackageCheckResponse)
+async def check_installed_packages(
+    connection_id: str,
+    request: PackageCheckRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Check which packages from a list are already installed."""
+    await _verify_connection(connection_id, current_user)
+
+    # Validate and deduplicate package names
+    seen = set()
+    clean_packages = []
+    for pkg in request.packages:
+        pkg = pkg.strip()
+        if not pkg or pkg in seen:
+            continue
+        if not all(c.isalnum() or c in "-._+:" for c in pkg):
+            raise HTTPException(status_code=400, detail=f"Invalid package name: {pkg}")
+        seen.add(pkg)
+        clean_packages.append(pkg)
+
+    if not clean_packages:
+        return PackageCheckResponse(installed={})
+
+    detect = await _run(connection_id, DETECT_PKG_MANAGER_SCRIPT, timeout=5)
+    manager = detect.get("stdout", "").strip().split("|")[0]
+
+    installed = {}
+    pkg_list = " ".join(clean_packages)
+
+    if manager == "apt":
+        cmd = f"dpkg-query -W -f='${{Package}}|${{Status}}\\n' {pkg_list} 2>/dev/null; true"
+        result = await ssh_proxy.run_command(connection_id, cmd, timeout=15)
+        stdout = result.get("stdout", "")
+        installed_set = set()
+        for line in stdout.strip().split("\n"):
+            line = line.strip()
+            if "|" in line and "install ok installed" in line:
+                name = line.split("|")[0].strip()
+                installed_set.add(name)
+        for pkg in clean_packages:
+            installed[pkg] = pkg in installed_set
+
+    elif manager in ("dnf", "yum", "zypper"):
+        cmd = f"rpm -q {pkg_list} 2>/dev/null; true"
+        result = await ssh_proxy.run_command(connection_id, cmd, timeout=15)
+        stdout = result.get("stdout", "")
+        not_installed_set = set()
+        for line in stdout.strip().split("\n"):
+            line = line.strip()
+            if "is not installed" in line:
+                # "package XXX is not installed"
+                for pkg in clean_packages:
+                    if pkg in line:
+                        not_installed_set.add(pkg)
+        for pkg in clean_packages:
+            installed[pkg] = pkg not in not_installed_set
+
+    elif manager == "pacman":
+        cmd = f"pacman -Q {pkg_list} 2>/dev/null; true"
+        result = await ssh_proxy.run_command(connection_id, cmd, timeout=15)
+        stdout = result.get("stdout", "")
+        installed_set = set()
+        for line in stdout.strip().split("\n"):
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                installed_set.add(parts[0])
+        for pkg in clean_packages:
+            installed[pkg] = pkg in installed_set
+
+    elif manager == "apk":
+        cmd = f"apk info -e {pkg_list} 2>/dev/null; true"
+        result = await ssh_proxy.run_command(connection_id, cmd, timeout=15)
+        stdout = result.get("stdout", "")
+        installed_set = set()
+        for line in stdout.strip().split("\n"):
+            name = line.strip()
+            if name:
+                installed_set.add(name)
+        for pkg in clean_packages:
+            installed[pkg] = pkg in installed_set
+
+    else:
+        # Unknown manager — mark all as unknown/false
+        for pkg in clean_packages:
+            installed[pkg] = False
+
+    return PackageCheckResponse(installed=installed)
 
 
 @router.post("/{connection_id}/packages/upgrade-all")
@@ -1542,34 +2728,274 @@ async def upgrade_all_packages(
 
 
 # ---------------------------------------------------------------------------
-# Docker
+# Docker — comprehensive container management
 # ---------------------------------------------------------------------------
 
-DOCKER_INFO_SCRIPT = r"""
-sh -c '
-if command -v docker >/dev/null 2>&1; then
-  ver=$(docker --version 2>/dev/null | awk "{print \$3}" | tr -d ",")
-  running=$(docker info --format "{{.ContainersRunning}}" 2>/dev/null || echo 0)
-  paused=$(docker info --format "{{.ContainersPaused}}" 2>/dev/null || echo 0)
-  stopped=$(docker info --format "{{.ContainersStopped}}" 2>/dev/null || echo 0)
-  images=$(docker info --format "{{.Images}}" 2>/dev/null || echo 0)
-  driver=$(docker info --format "{{.Driver}}" 2>/dev/null || echo "")
-  api=$(docker info --format "{{.ServerVersion}}" 2>/dev/null || echo "")
-  printf "{\"installed\":true,\"version\":\"%s\",\"api_version\":\"%s\",\"containers_running\":%s,\"containers_paused\":%s,\"containers_stopped\":%s,\"images\":%s,\"storage_driver\":\"%s\"}\n" \
-    "$ver" "$api" "${running:-0}" "${paused:-0}" "${stopped:-0}" "${images:-0}" "$driver"
-else
-  echo "{\"installed\":false}"
+DOCKER_CHECK_SCRIPT = r"""
+bash -c '
+os=""
+os_version=""
+supported="false"
+reason=""
+
+if [ -f /etc/os-release ]; then
+  os=$(grep "PRETTY_NAME" /etc/os-release | cut -d "\"" -f 2)
+  os_version=$(grep "VERSION_ID" /etc/os-release | cut -d "\"" -f 2)
 fi
+[ -z "$os" ] && os=$(uname -s)
+
+# Docker supports Ubuntu, Debian, CentOS, Fedora, RHEL, SLES, Raspbian
+distro=""
+if grep -qs "ubuntu" /etc/os-release; then distro="ubuntu"; supported="true"
+elif [ -e /etc/debian_version ]; then distro="debian"; supported="true"
+elif [ -e /etc/centos-release ] || [ -e /etc/almalinux-release ] || [ -e /etc/rocky-release ]; then distro="centos"; supported="true"
+elif [ -e /etc/fedora-release ]; then distro="fedora"; supported="true"
+elif grep -qs "rhel" /etc/os-release; then distro="rhel"; supported="true"
+else reason="Unsupported distribution for Docker install script"; fi
+
+already="false"
+command -v docker >/dev/null 2>&1 && already="true"
+
+curl_avail="false"
+command -v curl >/dev/null 2>&1 && curl_avail="true"
+
+has_systemd="false"
+command -v systemctl >/dev/null 2>&1 && has_systemd="true"
+
+printf "SUPPORTED:%s\n" "$supported"
+printf "OS:%s\n" "$os"
+printf "OS_VERSION:%s\n" "$os_version"
+printf "ALREADY_INSTALLED:%s\n" "$already"
+printf "REASON:%s\n" "$reason"
+printf "CURL_AVAILABLE:%s\n" "$curl_avail"
+printf "HAS_SYSTEMD:%s\n" "$has_systemd"
 ' 2>/dev/null
 """
 
-DOCKER_PS_SCRIPT = r"""
-docker ps -a --format '{{json .}}' 2>/dev/null
+DOCKER_INFO_SCRIPT = r"""
+bash -c '
+if ! command -v docker >/dev/null 2>&1; then
+  echo "INSTALLED:false"
+  exit 0
+fi
+
+daemon_running="false"
+docker info >/dev/null 2>&1 && daemon_running="true"
+
+ver=$(docker --version 2>/dev/null | awk "{print \$3}" | tr -d ",")
+api=$(docker info --format "{{.ServerVersion}}" 2>/dev/null || echo "")
+running=$(docker info --format "{{.ContainersRunning}}" 2>/dev/null || echo "0")
+paused=$(docker info --format "{{.ContainersPaused}}" 2>/dev/null || echo "0")
+stopped=$(docker info --format "{{.ContainersStopped}}" 2>/dev/null || echo "0")
+images=$(docker info --format "{{.Images}}" 2>/dev/null || echo "0")
+driver=$(docker info --format "{{.Driver}}" 2>/dev/null || echo "")
+root_dir=$(docker info --format "{{.DockerRootDir}}" 2>/dev/null || echo "")
+os_type=$(docker info --format "{{.OSType}}" 2>/dev/null || echo "")
+arch=$(docker info --format "{{.Architecture}}" 2>/dev/null || echo "")
+
+echo "INSTALLED:true"
+echo "DAEMON_RUNNING:${daemon_running}"
+echo "VERSION:${ver}"
+echo "API_VERSION:${api}"
+echo "CONTAINERS_RUNNING:${running:-0}"
+echo "CONTAINERS_PAUSED:${paused:-0}"
+echo "CONTAINERS_STOPPED:${stopped:-0}"
+echo "IMAGES_COUNT:${images:-0}"
+echo "STORAGE_DRIVER:${driver}"
+echo "DOCKER_ROOT:${root_dir}"
+echo "OS_TYPE:${os_type}"
+echo "ARCHITECTURE:${arch}"
+
+# Disk usage
+if [ "$daemon_running" = "true" ]; then
+  docker system df --format "{{.Type}}\t{{.Size}}\t{{.Reclaimable}}" 2>/dev/null | while IFS="$(printf "\t")" read -r dtype dsize dreclaim; do
+    echo "DISK:${dtype}|${dsize}|${dreclaim}"
+  done
+  total=$(docker system df 2>/dev/null | tail -1 | awk "{print \$NF}" || echo "")
+  echo "DISK_TOTAL:${total}"
+fi
+
+# Network & volume counts
+net_count=$(docker network ls -q 2>/dev/null | wc -l | tr -d " ")
+vol_count=$(docker volume ls -q 2>/dev/null | wc -l | tr -d " ")
+echo "NETWORKS_COUNT:${net_count:-0}"
+echo "VOLUMES_COUNT:${vol_count:-0}"
+
+# Compose
+compose_installed="false"
+compose_version=""
+if docker compose version >/dev/null 2>&1; then
+  compose_installed="true"
+  compose_version=$(docker compose version --short 2>/dev/null || echo "")
+elif command -v docker-compose >/dev/null 2>&1; then
+  compose_installed="true"
+  compose_version=$(docker-compose version --short 2>/dev/null || echo "")
+fi
+echo "COMPOSE_INSTALLED:${compose_installed}"
+echo "COMPOSE_VERSION:${compose_version}"
+echo "DOCKER_INFO_END"
+' 2>/dev/null
+"""
+
+DOCKER_PS_WITH_STATS_SCRIPT = r"""
+bash -c '
+# Get container list as JSON
+echo "CONTAINERS_START"
+docker ps -a --format "{{json .}}" 2>/dev/null
+echo "CONTAINERS_END"
+
+# Get stats for running containers
+echo "STATS_START"
+docker stats --no-stream --format "{{json .}}" 2>/dev/null
+echo "STATS_END"
+
+# Get compose labels for containers
+echo "LABELS_START"
+docker ps -a --format "{{.ID}}|{{.Label \"com.docker.compose.project\"}}|{{.Label \"com.docker.compose.service\"}}" 2>/dev/null
+echo "LABELS_END"
+' 2>/dev/null
 """
 
 DOCKER_IMAGES_SCRIPT = r"""
 docker images --format '{{json .}}' 2>/dev/null
 """
+
+DOCKER_NETWORKS_SCRIPT = r"""
+bash -c '
+docker network ls --format "{{json .}}" 2>/dev/null | while read -r line; do
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"ID\",\"\"))" 2>/dev/null || echo "")
+  if [ -n "$id" ]; then
+    subnet=$(docker network inspect "$id" --format "{{range .IPAM.Config}}{{.Subnet}}{{end}}" 2>/dev/null || echo "")
+    gateway=$(docker network inspect "$id" --format "{{range .IPAM.Config}}{{.Gateway}}{{end}}" 2>/dev/null || echo "")
+    containers=$(docker network inspect "$id" --format "{{len .Containers}}" 2>/dev/null || echo "0")
+    internal=$(docker network inspect "$id" --format "{{.Internal}}" 2>/dev/null || echo "false")
+    echo "NET:${line}|${subnet}|${gateway}|${containers}|${internal}"
+  fi
+done
+echo "NETWORKS_END"
+' 2>/dev/null
+"""
+
+DOCKER_VOLUMES_SCRIPT = r"""
+bash -c '
+docker volume ls --format "{{json .}}" 2>/dev/null | while read -r line; do
+  name=$(echo "$line" | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"Name\",\"\"))" 2>/dev/null || echo "")
+  if [ -n "$name" ]; then
+    mp=$(docker volume inspect "$name" --format "{{.Mountpoint}}" 2>/dev/null || echo "")
+    created=$(docker volume inspect "$name" --format "{{.CreatedAt}}" 2>/dev/null || echo "")
+    size=$(sudo du -sh "$mp" 2>/dev/null | cut -f1 || echo "—")
+    echo "VOL:${line}|${mp}|${created}|${size}"
+  fi
+done
+echo "VOLUMES_END"
+' 2>/dev/null
+"""
+
+DOCKER_COMPOSE_LS_SCRIPT = r"""
+bash -c '
+if docker compose version >/dev/null 2>&1; then
+  docker compose ls --format json 2>/dev/null || docker compose ls 2>/dev/null
+elif command -v docker-compose >/dev/null 2>&1; then
+  docker-compose ls --format json 2>/dev/null || echo "[]"
+else
+  echo "[]"
+fi
+' 2>/dev/null
+"""
+
+DOCKER_UNINSTALL_SCRIPT = r"""
+bash -c '
+set -e
+
+os=""
+if grep -qs "ubuntu" /etc/os-release; then os="ubuntu"
+elif [ -e /etc/debian_version ]; then os="debian"
+elif [ -e /etc/centos-release ] || [ -e /etc/almalinux-release ] || [ -e /etc/rocky-release ]; then os="centos"
+elif [ -e /etc/fedora-release ]; then os="fedora"
+elif grep -qs "rhel" /etc/os-release; then os="rhel"
+fi
+
+echo ">>> Stopping Docker service..."
+sudo systemctl stop docker.service 2>/dev/null || true
+sudo systemctl stop docker.socket 2>/dev/null || true
+sudo systemctl stop containerd.service 2>/dev/null || true
+sudo systemctl disable docker.service 2>/dev/null || true
+sudo systemctl disable docker.socket 2>/dev/null || true
+sudo systemctl disable containerd.service 2>/dev/null || true
+
+echo ">>> Removing Docker packages..."
+if [ "$os" = "ubuntu" ] || [ "$os" = "debian" ]; then
+  sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras 2>/dev/null || true
+  sudo apt-get autoremove -y 2>/dev/null || true
+elif [ "$os" = "centos" ] || [ "$os" = "fedora" ] || [ "$os" = "rhel" ]; then
+  sudo dnf remove -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras 2>/dev/null || true
+  sudo yum remove -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin 2>/dev/null || true
+fi
+
+echo ">>> Removing Docker data directories..."
+sudo rm -rf /var/lib/docker
+sudo rm -rf /var/lib/containerd
+sudo rm -f /etc/apt/sources.list.d/docker.list 2>/dev/null
+sudo rm -f /etc/apt/keyrings/docker.asc 2>/dev/null
+sudo rm -f /etc/yum.repos.d/docker-ce.repo 2>/dev/null
+
+echo ">>> Verifying removal..."
+if ! command -v docker >/dev/null 2>&1; then
+  echo "DOCKER_UNINSTALL_SUCCESS"
+else
+  echo "DOCKER_UNINSTALL_FAILED"
+fi
+' 2>&1
+"""
+
+
+def _parse_exit_code(stdout: str) -> tuple[str, str]:
+    """Extract exit code and clean output from command stdout."""
+    exit_code = "1"
+    clean_lines = []
+    for line in stdout.split("\n"):
+        if line.startswith("EXIT:"):
+            exit_code = line.replace("EXIT:", "").strip()
+        else:
+            clean_lines.append(line)
+    return exit_code, "\n".join(clean_lines).strip()
+
+
+@router.get("/{connection_id}/docker/check", response_model=DockerInstallCheck)
+async def check_docker(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Pre-install check for Docker."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, DOCKER_CHECK_SCRIPT, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    data: dict = {
+        "supported": False, "os": "", "os_version": "",
+        "already_installed": False, "reason": "",
+        "curl_available": False, "has_systemd": False,
+    }
+
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if line.startswith("SUPPORTED:"):
+            data["supported"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("OS:"):
+            data["os"] = line.split(":", 1)[1]
+        elif line.startswith("OS_VERSION:"):
+            data["os_version"] = line.split(":", 1)[1]
+        elif line.startswith("ALREADY_INSTALLED:"):
+            data["already_installed"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("REASON:"):
+            data["reason"] = line.split(":", 1)[1]
+        elif line.startswith("CURL_AVAILABLE:"):
+            data["curl_available"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("HAS_SYSTEMD:"):
+            data["has_systemd"] = line.split(":", 1)[1] == "true"
+
+    return DockerInstallCheck(**data)
 
 
 @router.get("/{connection_id}/docker/info", response_model=DockerInfo)
@@ -1577,19 +3003,76 @@ async def get_docker_info(
     connection_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    """Get Docker daemon info."""
+    """Get comprehensive Docker daemon info."""
     await _verify_connection(connection_id, current_user)
 
-    result = await _run(connection_id, DOCKER_INFO_SCRIPT, timeout=10)
+    result = await _run(connection_id, DOCKER_INFO_SCRIPT, timeout=15)
     stdout = result.get("stdout", "").strip()
-    if not stdout:
-        return DockerInfo(installed=False)
 
-    try:
-        data = json.loads(stdout)
-        return DockerInfo(**data)
-    except (json.JSONDecodeError, Exception):
-        return DockerInfo(installed=False)
+    data: dict = {
+        "installed": False, "version": "", "api_version": "",
+        "containers_running": 0, "containers_paused": 0, "containers_stopped": 0,
+        "images_count": 0, "storage_driver": "", "docker_root": "",
+        "os_type": "", "architecture": "", "daemon_running": False,
+        "disk_usage_images": "", "disk_usage_containers": "",
+        "disk_usage_volumes": "", "disk_usage_buildcache": "",
+        "disk_usage_total": "",
+        "networks_count": 0, "volumes_count": 0,
+        "compose_installed": False, "compose_version": "",
+    }
+
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("INSTALLED:"):
+            data["installed"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("DAEMON_RUNNING:"):
+            data["daemon_running"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("VERSION:"):
+            data["version"] = line.split(":", 1)[1]
+        elif line.startswith("API_VERSION:"):
+            data["api_version"] = line.split(":", 1)[1]
+        elif line.startswith("CONTAINERS_RUNNING:"):
+            data["containers_running"] = int(line.split(":", 1)[1] or "0")
+        elif line.startswith("CONTAINERS_PAUSED:"):
+            data["containers_paused"] = int(line.split(":", 1)[1] or "0")
+        elif line.startswith("CONTAINERS_STOPPED:"):
+            data["containers_stopped"] = int(line.split(":", 1)[1] or "0")
+        elif line.startswith("IMAGES_COUNT:"):
+            data["images_count"] = int(line.split(":", 1)[1] or "0")
+        elif line.startswith("STORAGE_DRIVER:"):
+            data["storage_driver"] = line.split(":", 1)[1]
+        elif line.startswith("DOCKER_ROOT:"):
+            data["docker_root"] = line.split(":", 1)[1]
+        elif line.startswith("OS_TYPE:"):
+            data["os_type"] = line.split(":", 1)[1]
+        elif line.startswith("ARCHITECTURE:"):
+            data["architecture"] = line.split(":", 1)[1]
+        elif line.startswith("DISK:"):
+            parts = line.split(":", 1)[1].split("|")
+            dtype = parts[0].strip().lower() if len(parts) > 0 else ""
+            dsize = parts[1].strip() if len(parts) > 1 else ""
+            if "image" in dtype:
+                data["disk_usage_images"] = dsize
+            elif "container" in dtype:
+                data["disk_usage_containers"] = dsize
+            elif "volume" in dtype or "local volume" in dtype:
+                data["disk_usage_volumes"] = dsize
+            elif "build" in dtype:
+                data["disk_usage_buildcache"] = dsize
+        elif line.startswith("DISK_TOTAL:"):
+            data["disk_usage_total"] = line.split(":", 1)[1]
+        elif line.startswith("NETWORKS_COUNT:"):
+            data["networks_count"] = int(line.split(":", 1)[1] or "0")
+        elif line.startswith("VOLUMES_COUNT:"):
+            data["volumes_count"] = int(line.split(":", 1)[1] or "0")
+        elif line.startswith("COMPOSE_INSTALLED:"):
+            data["compose_installed"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("COMPOSE_VERSION:"):
+            data["compose_version"] = line.split(":", 1)[1]
+
+    return DockerInfo(**data)
 
 
 @router.get("/{connection_id}/docker/containers", response_model=DockerContainersResponse)
@@ -1597,23 +3080,67 @@ async def list_docker_containers(
     connection_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    """List Docker containers."""
+    """List Docker containers with resource stats."""
     await _verify_connection(connection_id, current_user)
 
-    result = await _run(connection_id, DOCKER_PS_SCRIPT, timeout=10)
+    result = await _run(connection_id, DOCKER_PS_WITH_STATS_SCRIPT, timeout=15)
     stdout = result.get("stdout", "").strip()
 
     containers: list[DockerContainer] = []
-    if stdout:
-        for line in stdout.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
+    stats_map: dict[str, dict] = {}
+    labels_map: dict[str, dict] = {}
+
+    in_containers = False
+    in_stats = False
+    in_labels = False
+
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line == "CONTAINERS_START":
+            in_containers = True
+            continue
+        elif line == "CONTAINERS_END":
+            in_containers = False
+            continue
+        elif line == "STATS_START":
+            in_stats = True
+            continue
+        elif line == "STATS_END":
+            in_stats = False
+            continue
+        elif line == "LABELS_START":
+            in_labels = True
+            continue
+        elif line == "LABELS_END":
+            in_labels = False
+            continue
+
+        if in_stats:
             try:
                 raw = json.loads(line)
-                # docker ps --format '{{json .}}' uses capitalized keys
+                cid = raw.get("ID", raw.get("Container", ""))[:12]
+                stats_map[cid] = raw
+            except (json.JSONDecodeError, Exception):
+                continue
+        elif in_labels:
+            parts = line.split("|", 2)
+            if len(parts) >= 3:
+                cid = parts[0][:12]
+                labels_map[cid] = {
+                    "compose_project": parts[1],
+                    "compose_service": parts[2],
+                }
+        elif in_containers:
+            try:
+                raw = json.loads(line)
+                cid = raw.get("ID", raw.get("id", ""))
+                cid_short = cid[:12]
+                stat = stats_map.get(cid_short, {})
+                label = labels_map.get(cid_short, {})
                 containers.append(DockerContainer(
-                    id=raw.get("ID", raw.get("id", "")),
+                    id=cid,
                     name=raw.get("Names", raw.get("name", "")),
                     image=raw.get("Image", raw.get("image", "")),
                     status=raw.get("Status", raw.get("status", "")),
@@ -1621,6 +3148,15 @@ async def list_docker_containers(
                     created=raw.get("CreatedAt", raw.get("created", "")),
                     ports=raw.get("Ports", raw.get("ports", "")),
                     size=raw.get("Size", raw.get("size", "")),
+                    cpu_percent=stat.get("CPUPerc", ""),
+                    mem_usage=stat.get("MemUsage", "").split("/")[0].strip() if "/" in stat.get("MemUsage", "") else stat.get("MemUsage", ""),
+                    mem_limit=stat.get("MemUsage", "").split("/")[1].strip() if "/" in stat.get("MemUsage", "") else "",
+                    mem_percent=stat.get("MemPerc", ""),
+                    net_io=stat.get("NetIO", ""),
+                    block_io=stat.get("BlockIO", ""),
+                    pids=stat.get("PIDs", ""),
+                    compose_project=label.get("compose_project", ""),
+                    compose_service=label.get("compose_service", ""),
                 ))
             except (json.JSONDecodeError, Exception):
                 continue
@@ -1638,7 +3174,6 @@ async def docker_container_action(
     """Perform an action on a Docker container."""
     await _verify_connection(connection_id, current_user)
 
-    # Sanitize container ID (hex or name)
     if not all(c.isalnum() or c in "-_." for c in container_id):
         raise HTTPException(status_code=400, detail="Invalid container ID")
 
@@ -1650,15 +3185,10 @@ async def docker_container_action(
 
     result = await _run(connection_id, cmd, timeout=30)
     stdout = result.get("stdout", "").strip()
-
-    exit_code = "1"
-    for line in stdout.split("\n"):
-        if line.startswith("EXIT:"):
-            exit_code = line.replace("EXIT:", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
 
     if exit_code != "0":
-        error_lines = [l for l in stdout.split("\n") if not l.startswith("EXIT:")]
-        raise HTTPException(status_code=400, detail="\n".join(error_lines) or f"Failed to {action} container")
+        raise HTTPException(status_code=400, detail=clean or f"Failed to {action} container")
 
     return {"message": f"Container {container_id} {action} successful"}
 
@@ -1678,9 +3208,32 @@ async def get_docker_container_logs(
 
     cmd = f"docker logs --tail {tail} --timestamps {container_id} 2>&1"
     result = await _run(connection_id, cmd, timeout=15)
-    stdout = result.get("stdout", "")
+    return {"logs": result.get("stdout", ""), "container_id": container_id}
 
-    return {"logs": stdout, "container_id": container_id}
+
+@router.get("/{connection_id}/docker/containers/{container_id}/inspect")
+async def inspect_docker_container(
+    connection_id: str,
+    container_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Get detailed Docker container inspect data."""
+    await _verify_connection(connection_id, current_user)
+
+    if not all(c.isalnum() or c in "-_." for c in container_id):
+        raise HTTPException(status_code=400, detail="Invalid container ID")
+
+    cmd = f"docker inspect {container_id} 2>/dev/null"
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    try:
+        data = json.loads(stdout)
+        if isinstance(data, list) and len(data) > 0:
+            return data[0]
+        return data
+    except (json.JSONDecodeError, Exception):
+        raise HTTPException(status_code=400, detail="Failed to inspect container")
 
 
 @router.get("/{connection_id}/docker/images", response_model=DockerImagesResponse)
@@ -1702,7 +3255,6 @@ async def list_docker_images(
                 continue
             try:
                 raw = json.loads(line)
-                # docker images --format '{{json .}}' uses capitalized keys
                 images.append(DockerImage(
                     id=raw.get("ID", raw.get("id", "")),
                     repository=raw.get("Repository", raw.get("repository", "")),
@@ -1731,166 +3283,1164 @@ async def delete_docker_image(
     cmd = f"docker rmi {image_id} 2>&1; echo EXIT:$?"
     result = await _run(connection_id, cmd, timeout=30)
     stdout = result.get("stdout", "").strip()
-
-    exit_code = "1"
-    for line in stdout.split("\n"):
-        if line.startswith("EXIT:"):
-            exit_code = line.replace("EXIT:", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
 
     if exit_code != "0":
-        error_lines = [l for l in stdout.split("\n") if not l.startswith("EXIT:")]
-        raise HTTPException(status_code=400, detail="\n".join(error_lines) or "Failed to delete image")
+        raise HTTPException(status_code=400, detail=clean or "Failed to delete image")
 
     return {"message": f"Image {image_id} deleted"}
 
 
+@router.get("/{connection_id}/docker/networks", response_model=DockerNetworksResponse)
+async def list_docker_networks(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """List Docker networks."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, DOCKER_NETWORKS_SCRIPT, timeout=15)
+    stdout = result.get("stdout", "").strip()
+
+    networks: list[DockerNetwork] = []
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if not line or line == "NETWORKS_END":
+            continue
+        if line.startswith("NET:"):
+            raw_parts = line[4:].split("|", 4)
+            try:
+                raw = json.loads(raw_parts[0]) if raw_parts else {}
+                networks.append(DockerNetwork(
+                    id=raw.get("ID", ""),
+                    name=raw.get("Name", ""),
+                    driver=raw.get("Driver", ""),
+                    scope=raw.get("Scope", ""),
+                    subnet=raw_parts[1] if len(raw_parts) > 1 else "",
+                    gateway=raw_parts[2] if len(raw_parts) > 2 else "",
+                    containers_count=int(raw_parts[3]) if len(raw_parts) > 3 and raw_parts[3].isdigit() else 0,
+                    internal=raw_parts[4] == "true" if len(raw_parts) > 4 else False,
+                ))
+            except (json.JSONDecodeError, Exception):
+                continue
+
+    return DockerNetworksResponse(networks=networks, total=len(networks))
+
+
+@router.post("/{connection_id}/docker/networks/create")
+async def create_docker_network(
+    connection_id: str,
+    request: DockerNetworkCreate,
+    current_user: User = Depends(get_current_user),
+):
+    """Create a Docker network."""
+    await _verify_connection(connection_id, current_user)
+
+    name = _sanitize_shell(request.name)
+    driver = _sanitize_shell(request.driver)
+    subnet_flag = ""
+    if request.subnet:
+        subnet = _sanitize_shell(request.subnet)
+        subnet_flag = f" --subnet {subnet}"
+
+    cmd = f"docker network create --driver {driver}{subnet_flag} {name} 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=15)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=clean or "Failed to create network")
+
+    return {"message": f"Network '{name}' created"}
+
+
+@router.delete("/{connection_id}/docker/networks/{network_id}")
+async def delete_docker_network(
+    connection_id: str,
+    network_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Remove a Docker network."""
+    await _verify_connection(connection_id, current_user)
+
+    if not all(c.isalnum() or c in "-_." for c in network_id):
+        raise HTTPException(status_code=400, detail="Invalid network ID")
+
+    cmd = f"docker network rm {network_id} 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=15)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=clean or "Failed to remove network")
+
+    return {"message": f"Network {network_id} removed"}
+
+
+@router.get("/{connection_id}/docker/volumes", response_model=DockerVolumesResponse)
+async def list_docker_volumes(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """List Docker volumes."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, DOCKER_VOLUMES_SCRIPT, timeout=20)
+    stdout = result.get("stdout", "").strip()
+
+    volumes: list[DockerVolume] = []
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if not line or line == "VOLUMES_END":
+            continue
+        if line.startswith("VOL:"):
+            raw_parts = line[4:].split("|", 3)
+            try:
+                raw = json.loads(raw_parts[0]) if raw_parts else {}
+                volumes.append(DockerVolume(
+                    name=raw.get("Name", ""),
+                    driver=raw.get("Driver", ""),
+                    mountpoint=raw_parts[1] if len(raw_parts) > 1 else "",
+                    created=raw_parts[2] if len(raw_parts) > 2 else "",
+                    size=raw_parts[3] if len(raw_parts) > 3 else "",
+                ))
+            except (json.JSONDecodeError, Exception):
+                continue
+
+    return DockerVolumesResponse(volumes=volumes, total=len(volumes))
+
+
+@router.post("/{connection_id}/docker/volumes/create")
+async def create_docker_volume(
+    connection_id: str,
+    request: DockerVolumeCreate,
+    current_user: User = Depends(get_current_user),
+):
+    """Create a Docker volume."""
+    await _verify_connection(connection_id, current_user)
+
+    name = _sanitize_shell(request.name)
+    driver = _sanitize_shell(request.driver)
+    cmd = f"docker volume create --driver {driver} {name} 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=clean or "Failed to create volume")
+
+    return {"message": f"Volume '{name}' created"}
+
+
+@router.delete("/{connection_id}/docker/volumes/{volume_name}")
+async def delete_docker_volume(
+    connection_id: str,
+    volume_name: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Remove a Docker volume."""
+    await _verify_connection(connection_id, current_user)
+
+    if not all(c.isalnum() or c in "-_." for c in volume_name):
+        raise HTTPException(status_code=400, detail="Invalid volume name")
+
+    cmd = f"docker volume rm {volume_name} 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=clean or "Failed to remove volume")
+
+    return {"message": f"Volume {volume_name} removed"}
+
+
+@router.get("/{connection_id}/docker/compose/projects", response_model=DockerComposeProjectsResponse)
+async def list_compose_projects(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """List Docker Compose projects."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, DOCKER_COMPOSE_LS_SCRIPT, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    projects: list[DockerComposeProject] = []
+    if stdout:
+        try:
+            raw_list = json.loads(stdout)
+            if isinstance(raw_list, list):
+                for raw in raw_list:
+                    status_str = raw.get("Status", "")
+                    running = 0
+                    total = 0
+                    # Status format: "running(2)" or "running(1), exited(1)"
+                    import re
+                    for m in re.finditer(r'(\w+)\((\d+)\)', status_str):
+                        count = int(m.group(2))
+                        total += count
+                        if m.group(1) == "running":
+                            running = count
+
+                    projects.append(DockerComposeProject(
+                        name=raw.get("Name", ""),
+                        status=status_str,
+                        config_files=raw.get("ConfigFiles", ""),
+                        running_count=running,
+                        total_count=total,
+                    ))
+        except (json.JSONDecodeError, Exception):
+            pass
+
+    return DockerComposeProjectsResponse(projects=projects, total=len(projects))
+
+
+@router.post("/{connection_id}/docker/compose/action")
+async def docker_compose_action(
+    connection_id: str,
+    request: DockerComposeAction,
+    current_user: User = Depends(get_current_user),
+):
+    """Perform a Docker Compose action on a project."""
+    await _verify_connection(connection_id, current_user)
+
+    project_dir = _sanitize_shell(request.project_dir)
+    action = request.action
+
+    if action == "up":
+        cmd = f"cd {project_dir} && docker compose up -d 2>&1; echo EXIT:$?"
+    elif action == "down":
+        cmd = f"cd {project_dir} && docker compose down 2>&1; echo EXIT:$?"
+    elif action == "restart":
+        cmd = f"cd {project_dir} && docker compose restart 2>&1; echo EXIT:$?"
+    elif action == "pull":
+        cmd = f"cd {project_dir} && docker compose pull 2>&1; echo EXIT:$?"
+    elif action == "build":
+        cmd = f"cd {project_dir} && docker compose build 2>&1; echo EXIT:$?"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    result = await _run(connection_id, cmd, timeout=120)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=clean or f"Failed to {action} compose project")
+
+    return {"message": f"Compose {action} successful", "output": clean}
+
+
+@router.post("/{connection_id}/docker/compose/file/read")
+async def read_compose_file(
+    connection_id: str,
+    request: DockerComposeFileRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Read a Docker Compose file."""
+    await _verify_connection(connection_id, current_user)
+
+    path = _sanitize_shell(request.path)
+    cmd = f"cat {path} 2>/dev/null"
+    result = await _run(connection_id, cmd, timeout=5)
+    stdout = result.get("stdout", "")
+
+    if not stdout:
+        raise HTTPException(status_code=404, detail="Compose file not found or empty")
+
+    return {"content": stdout, "path": path}
+
+
+@router.post("/{connection_id}/docker/compose/file/save")
+async def save_compose_file(
+    connection_id: str,
+    request: DockerComposeFileSave,
+    current_user: User = Depends(get_current_user),
+):
+    """Save a Docker Compose file."""
+    await _verify_connection(connection_id, current_user)
+
+    import base64
+    path = _sanitize_shell(request.path)
+    content_b64 = base64.b64encode(request.content.encode()).decode()
+    cmd = f"echo '{content_b64}' | base64 -d > {path} 2>&1; echo EXIT:$?"
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+    exit_code, clean = _parse_exit_code(stdout)
+
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=clean or "Failed to save compose file")
+
+    return {"message": "Compose file saved", "path": path}
+
+
+@router.post("/{connection_id}/docker/uninstall")
+async def uninstall_docker(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Remove Docker completely from the server."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, DOCKER_UNINSTALL_SCRIPT, timeout=120)
+    stdout = result.get("stdout", "").strip()
+
+    if "DOCKER_UNINSTALL_SUCCESS" in stdout:
+        return {"message": "Docker removed successfully", "success": True, "output": stdout}
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Uninstall may have failed. Output:\n{stdout}",
+        )
+
+
 # ---------------------------------------------------------------------------
-# WireGuard
+# WireGuard — Nyr-style server management
 # ---------------------------------------------------------------------------
 
-WIREGUARD_STATUS_SCRIPT = r"""
-sh -c '
-if command -v wg >/dev/null 2>&1; then
-  ver=$(wg --version 2>/dev/null | awk "{print \$2}" || echo "unknown")
-  echo "INSTALLED:true"
-  echo "VERSION:${ver}"
+import re as _re
 
-  # List interfaces
-  ifaces=$(sudo wg show interfaces 2>/dev/null)
-  if [ -z "$ifaces" ]; then
-    echo "INTERFACES_END"
-  else
-    for iface in $ifaces; do
-      echo "IFACE_START:${iface}"
+WG_CHECK_SCRIPT = r"""
+bash -c '
+# Detect OS
+os=""
+os_version=""
+supported="false"
+reason=""
 
-      # Get interface details
-      pubkey=$(sudo wg show "$iface" public-key 2>/dev/null || echo "")
-      listen=$(sudo wg show "$iface" listen-port 2>/dev/null || echo "")
-
-      # Get address from ip command
-      addr=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP "inet \K[0-9./]+" | head -1)
-      [ -z "$addr" ] && addr=$(ip -6 addr show "$iface" 2>/dev/null | grep -oP "inet6 \K[0-9a-f:/]+" | head -1)
-
-      # Check if active
-      state=$(ip link show "$iface" 2>/dev/null | grep -oP "state \K\w+")
-      active="false"
-      [ "$state" = "UP" ] || [ "$state" = "UNKNOWN" ] && active="true"
-
-      echo "IFACE_INFO:${pubkey}|${listen}|${addr}|${active}"
-
-      # Get peers
-      sudo wg show "$iface" dump 2>/dev/null | tail -n +2 | while IFS="$(printf '\t')" read -r pk psk ep aip hs rx tx ka; do
-        hs_fmt=""
-        if [ "$hs" != "0" ] && [ -n "$hs" ]; then
-          hs_fmt=$(date -d "@$hs" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$hs" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$hs")
-        fi
-        # Convert bytes to human readable
-        rx_h=$(numfmt --to=iec "$rx" 2>/dev/null || echo "${rx}B")
-        tx_h=$(numfmt --to=iec "$tx" 2>/dev/null || echo "${tx}B")
-        ka_str=""
-        [ "$ka" != "off" ] && [ -n "$ka" ] && ka_str="${ka}s"
-        printf "PEER:%s|%s|%s|%s|%s|%s|%s\n" "$pk" "$ep" "$aip" "$hs_fmt" "$rx_h" "$tx_h" "$ka_str"
-      done
-
-      echo "IFACE_END"
-    done
-    echo "INTERFACES_END"
-  fi
+if grep -qs "ubuntu" /etc/os-release; then
+  os="ubuntu"
+  os_version=$(grep "VERSION_ID" /etc/os-release | cut -d "\"" -f 2 | tr -d ".")
+  if [ "$os_version" -ge 2204 ] 2>/dev/null; then supported="true"; else reason="Ubuntu 22.04+ required"; fi
+elif [ -e /etc/debian_version ]; then
+  os="debian"
+  os_version=$(grep -oE "[0-9]+" /etc/debian_version | head -1)
+  if grep -q "/sid" /etc/debian_version; then reason="Debian Testing/Unstable unsupported"
+  elif [ "$os_version" -ge 11 ] 2>/dev/null; then supported="true"
+  else reason="Debian 11+ required"; fi
+elif [ -e /etc/almalinux-release ] || [ -e /etc/rocky-release ] || [ -e /etc/centos-release ]; then
+  os="centos"
+  os_version=$(grep -shoE "[0-9]+" /etc/almalinux-release /etc/rocky-release /etc/centos-release 2>/dev/null | head -1)
+  if [ "$os_version" -ge 9 ] 2>/dev/null; then supported="true"; else reason="RHEL/CentOS/Alma/Rocky 9+ required"; fi
+elif [ -e /etc/fedora-release ]; then
+  os="fedora"
+  os_version=$(grep -oE "[0-9]+" /etc/fedora-release | head -1)
+  supported="true"
 else
-  echo "INSTALLED:false"
-  echo "INTERFACES_END"
+  reason="Unsupported distribution"
 fi
+
+# Pretty OS name
+os_pretty="$os"
+if [ -f /etc/os-release ]; then
+  os_pretty=$(grep "PRETTY_NAME" /etc/os-release | cut -d "\"" -f 2)
+fi
+
+# Check if already installed
+already="false"
+[ -e /etc/wireguard/wg0.conf ] && already="true"
+
+# Detect container / BoringTun need
+is_container="false"
+needs_boringtun="false"
+if systemd-detect-virt -cq 2>/dev/null; then
+  is_container="true"
+  if ! grep -q "^wireguard " /proc/modules 2>/dev/null; then
+    needs_boringtun="true"
+    if [ "$(uname -m)" != "x86_64" ]; then
+      reason="Containerized non-x86_64 unsupported for BoringTun"
+      supported="false"
+    fi
+  fi
+fi
+
+# Get public IP
+public_ip=$(wget -T 5 -t 1 -4qO- "http://ip1.dynupdate.no-ip.com/" 2>/dev/null || curl -m 5 -4Ls "http://ip1.dynupdate.no-ip.com/" 2>/dev/null || echo "")
+
+# Get local IPs
+local_ips=""
+for lip in $(ip -4 addr | grep inet | grep -vE "127(\.[0-9]{1,3}){3}" | cut -d "/" -f 1 | grep -oE "[0-9]{1,3}(\.[0-9]{1,3}){3}"); do
+  [ -n "$local_ips" ] && local_ips="${local_ips},"
+  local_ips="${local_ips}${lip}"
+done
+
+# IPv6
+has_ipv6="false"
+ipv6_addr=""
+v6=$(ip -6 addr | grep "inet6 [23]" | cut -d "/" -f 1 | grep -oE "([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}" | head -1)
+if [ -n "$v6" ]; then
+  has_ipv6="true"
+  ipv6_addr="$v6"
+fi
+
+printf "SUPPORTED:%s\n" "$supported"
+printf "OS:%s\n" "$os_pretty"
+printf "OS_VERSION:%s\n" "$os_version"
+printf "ALREADY_INSTALLED:%s\n" "$already"
+printf "PUBLIC_IP:%s\n" "$public_ip"
+printf "LOCAL_IPS:%s\n" "$local_ips"
+printf "HAS_IPV6:%s\n" "$has_ipv6"
+printf "IPV6_ADDR:%s\n" "$ipv6_addr"
+printf "IS_CONTAINER:%s\n" "$is_container"
+printf "NEEDS_BORINGTUN:%s\n" "$needs_boringtun"
+printf "REASON:%s\n" "$reason"
+' 2>/dev/null
+"""
+
+WG_STATUS_SCRIPT = r"""
+bash -c '
+if ! command -v wg >/dev/null 2>&1 || [ ! -e /etc/wireguard/wg0.conf ]; then
+  echo "INSTALLED:false"
+  exit 0
+fi
+
+ver=$(wg --version 2>/dev/null | awk "{print \$2}" || echo "unknown")
+echo "INSTALLED:true"
+echo "VERSION:${ver}"
+
+# Server interface info
+pubkey=$(sudo wg show wg0 public-key 2>/dev/null || echo "")
+listen=$(sudo wg show wg0 listen-port 2>/dev/null || echo "")
+addr=$(ip -4 addr show wg0 2>/dev/null | grep -oP "inet \K[0-9./]+" | head -1)
+[ -z "$addr" ] && addr=$(ip -6 addr show wg0 2>/dev/null | grep -oP "inet6 \K[0-9a-f:/]+" | head -1)
+
+state=$(ip link show wg0 2>/dev/null | grep -oP "state \K\w+" || echo "DOWN")
+active="false"
+[ "$state" = "UP" ] || [ "$state" = "UNKNOWN" ] && active="true"
+
+# Get endpoint from config comment
+endpoint=$(grep "^# ENDPOINT" /etc/wireguard/wg0.conf 2>/dev/null | cut -d " " -f 3)
+
+# Public IP for display
+public_ip=$(wget -T 3 -t 1 -4qO- "http://ip1.dynupdate.no-ip.com/" 2>/dev/null || curl -m 3 -4Ls "http://ip1.dynupdate.no-ip.com/" 2>/dev/null || echo "")
+
+printf "SERVER_INFO:%s|%s|%s|%s|%s|%s\n" "$pubkey" "$listen" "$addr" "$active" "$endpoint" "$public_ip"
+
+# Parse named clients from config (BEGIN_PEER / END_PEER markers)
+# Also detect disabled clients (commented-out blocks)
+now=$(date +%s)
+current_name=""
+while IFS= read -r line; do
+  if echo "$line" | grep -q "^# BEGIN_PEER "; then
+    current_name=$(echo "$line" | sed "s/^# BEGIN_PEER //")
+    echo "CLIENT_START:${current_name}:enabled"
+  elif echo "$line" | grep -q "^# DISABLED_BEGIN_PEER "; then
+    current_name=$(echo "$line" | sed "s/^# DISABLED_BEGIN_PEER //")
+    echo "CLIENT_START:${current_name}:disabled"
+  elif echo "$line" | grep -q "^# END_PEER \|^# DISABLED_END_PEER "; then
+    echo "CLIENT_END"
+    current_name=""
+  fi
+done < /etc/wireguard/wg0.conf
+
+# Get live peer stats from wg show dump
+total_rx=0
+total_tx=0
+sudo wg show wg0 dump 2>/dev/null | tail -n +2 | while IFS="$(printf "\t")" read -r pk psk ep aip hs rx tx ka; do
+  hs_fmt=""
+  has_recent="false"
+  if [ "$hs" != "0" ] && [ -n "$hs" ]; then
+    hs_fmt=$(date -d "@$hs" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$hs" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$hs")
+    age=$((now - hs))
+    [ "$age" -lt 180 ] && has_recent="true"
+  fi
+  rx_h=$(numfmt --to=iec "$rx" 2>/dev/null || echo "${rx}B")
+  tx_h=$(numfmt --to=iec "$tx" 2>/dev/null || echo "${tx}B")
+  ka_str=""
+  [ "$ka" != "off" ] && [ -n "$ka" ] && ka_str="${ka}s"
+
+  # Find client name for this public key
+  client_name=$(grep -B1 "PublicKey = " /etc/wireguard/wg0.conf 2>/dev/null | grep -B1 "$pk" | grep -oP "BEGIN_PEER \K.*" | head -1)
+  [ -z "$client_name" ] && client_name="unknown"
+
+  printf "LIVE_PEER:%s|%s|%s|%s|%s|%s|%s|%s|%s\n" "$client_name" "$pk" "$ep" "$aip" "$hs_fmt" "$rx_h" "$tx_h" "$ka_str" "$has_recent"
+done
+
+# Total transfer
+sudo wg show wg0 transfer 2>/dev/null | while IFS="$(printf "\t")" read -r pk rx tx; do
+  total_rx=$((total_rx + rx))
+  total_tx=$((total_tx + tx))
+done
+trx=$(sudo wg show wg0 transfer 2>/dev/null | awk -F"\t" "{s+=\$2} END {print s+0}")
+ttx=$(sudo wg show wg0 transfer 2>/dev/null | awk -F"\t" "{s+=\$3} END {print s+0}")
+trx_h=$(numfmt --to=iec "$trx" 2>/dev/null || echo "${trx}B")
+ttx_h=$(numfmt --to=iec "$ttx" 2>/dev/null || echo "${ttx}B")
+printf "TOTAL_TRANSFER:%s|%s\n" "$trx_h" "$ttx_h"
+echo "STATUS_END"
 ' 2>/dev/null
 """
 
 
-@router.get("/{connection_id}/wireguard", response_model=WireGuardStatusResponse)
+def _build_wg_install_script(
+    endpoint: str, port: int, dns: str, first_client: str,
+    local_ip: str, ipv6_addr: str,
+) -> str:
+    """Build a non-interactive WireGuard install script mirroring the Nyr installer."""
+    # Sanitize all inputs
+    endpoint = _sanitize_shell(endpoint)
+    dns = _sanitize_shell(dns)
+    first_client = _sanitize_shell(first_client)
+    local_ip = _sanitize_shell(local_ip)
+    ipv6_addr = _sanitize_shell(ipv6_addr)
+
+    return f"""bash -c '
+set -e
+
+# Detect OS
+os=""
+if grep -qs "ubuntu" /etc/os-release; then os="ubuntu"
+elif [ -e /etc/debian_version ]; then os="debian"
+elif [ -e /etc/almalinux-release ] || [ -e /etc/rocky-release ] || [ -e /etc/centos-release ]; then os="centos"
+elif [ -e /etc/fedora-release ]; then os="fedora"
+else echo "ERROR: Unsupported OS"; exit 1; fi
+
+# BoringTun detection
+use_boringtun=0
+if systemd-detect-virt -cq 2>/dev/null; then
+  if ! grep -q "^wireguard " /proc/modules 2>/dev/null; then
+    use_boringtun=1
+  fi
+fi
+
+ip="{local_ip}"
+if [ -z "$ip" ]; then
+  ip=$(ip -4 addr | grep inet | grep -vE "127(\\.[0-9]{{1,3}}){{3}}" | cut -d "/" -f 1 | grep -oE "[0-9]{{1,3}}(\\.[0-9]{{1,3}}){{3}}" | head -1)
+fi
+
+ip6="{ipv6_addr}"
+port={port}
+client="{first_client}"
+dns="{dns}"
+public_ip="{endpoint}"
+
+echo ">>> Installing WireGuard packages..."
+
+if [ "$use_boringtun" -eq 0 ]; then
+  if [ "$os" = "ubuntu" ] || [ "$os" = "debian" ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y wireguard qrencode
+  elif [ "$os" = "centos" ]; then
+    dnf install -y epel-release
+    dnf install -y wireguard-tools qrencode
+  elif [ "$os" = "fedora" ]; then
+    dnf install -y wireguard-tools qrencode
+    mkdir -p /etc/wireguard/
+  fi
+else
+  echo ">>> Container detected, installing BoringTun..."
+  if [ "$os" = "ubuntu" ] || [ "$os" = "debian" ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y qrencode ca-certificates
+    apt-get install -y wireguard-tools --no-install-recommends
+  elif [ "$os" = "centos" ]; then
+    dnf install -y epel-release
+    dnf install -y wireguard-tools qrencode ca-certificates tar
+  elif [ "$os" = "fedora" ]; then
+    dnf install -y wireguard-tools qrencode ca-certificates tar
+    mkdir -p /etc/wireguard/
+  fi
+  {{ wget -qO- https://wg.nyr.be/1/latest/download 2>/dev/null || curl -sL https://wg.nyr.be/1/latest/download; }} | tar xz -C /usr/local/sbin/ --wildcards "boringtun-*/boringtun" --strip-components 1 || true
+  mkdir -p /etc/systemd/system/wg-quick@wg0.service.d/ 2>/dev/null
+  printf "[Service]\\nEnvironment=WG_QUICK_USERSPACE_IMPLEMENTATION=boringtun\\nEnvironment=WG_SUDO=1\\n" > /etc/systemd/system/wg-quick@wg0.service.d/boringtun.conf
+fi
+
+echo ">>> Configuring firewall..."
+# Install firewall if needed
+if ! systemctl is-active --quiet firewalld.service && ! command -v iptables >/dev/null 2>&1; then
+  if [ "$os" = "centos" ] || [ "$os" = "fedora" ]; then
+    dnf install -y firewalld
+    systemctl enable --now firewalld.service
+  elif [ "$os" = "ubuntu" ] || [ "$os" = "debian" ]; then
+    apt-get install -y iptables
+  fi
+fi
+
+echo ">>> Generating server keys..."
+server_privkey=$(wg genkey)
+server_pubkey=$(echo "$server_privkey" | wg pubkey)
+
+echo ">>> Creating server config..."
+ipv6_line=""
+[ -n "$ip6" ] && ipv6_line=", fddd:2c4:2c4:2c4::1/64"
+
+cat > /etc/wireguard/wg0.conf << WGEOF
+# Do not alter the commented lines
+# They are used by wireguard-install
+# ENDPOINT $public_ip
+
+[Interface]
+Address = 10.7.0.1/24${{ipv6_line}}
+PrivateKey = $server_privkey
+ListenPort = $port
+
+WGEOF
+chmod 600 /etc/wireguard/wg0.conf
+
+echo ">>> Enabling IP forwarding..."
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard-forward.conf
+echo 1 > /proc/sys/net/ipv4/ip_forward
+if [ -n "$ip6" ]; then
+  echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-wireguard-forward.conf
+  echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+fi
+
+echo ">>> Setting up firewall rules..."
+if systemctl is-active --quiet firewalld.service; then
+  firewall-cmd --add-port="${{port}}"/udp
+  firewall-cmd --zone=trusted --add-source=10.7.0.0/24
+  firewall-cmd --permanent --add-port="${{port}}"/udp
+  firewall-cmd --permanent --zone=trusted --add-source=10.7.0.0/24
+  firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to "$ip"
+  firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to "$ip"
+  if [ -n "$ip6" ]; then
+    firewall-cmd --zone=trusted --add-source=fddd:2c4:2c4:2c4::/64
+    firewall-cmd --permanent --zone=trusted --add-source=fddd:2c4:2c4:2c4::/64
+    firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to "$ip6"
+    firewall-cmd --permanent --direct --add-rule ipv6 nat POSTROUTING 0 -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to "$ip6"
+  fi
+else
+  iptables_path=$(command -v iptables)
+  ip6tables_path=$(command -v ip6tables)
+  if [ "$(systemd-detect-virt 2>/dev/null)" = "openvz" ] && readlink -f "$(command -v iptables)" | grep -q "nft" && command -v iptables-legacy >/dev/null 2>&1; then
+    iptables_path=$(command -v iptables-legacy)
+    ip6tables_path=$(command -v ip6tables-legacy)
+  fi
+  cat > /etc/systemd/system/wg-iptables.service << IPTEOF
+[Unit]
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=$iptables_path -w 5 -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip
+ExecStart=$iptables_path -w 5 -I INPUT -p udp --dport $port -j ACCEPT
+ExecStart=$iptables_path -w 5 -I FORWARD -s 10.7.0.0/24 -j ACCEPT
+ExecStart=$iptables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+ExecStop=$iptables_path -w 5 -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to $ip
+ExecStop=$iptables_path -w 5 -D INPUT -p udp --dport $port -j ACCEPT
+ExecStop=$iptables_path -w 5 -D FORWARD -s 10.7.0.0/24 -j ACCEPT
+ExecStop=$iptables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+IPTEOF
+
+  if [ -n "$ip6" ]; then
+    cat >> /etc/systemd/system/wg-iptables.service << IPTEOF6
+ExecStart=$ip6tables_path -w 5 -t nat -A POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6
+ExecStart=$ip6tables_path -w 5 -I FORWARD -s fddd:2c4:2c4:2c4::/64 -j ACCEPT
+ExecStart=$ip6tables_path -w 5 -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+ExecStop=$ip6tables_path -w 5 -t nat -D POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j SNAT --to $ip6
+ExecStop=$ip6tables_path -w 5 -D FORWARD -s fddd:2c4:2c4:2c4::/64 -j ACCEPT
+ExecStop=$ip6tables_path -w 5 -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+IPTEOF6
+  fi
+
+  cat >> /etc/systemd/system/wg-iptables.service << IPTEOF_END
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+IPTEOF_END
+  systemctl enable --now wg-iptables.service
+fi
+
+echo ">>> Creating first client: $client..."
+key=$(wg genkey)
+psk=$(wg genpsk)
+client_pubkey=$(echo "$key" | wg pubkey)
+
+ipv6_peer=""
+[ -n "$ip6" ] && ipv6_peer=", fddd:2c4:2c4:2c4::2/128"
+
+cat >> /etc/wireguard/wg0.conf << PEEREOF
+# BEGIN_PEER $client
+[Peer]
+PublicKey = $client_pubkey
+PresharedKey = $psk
+AllowedIPs = 10.7.0.2/32${{ipv6_peer}}
+# END_PEER $client
+PEEREOF
+
+ipv6_client=""
+[ -n "$ip6" ] && ipv6_client=", fddd:2c4:2c4:2c4::2/64"
+
+mkdir -p /etc/wireguard/clients
+cat > "/etc/wireguard/clients/$client.conf" << CLIENTEOF
+[Interface]
+Address = 10.7.0.2/24${{ipv6_client}}
+DNS = $dns
+PrivateKey = $key
+
+[Peer]
+PublicKey = $server_pubkey
+PresharedKey = $psk
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = $public_ip:$port
+PersistentKeepalive = 25
+CLIENTEOF
+
+echo ">>> Starting WireGuard service..."
+systemctl enable --now wg-quick@wg0.service
+
+echo ">>> Verifying installation..."
+if systemctl is-active --quiet wg-quick@wg0.service && command -v wg >/dev/null 2>&1; then
+  echo "WG_INSTALL_SUCCESS"
+  echo ">>> WireGuard installed and running successfully!"
+else
+  echo "WG_INSTALL_FAILED"
+  echo ">>> WireGuard service failed to start"
+  exit 1
+fi
+' 2>&1
+"""
+
+
+WG_UNINSTALL_SCRIPT = r"""
+bash -c '
+set -e
+
+# Detect OS
+os=""
+if grep -qs "ubuntu" /etc/os-release; then os="ubuntu"
+elif [ -e /etc/debian_version ]; then os="debian"
+elif [ -e /etc/almalinux-release ] || [ -e /etc/rocky-release ] || [ -e /etc/centos-release ]; then os="centos"
+elif [ -e /etc/fedora-release ]; then os="fedora"
+fi
+
+# BoringTun check
+use_boringtun=0
+[ -f /usr/local/sbin/boringtun ] && use_boringtun=1
+
+port=$(grep "^ListenPort" /etc/wireguard/wg0.conf | cut -d " " -f 3)
+
+echo ">>> Removing firewall rules..."
+if systemctl is-active --quiet firewalld.service; then
+  ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep "\-s 10.7.0.0/24" | grep -oE "[^ ]+$" || true)
+  firewall-cmd --remove-port="${port}"/udp 2>/dev/null || true
+  firewall-cmd --zone=trusted --remove-source=10.7.0.0/24 2>/dev/null || true
+  firewall-cmd --permanent --remove-port="${port}"/udp 2>/dev/null || true
+  firewall-cmd --permanent --zone=trusted --remove-source=10.7.0.0/24 2>/dev/null || true
+  [ -n "$ip" ] && firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to "$ip" 2>/dev/null || true
+  [ -n "$ip" ] && firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j SNAT --to "$ip" 2>/dev/null || true
+  if grep -qs "fddd:2c4:2c4:2c4::1/64" /etc/wireguard/wg0.conf; then
+    firewall-cmd --zone=trusted --remove-source=fddd:2c4:2c4:2c4::/64 2>/dev/null || true
+    firewall-cmd --permanent --zone=trusted --remove-source=fddd:2c4:2c4:2c4::/64 2>/dev/null || true
+  fi
+else
+  systemctl disable --now wg-iptables.service 2>/dev/null || true
+  rm -f /etc/systemd/system/wg-iptables.service
+fi
+
+echo ">>> Stopping WireGuard service..."
+systemctl disable --now wg-quick@wg0.service 2>/dev/null || true
+rm -f /etc/systemd/system/wg-quick@wg0.service.d/boringtun.conf
+rm -f /etc/sysctl.d/99-wireguard-forward.conf
+
+echo ">>> Removing packages..."
+if [ "$use_boringtun" -eq 0 ]; then
+  if [ "$os" = "ubuntu" ] || [ "$os" = "debian" ]; then
+    apt-get remove --purge -y wireguard wireguard-tools 2>/dev/null || true
+  elif [ "$os" = "centos" ] || [ "$os" = "fedora" ]; then
+    dnf remove -y wireguard-tools 2>/dev/null || true
+  fi
+else
+  if [ "$os" = "ubuntu" ] || [ "$os" = "debian" ]; then
+    apt-get remove --purge -y wireguard-tools 2>/dev/null || true
+  elif [ "$os" = "centos" ] || [ "$os" = "fedora" ]; then
+    dnf remove -y wireguard-tools 2>/dev/null || true
+  fi
+  rm -f /usr/local/sbin/boringtun /usr/local/sbin/boringtun-upgrade
+  { crontab -l 2>/dev/null | grep -v "/usr/local/sbin/boringtun-upgrade"; } | crontab - 2>/dev/null || true
+fi
+
+echo ">>> Cleaning up config files..."
+rm -rf /etc/wireguard/
+
+echo ">>> Verifying removal..."
+if ! command -v wg >/dev/null 2>&1 && [ ! -e /etc/wireguard/wg0.conf ]; then
+  echo "WG_UNINSTALL_SUCCESS"
+else
+  echo "WG_UNINSTALL_FAILED"
+fi
+' 2>&1
+"""
+
+
+def _build_wg_add_client_script(client_name: str, dns: str) -> str:
+    """Build script to add a named WireGuard client."""
+    client_name = _sanitize_shell(client_name)
+    dns = _sanitize_shell(dns)
+
+    return f"""bash -c '
+set -e
+
+client="{client_name}"
+dns="{dns}"
+
+# Check client name not already in use
+if grep -q "^# BEGIN_PEER $client$" /etc/wireguard/wg0.conf; then
+  echo "ERROR:Client name already exists"
+  exit 1
+fi
+
+# Find next available IP octet
+octet=2
+while grep AllowedIPs /etc/wireguard/wg0.conf | cut -d "." -f 4 | cut -d "/" -f 1 | grep -q "^$octet$"; do
+  octet=$((octet + 1))
+done
+if [ "$octet" -ge 255 ]; then
+  echo "ERROR:Address space full (max 253 clients)"
+  exit 1
+fi
+
+# Generate keys
+key=$(wg genkey)
+psk=$(wg genpsk)
+client_pubkey=$(echo "$key" | wg pubkey)
+server_pubkey=$(grep PrivateKey /etc/wireguard/wg0.conf | cut -d " " -f 3 | wg pubkey)
+
+# IPv6 support
+ipv6_peer=""
+grep -q "fddd:2c4:2c4:2c4::1" /etc/wireguard/wg0.conf && ipv6_peer=", fddd:2c4:2c4:2c4::$octet/128"
+
+# Add peer to server config
+cat >> /etc/wireguard/wg0.conf << PEEREOF
+# BEGIN_PEER $client
+[Peer]
+PublicKey = $client_pubkey
+PresharedKey = $psk
+AllowedIPs = 10.7.0.$octet/32${{ipv6_peer}}
+# END_PEER $client
+PEEREOF
+
+# Add to live interface
+wg addconf wg0 <(sed -n "/^# BEGIN_PEER $client$/,/^# END_PEER $client$/p" /etc/wireguard/wg0.conf)
+
+# IPv6 client address
+ipv6_client=""
+grep -q "fddd:2c4:2c4:2c4::1" /etc/wireguard/wg0.conf && ipv6_client=", fddd:2c4:2c4:2c4::$octet/64"
+
+# Build client config
+endpoint=$(grep "^# ENDPOINT" /etc/wireguard/wg0.conf | cut -d " " -f 3)
+listen_port=$(grep ListenPort /etc/wireguard/wg0.conf | cut -d " " -f 3)
+
+mkdir -p /etc/wireguard/clients
+cat > "/etc/wireguard/clients/$client.conf" << CLIENTEOF
+[Interface]
+Address = 10.7.0.$octet/24${{ipv6_client}}
+DNS = $dns
+PrivateKey = $key
+
+[Peer]
+PublicKey = $server_pubkey
+PresharedKey = $psk
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = $endpoint:$listen_port
+PersistentKeepalive = 25
+CLIENTEOF
+
+# Output the config content
+echo "CLIENT_CONFIG_START"
+cat "/etc/wireguard/clients/$client.conf"
+echo "CLIENT_CONFIG_END"
+
+# Generate QR code as SVG if qrencode is available
+if command -v qrencode >/dev/null 2>&1; then
+  echo "QR_SVG_START"
+  qrencode -t SVG -r "/etc/wireguard/clients/$client.conf"
+  echo "QR_SVG_END"
+fi
+
+# Verify peer was added
+if sudo wg show wg0 dump | grep -q "$client_pubkey"; then
+  echo "ADD_CLIENT_SUCCESS"
+else
+  echo "ADD_CLIENT_FAILED"
+fi
+' 2>&1
+"""
+
+
+def _build_wg_remove_client_script(client_name: str) -> str:
+    """Build script to remove a named WireGuard client."""
+    client_name = _sanitize_shell(client_name)
+
+    return f"""bash -c '
+client="{client_name}"
+
+# Find the public key for this client
+pubkey=$(sed -n "/^# BEGIN_PEER $client$/,/^# END_PEER $client$/p" /etc/wireguard/wg0.conf | grep "PublicKey" | cut -d " " -f 3)
+
+if [ -z "$pubkey" ]; then
+  echo "ERROR:Client not found"
+  exit 1
+fi
+
+# Remove from live interface
+sudo wg set wg0 peer "$pubkey" remove
+
+# Remove from config file
+sudo sed -i "/^# BEGIN_PEER $client$/,/^# END_PEER $client$/d" /etc/wireguard/wg0.conf
+
+# Remove client config file
+rm -f "/etc/wireguard/clients/$client.conf"
+
+# Verify removal
+if ! grep -q "^# BEGIN_PEER $client$" /etc/wireguard/wg0.conf; then
+  echo "REMOVE_CLIENT_SUCCESS"
+else
+  echo "REMOVE_CLIENT_FAILED"
+fi
+' 2>&1
+"""
+
+
+def _build_wg_toggle_client_script(client_name: str, action: str) -> str:
+    """Build script to enable/disable a named WireGuard client."""
+    client_name = _sanitize_shell(client_name)
+
+    if action == "disable":
+        return f"""bash -c '
+client="{client_name}"
+
+# Check client exists and is enabled
+if ! grep -q "^# BEGIN_PEER $client$" /etc/wireguard/wg0.conf; then
+  echo "ERROR:Client not found or already disabled"
+  exit 1
+fi
+
+# Get public key before commenting
+pubkey=$(sed -n "/^# BEGIN_PEER $client$/,/^# END_PEER $client$/p" /etc/wireguard/wg0.conf | grep "PublicKey" | cut -d " " -f 3)
+
+# Remove from live interface
+[ -n "$pubkey" ] && sudo wg set wg0 peer "$pubkey" remove
+
+# Comment out the peer block by renaming markers and commenting config lines
+sudo sed -i "/^# BEGIN_PEER $client$/,/^# END_PEER $client$/{{
+  s/^# BEGIN_PEER $client$/# DISABLED_BEGIN_PEER $client/
+  s/^# END_PEER $client$/# DISABLED_END_PEER $client/
+  /^# DISABLED_/! s/^/# DISABLED_/
+}}" /etc/wireguard/wg0.conf
+
+# Verify
+if grep -q "^# DISABLED_BEGIN_PEER $client$" /etc/wireguard/wg0.conf; then
+  echo "TOGGLE_CLIENT_SUCCESS"
+else
+  echo "TOGGLE_CLIENT_FAILED"
+fi
+' 2>&1
+"""
+    else:  # enable
+        return f"""bash -c '
+client="{client_name}"
+
+# Check client exists and is disabled
+if ! grep -q "^# DISABLED_BEGIN_PEER $client$" /etc/wireguard/wg0.conf; then
+  echo "ERROR:Client not found or already enabled"
+  exit 1
+fi
+
+# Uncomment the peer block
+sudo sed -i "/^# DISABLED_BEGIN_PEER $client$/,/^# DISABLED_END_PEER $client$/{{
+  s/^# DISABLED_BEGIN_PEER $client$/# BEGIN_PEER $client/
+  s/^# DISABLED_END_PEER $client$/# END_PEER $client/
+  /^# \\(BEGIN\\|END\\)_PEER/! s/^# DISABLED_//
+}}" /etc/wireguard/wg0.conf
+
+# Re-add to live interface
+wg addconf wg0 <(sed -n "/^# BEGIN_PEER $client$/,/^# END_PEER $client$/p" /etc/wireguard/wg0.conf)
+
+# Verify
+if grep -q "^# BEGIN_PEER $client$" /etc/wireguard/wg0.conf; then
+  echo "TOGGLE_CLIENT_SUCCESS"
+else
+  echo "TOGGLE_CLIENT_FAILED"
+fi
+' 2>&1
+"""
+
+
+def _build_wg_get_client_config_script(client_name: str) -> str:
+    """Build script to retrieve a client config and generate QR."""
+    client_name = _sanitize_shell(client_name)
+
+    return f"""bash -c '
+client="{client_name}"
+conf="/etc/wireguard/clients/$client.conf"
+
+if [ ! -f "$conf" ]; then
+  echo "ERROR:Client config file not found"
+  exit 1
+fi
+
+echo "CLIENT_CONFIG_START"
+cat "$conf"
+echo "CLIENT_CONFIG_END"
+
+if command -v qrencode >/dev/null 2>&1; then
+  echo "QR_SVG_START"
+  qrencode -t SVG -r "$conf"
+  echo "QR_SVG_END"
+fi
+echo "GET_CONFIG_SUCCESS"
+' 2>&1
+"""
+
+
+@router.get("/{connection_id}/wireguard/check", response_model=WireGuardInstallCheck)
+async def check_wireguard(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Pre-install check: detect OS, version, existing install, IPs."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, WG_CHECK_SCRIPT, timeout=15)
+    stdout = result.get("stdout", "").strip()
+
+    data: dict = {
+        "supported": False, "os": "", "os_version": "",
+        "already_installed": False, "public_ip": "", "local_ips": [],
+        "has_ipv6": False, "ipv6_addr": "", "is_container": False,
+        "needs_boringtun": False, "reason": "",
+    }
+
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if line.startswith("SUPPORTED:"):
+            data["supported"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("OS:"):
+            data["os"] = line.split(":", 1)[1]
+        elif line.startswith("OS_VERSION:"):
+            data["os_version"] = line.split(":", 1)[1]
+        elif line.startswith("ALREADY_INSTALLED:"):
+            data["already_installed"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("PUBLIC_IP:"):
+            data["public_ip"] = line.split(":", 1)[1]
+        elif line.startswith("LOCAL_IPS:"):
+            ips_str = line.split(":", 1)[1]
+            data["local_ips"] = [ip for ip in ips_str.split(",") if ip] if ips_str else []
+        elif line.startswith("HAS_IPV6:"):
+            data["has_ipv6"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("IPV6_ADDR:"):
+            data["ipv6_addr"] = line.split(":", 1)[1]
+        elif line.startswith("IS_CONTAINER:"):
+            data["is_container"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("NEEDS_BORINGTUN:"):
+            data["needs_boringtun"] = line.split(":", 1)[1] == "true"
+        elif line.startswith("REASON:"):
+            data["reason"] = line.split(":", 1)[1]
+
+    return WireGuardInstallCheck(**data)
+
+
+@router.get("/{connection_id}/wireguard/status", response_model=WireGuardStatusResponse)
 async def get_wireguard_status(
     connection_id: str,
     current_user: User = Depends(get_current_user),
 ):
-    """Get WireGuard status and interfaces."""
+    """Get comprehensive WireGuard server status and named clients."""
     await _verify_connection(connection_id, current_user)
 
-    result = await _run(connection_id, WIREGUARD_STATUS_SCRIPT, timeout=10)
+    result = await _run(connection_id, WG_STATUS_SCRIPT, timeout=15)
     stdout = result.get("stdout", "").strip()
 
-    installed = False
-    version = ""
-    interfaces: list[WireGuardInterface] = []
-    current_iface: dict | None = None
-    current_peers: list[WireGuardPeer] = []
+    data: dict = {
+        "installed": False, "version": "", "active": False,
+        "server_public_key": "", "listen_port": "", "address": "",
+        "endpoint": "", "public_ip": "",
+        "total_transfer_rx": "0", "total_transfer_tx": "0",
+        "clients": [], "active_clients": 0, "total_clients": 0,
+    }
+
+    # Track client names and states from config parsing
+    client_configs: list[dict] = []
+    live_peers: dict[str, dict] = {}  # keyed by client name
 
     for line in stdout.split("\n"):
         line = line.strip()
         if not line:
             continue
+
         if line.startswith("INSTALLED:"):
-            installed = line.split(":", 1)[1] == "true"
+            data["installed"] = line.split(":", 1)[1] == "true"
         elif line.startswith("VERSION:"):
-            version = line.split(":", 1)[1]
-        elif line.startswith("IFACE_START:"):
-            iface_name = line.split(":", 1)[1]
-            current_iface = {"name": iface_name}
-            current_peers = []
-        elif line.startswith("IFACE_INFO:") and current_iface is not None:
-            parts = line.split(":", 1)[1].split("|", 3)
-            current_iface["public_key"] = parts[0] if len(parts) > 0 else ""
-            current_iface["listening_port"] = parts[1] if len(parts) > 1 else ""
-            current_iface["address"] = parts[2] if len(parts) > 2 else ""
-            current_iface["active"] = parts[3] == "true" if len(parts) > 3 else False
-        elif line.startswith("PEER:") and current_iface is not None:
-            parts = line.split(":", 1)[1].split("|", 6)
-            current_peers.append(WireGuardPeer(
-                public_key=parts[0] if len(parts) > 0 else "",
-                endpoint=parts[1] if len(parts) > 1 else "",
-                allowed_ips=parts[2] if len(parts) > 2 else "",
-                latest_handshake=parts[3] if len(parts) > 3 else "",
-                transfer_rx=parts[4] if len(parts) > 4 else "",
-                transfer_tx=parts[5] if len(parts) > 5 else "",
-                persistent_keepalive=parts[6] if len(parts) > 6 else "",
-            ))
-        elif line == "IFACE_END" and current_iface is not None:
-            interfaces.append(WireGuardInterface(
-                **current_iface,
-                peers=current_peers,
-            ))
-            current_iface = None
-            current_peers = []
+            data["version"] = line.split(":", 1)[1]
+        elif line.startswith("SERVER_INFO:"):
+            parts = line.split(":", 1)[1].split("|", 5)
+            data["server_public_key"] = parts[0] if len(parts) > 0 else ""
+            data["listen_port"] = parts[1] if len(parts) > 1 else ""
+            data["address"] = parts[2] if len(parts) > 2 else ""
+            data["active"] = parts[3] == "true" if len(parts) > 3 else False
+            data["endpoint"] = parts[4] if len(parts) > 4 else ""
+            data["public_ip"] = parts[5] if len(parts) > 5 else ""
+        elif line.startswith("CLIENT_START:"):
+            parts = line.split(":", 1)[1].split(":", 1)
+            name = parts[0] if len(parts) > 0 else ""
+            enabled = parts[1] != "disabled" if len(parts) > 1 else True
+            client_configs.append({"name": name, "enabled": enabled})
+        elif line.startswith("LIVE_PEER:"):
+            parts = line.split(":", 1)[1].split("|", 8)
+            name = parts[0] if len(parts) > 0 else "unknown"
+            live_peers[name] = {
+                "public_key": parts[1] if len(parts) > 1 else "",
+                "endpoint": parts[2] if len(parts) > 2 else "",
+                "allowed_ips": parts[3] if len(parts) > 3 else "",
+                "latest_handshake": parts[4] if len(parts) > 4 else "",
+                "transfer_rx": parts[5] if len(parts) > 5 else "",
+                "transfer_tx": parts[6] if len(parts) > 6 else "",
+                "persistent_keepalive": parts[7] if len(parts) > 7 else "",
+                "has_recent_handshake": parts[8] == "true" if len(parts) > 8 else False,
+            }
+        elif line.startswith("TOTAL_TRANSFER:"):
+            parts = line.split(":", 1)[1].split("|", 1)
+            data["total_transfer_rx"] = parts[0] if len(parts) > 0 else "0"
+            data["total_transfer_tx"] = parts[1] if len(parts) > 1 else "0"
 
-    return WireGuardStatusResponse(
-        installed=installed,
-        version=version,
-        interfaces=interfaces,
-    )
+    # Merge config clients with live stats
+    active_count = 0
+    clients = []
+    for cc in client_configs:
+        name = cc["name"]
+        live = live_peers.get(name, {})
+        has_recent = live.get("has_recent_handshake", False)
+        if has_recent:
+            active_count += 1
+        clients.append(WireGuardClient(
+            name=name,
+            public_key=live.get("public_key", ""),
+            allowed_ips=live.get("allowed_ips", ""),
+            endpoint=live.get("endpoint", ""),
+            latest_handshake=live.get("latest_handshake", ""),
+            transfer_rx=live.get("transfer_rx", ""),
+            transfer_tx=live.get("transfer_tx", ""),
+            persistent_keepalive=live.get("persistent_keepalive", ""),
+            enabled=cc["enabled"],
+            has_recent_handshake=has_recent,
+        ))
+
+    data["clients"] = clients
+    data["total_clients"] = len(clients)
+    data["active_clients"] = active_count
+
+    return WireGuardStatusResponse(**data)
 
 
-@router.post("/{connection_id}/wireguard/{interface}/toggle")
-async def toggle_wireguard_interface(
+@router.post("/{connection_id}/wireguard/toggle")
+async def toggle_wireguard(
     connection_id: str,
-    interface: str,
     current_user: User = Depends(get_current_user),
 ):
-    """Bring a WireGuard interface up or down."""
+    """Bring wg0 interface up or down."""
     await _verify_connection(connection_id, current_user)
 
-    if not all(c.isalnum() or c in "-_" for c in interface):
-        raise HTTPException(status_code=400, detail="Invalid interface name")
-
-    # Check current state
     state_result = await _run(
         connection_id,
-        f"ip link show {interface} 2>/dev/null | grep -oP 'state \\K\\w+'",
+        "ip link show wg0 2>/dev/null | grep -oP 'state \\K\\w+'",
         timeout=5,
     )
     current_state = state_result.get("stdout", "").strip()
     is_up = current_state in ("UP", "UNKNOWN")
 
-    if is_up:
-        cmd = f"sudo wg-quick down {interface} 2>&1; echo EXIT:$?"
-    else:
-        cmd = f"sudo wg-quick up {interface} 2>&1; echo EXIT:$?"
-
+    cmd = f"sudo wg-quick {'down' if is_up else 'up'} wg0 2>&1; echo EXIT:$?"
     result = await _run(connection_id, cmd, timeout=15)
     stdout = result.get("stdout", "").strip()
 
@@ -1901,10 +4451,30 @@ async def toggle_wireguard_interface(
 
     if exit_code != "0":
         error_lines = [l for l in stdout.split("\n") if not l.startswith("EXIT:")]
-        raise HTTPException(status_code=400, detail="\n".join(error_lines) or f"Failed to toggle {interface}")
+        raise HTTPException(status_code=400, detail="\n".join(error_lines) or "Failed to toggle wg0")
 
     action = "down" if is_up else "up"
-    return {"message": f"Interface {interface} brought {action}"}
+    return {"message": f"Interface wg0 brought {action}", "active": not is_up}
+
+
+@router.post("/{connection_id}/wireguard/uninstall")
+async def uninstall_wireguard(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Remove WireGuard completely from the server."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, WG_UNINSTALL_SCRIPT, timeout=120)
+    stdout = result.get("stdout", "").strip()
+
+    if "WG_UNINSTALL_SUCCESS" in stdout:
+        return {"message": "WireGuard removed successfully", "success": True, "output": stdout}
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Uninstall may have failed. Output:\n{stdout}",
+        )
 
 
 @router.post("/{connection_id}/wireguard/generate-keypair", response_model=WireGuardKeyPair)
@@ -1926,121 +4496,171 @@ async def generate_wireguard_keypair(
     return WireGuardKeyPair(private_key=lines[0].strip(), public_key=lines[1].strip())
 
 
-@router.post("/{connection_id}/wireguard/create-config")
-async def create_wireguard_config(
+@router.post("/{connection_id}/wireguard/clients/add", response_model=WireGuardClientConfig)
+async def add_wireguard_client(
     connection_id: str,
-    request: WireGuardCreateConfig,
+    request: WireGuardAddClient,
     current_user: User = Depends(get_current_user),
 ):
-    """Create a WireGuard interface config file in /etc/wireguard/."""
+    """Add a named WireGuard client (Nyr-style with config + QR)."""
     await _verify_connection(connection_id, current_user)
 
-    iface = request.interface_name
-    if not all(c.isalnum() or c in "-_" for c in iface):
-        raise HTTPException(status_code=400, detail="Invalid interface name")
+    if not _re.match(r'^[a-zA-Z0-9_-]+$', request.name):
+        raise HTTPException(status_code=400, detail="Invalid client name")
 
-    # Sanitize private key (base64 chars only)
-    import re
-    if not re.match(r'^[A-Za-z0-9+/=]+$', request.private_key):
-        raise HTTPException(status_code=400, detail="Invalid private key format")
-
-    # Build config content
-    config_lines = [
-        "[Interface]",
-        f"PrivateKey = {request.private_key}",
-        f"Address = {_sanitize_shell(request.address)}",
-        f"ListenPort = {request.listen_port}",
-    ]
-    config_content = "\\n".join(config_lines)
-
-    cmd = f'printf "{config_content}\\n" | sudo tee /etc/wireguard/{iface}.conf > /dev/null 2>&1 && sudo chmod 600 /etc/wireguard/{iface}.conf 2>&1; echo EXIT:$?'
-    result = await _run(connection_id, cmd, timeout=10)
+    script = _build_wg_add_client_script(request.name, request.dns)
+    result = await _run(connection_id, script, timeout=30)
     stdout = result.get("stdout", "").strip()
 
-    exit_code = "1"
+    if stdout.startswith("ERROR:"):
+        raise HTTPException(status_code=400, detail=stdout.replace("ERROR:", "").strip())
+
+    # Parse config content
+    config_content = ""
+    qr_svg = ""
+
+    in_config = False
+    config_lines = []
+    in_qr = False
+    qr_lines = []
+
     for line in stdout.split("\n"):
-        if line.startswith("EXIT:"):
-            exit_code = line.replace("EXIT:", "").strip()
+        if line.strip() == "CLIENT_CONFIG_START":
+            in_config = True
+            continue
+        elif line.strip() == "CLIENT_CONFIG_END":
+            in_config = False
+            continue
+        elif line.strip() == "QR_SVG_START":
+            in_qr = True
+            continue
+        elif line.strip() == "QR_SVG_END":
+            in_qr = False
+            continue
 
-    if exit_code != "0":
-        raise HTTPException(status_code=400, detail=f"Failed to create config: {stdout}")
+        if in_config:
+            config_lines.append(line)
+        elif in_qr:
+            qr_lines.append(line)
 
-    return {"message": f"WireGuard config created for {iface}"}
+    config_content = "\n".join(config_lines)
+    qr_svg = "\n".join(qr_lines)
+
+    if "ADD_CLIENT_FAILED" in stdout:
+        raise HTTPException(status_code=500, detail="Client was created but peer verification failed")
+
+    return WireGuardClientConfig(
+        name=request.name,
+        config_content=config_content,
+        qr_svg=qr_svg,
+    )
 
 
-@router.post("/{connection_id}/wireguard/{interface}/add-peer")
-async def add_wireguard_peer(
+@router.post("/{connection_id}/wireguard/clients/remove")
+async def remove_wireguard_client(
     connection_id: str,
-    interface: str,
-    request: WireGuardAddPeer,
+    request: WireGuardRemoveClient,
     current_user: User = Depends(get_current_user),
 ):
-    """Add a peer to a WireGuard interface."""
+    """Remove a named WireGuard client."""
     await _verify_connection(connection_id, current_user)
 
-    if not all(c.isalnum() or c in "-_" for c in interface):
-        raise HTTPException(status_code=400, detail="Invalid interface name")
+    if not _re.match(r'^[a-zA-Z0-9_-]+$', request.name):
+        raise HTTPException(status_code=400, detail="Invalid client name")
 
-    import re
-    if not re.match(r'^[A-Za-z0-9+/=]+$', request.public_key):
-        raise HTTPException(status_code=400, detail="Invalid public key format")
-
-    allowed_ips = _sanitize_shell(request.allowed_ips)
-
-    parts = [f"sudo wg set {interface} peer {request.public_key} allowed-ips {allowed_ips}"]
-    if request.endpoint:
-        endpoint = _sanitize_shell(request.endpoint)
-        parts[0] += f" endpoint {endpoint}"
-    if request.persistent_keepalive > 0:
-        parts[0] += f" persistent-keepalive {request.persistent_keepalive}"
-
-    cmd = parts[0] + " 2>&1; echo EXIT:$?"
-    result = await _run(connection_id, cmd, timeout=10)
+    script = _build_wg_remove_client_script(request.name)
+    result = await _run(connection_id, script, timeout=15)
     stdout = result.get("stdout", "").strip()
 
-    exit_code = "1"
-    for line in stdout.split("\n"):
-        if line.startswith("EXIT:"):
-            exit_code = line.replace("EXIT:", "").strip()
+    if "ERROR:" in stdout:
+        raise HTTPException(status_code=400, detail=stdout.split("ERROR:", 1)[1].strip())
 
-    if exit_code != "0":
-        error_lines = [l for l in stdout.split("\n") if not l.startswith("EXIT:")]
-        raise HTTPException(status_code=400, detail="\n".join(error_lines) or "Failed to add peer")
-
-    return {"message": f"Peer added to {interface}"}
+    if "REMOVE_CLIENT_SUCCESS" in stdout:
+        return {"message": f"Client '{request.name}' removed successfully"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to remove client")
 
 
-@router.post("/{connection_id}/wireguard/{interface}/remove-peer")
-async def remove_wireguard_peer(
+@router.post("/{connection_id}/wireguard/clients/toggle")
+async def toggle_wireguard_client(
     connection_id: str,
-    interface: str,
-    request: WireGuardRemovePeer,
+    request: WireGuardToggleClient,
     current_user: User = Depends(get_current_user),
 ):
-    """Remove a peer from a WireGuard interface."""
+    """Enable or disable a named WireGuard client."""
     await _verify_connection(connection_id, current_user)
 
-    if not all(c.isalnum() or c in "-_" for c in interface):
-        raise HTTPException(status_code=400, detail="Invalid interface name")
+    if not _re.match(r'^[a-zA-Z0-9_-]+$', request.name):
+        raise HTTPException(status_code=400, detail="Invalid client name")
 
-    import re
-    if not re.match(r'^[A-Za-z0-9+/=]+$', request.public_key):
-        raise HTTPException(status_code=400, detail="Invalid public key format")
+    if request.action not in ("enable", "disable"):
+        raise HTTPException(status_code=400, detail="Action must be 'enable' or 'disable'")
 
-    cmd = f"sudo wg set {interface} peer {request.public_key} remove 2>&1; echo EXIT:$?"
-    result = await _run(connection_id, cmd, timeout=10)
+    script = _build_wg_toggle_client_script(request.name, request.action)
+    result = await _run(connection_id, script, timeout=15)
     stdout = result.get("stdout", "").strip()
 
-    exit_code = "1"
+    if "ERROR:" in stdout:
+        raise HTTPException(status_code=400, detail=stdout.split("ERROR:", 1)[1].strip())
+
+    if "TOGGLE_CLIENT_SUCCESS" in stdout:
+        return {"message": f"Client '{request.name}' {request.action}d successfully"}
+    else:
+        raise HTTPException(status_code=500, detail=f"Failed to {request.action} client")
+
+
+@router.get("/{connection_id}/wireguard/clients/{client_name}/config", response_model=WireGuardClientConfig)
+async def get_wireguard_client_config(
+    connection_id: str,
+    client_name: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Get a client's config file and QR code."""
+    await _verify_connection(connection_id, current_user)
+
+    if not _re.match(r'^[a-zA-Z0-9_-]+$', client_name):
+        raise HTTPException(status_code=400, detail="Invalid client name")
+
+    script = _build_wg_get_client_config_script(client_name)
+    result = await _run(connection_id, script, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    if "ERROR:" in stdout:
+        raise HTTPException(status_code=404, detail=stdout.split("ERROR:", 1)[1].strip())
+
+    config_content = ""
+    qr_svg = ""
+    in_config = False
+    config_lines = []
+    in_qr = False
+    qr_lines = []
+
     for line in stdout.split("\n"):
-        if line.startswith("EXIT:"):
-            exit_code = line.replace("EXIT:", "").strip()
+        if line.strip() == "CLIENT_CONFIG_START":
+            in_config = True
+            continue
+        elif line.strip() == "CLIENT_CONFIG_END":
+            in_config = False
+            continue
+        elif line.strip() == "QR_SVG_START":
+            in_qr = True
+            continue
+        elif line.strip() == "QR_SVG_END":
+            in_qr = False
+            continue
+        if in_config:
+            config_lines.append(line)
+        elif in_qr:
+            qr_lines.append(line)
 
-    if exit_code != "0":
-        error_lines = [l for l in stdout.split("\n") if not l.startswith("EXIT:")]
-        raise HTTPException(status_code=400, detail="\n".join(error_lines) or "Failed to remove peer")
+    config_content = "\n".join(config_lines)
+    qr_svg = "\n".join(qr_lines)
 
-    return {"message": f"Peer removed from {interface}"}
+    return WireGuardClientConfig(
+        name=client_name,
+        config_content=config_content,
+        qr_svg=qr_svg,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2052,16 +4672,71 @@ sh -c '
 user=$(whoami)
 echo "USER:${user}"
 
-# User crontab
+# Extract env vars from crontab
+echo "ENV_START"
+crontab -l 2>/dev/null | grep -E "^(SHELL|PATH|MAILTO|HOME|LOGNAME)=" | while IFS= read -r line; do
+  key=$(echo "$line" | cut -d= -f1)
+  val=$(echo "$line" | cut -d= -f2-)
+  val_esc=$(printf "%s" "$val" | sed "s/\"/\\\\\"/g")
+  printf "{\"key\":\"%s\",\"value\":\"%s\"}\n" "$key" "$val_esc"
+done
+echo "ENV_END"
+
+# User crontab -- include disabled (commented) lines too
 echo "USER_CRON_START"
-  crontab -l 2>/dev/null | grep -v "^#" | grep -v "^$" | cat -n | while IFS="$(printf '\t')" read -r num line; do
-  num=$(echo "$num" | tr -d " ")
-  sched=$(echo "$line" | awk "{print \$1,\$2,\$3,\$4,\$5}")
-  cmd=$(echo "$line" | awk "{for(i=6;i<=NF;i++) printf \"%s \",\$i; print \"\"}" | sed "s/ $//")
-  cmd_esc=$(printf "%s" "$cmd" | sed "s/\"/\\\\\"/g")
-  raw_esc=$(printf "%s" "$line" | sed "s/\"/\\\\\"/g")
-  printf "{\"schedule\":\"%s\",\"command\":\"%s\",\"user\":\"%s\",\"line_number\":%s,\"raw\":\"%s\"}\n" \
-    "$sched" "$cmd_esc" "$user" "$num" "$raw_esc"
+line_num=0
+crontab -l 2>/dev/null | grep -v "^$" | while IFS= read -r line; do
+  # Skip env var lines
+  case "$line" in SHELL=*|PATH=*|MAILTO=*|HOME=*|LOGNAME=*) continue ;; esac
+
+  # Check if it is a pure comment (not a disabled job)
+  is_comment_line=false
+  stripped=$(echo "$line" | sed "s/^#\s*//")
+  # A disabled job looks like: #* * * * * command or #*/5 * * * * command
+  first_field=$(echo "$stripped" | awk "{print \$1}")
+  case "$first_field" in
+    \*|[0-9]*|*/[0-9]*|@reboot|@hourly|@daily|@weekly|@monthly|@yearly|@annually)
+      ;;
+    *)
+      is_comment_line=true
+      ;;
+  esac
+
+  if [ "$is_comment_line" = "true" ]; then
+    continue
+  fi
+
+  line_num=$((line_num + 1))
+
+  enabled="true"
+  parse_line="$line"
+  if echo "$line" | grep -q "^#"; then
+    enabled="false"
+    parse_line="$stripped"
+  fi
+
+  # Check for inline comment at the end
+  comment=""
+
+  # Handle special schedules
+  first_word=$(echo "$parse_line" | awk "{print \$1}")
+  case "$first_word" in
+    @reboot|@hourly|@daily|@weekly|@monthly|@yearly|@annually)
+      sched="$first_word"
+      cmd=$(echo "$parse_line" | awk "{for(i=2;i<=NF;i++) printf \"%s \",\$i; print \"\"}" | sed "s/ $//")
+      ;;
+    *)
+      sched=$(echo "$parse_line" | awk "{print \$1,\$2,\$3,\$4,\$5}")
+      cmd=$(echo "$parse_line" | awk "{for(i=6;i<=NF;i++) printf \"%s \",\$i; print \"\"}" | sed "s/ $//")
+      ;;
+  esac
+
+  cmd_esc=$(printf "%s" "$cmd" | sed "s/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g")
+  raw_esc=$(printf "%s" "$line" | sed "s/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g")
+  comment_esc=$(printf "%s" "$comment" | sed "s/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g")
+
+  printf "{\"schedule\":\"%s\",\"command\":\"%s\",\"user\":\"%s\",\"line_number\":%s,\"raw\":\"%s\",\"enabled\":%s,\"comment\":\"%s\"}\n" \
+    "$sched" "$cmd_esc" "$user" "$line_num" "$raw_esc" "$enabled" "$comment_esc"
 done
 echo "USER_CRON_END"
 
@@ -2072,9 +4747,9 @@ if [ -f /etc/crontab ]; then
     sched=$(echo "$line" | awk "{print \$1,\$2,\$3,\$4,\$5}")
     cron_user=$(echo "$line" | awk "{print \$6}")
     cmd=$(echo "$line" | awk "{for(i=7;i<=NF;i++) printf \"%s \",\$i; print \"\"}" | sed "s/ $//")
-    cmd_esc=$(printf "%s" "$cmd" | sed "s/\"/\\\\\"/g")
-    raw_esc=$(printf "%s" "$line" | sed "s/\"/\\\\\"/g")
-    printf "{\"schedule\":\"%s\",\"command\":\"%s\",\"user\":\"%s\",\"line_number\":0,\"raw\":\"%s\"}\n" \
+    cmd_esc=$(printf "%s" "$cmd" | sed "s/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g")
+    raw_esc=$(printf "%s" "$line" | sed "s/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g")
+    printf "{\"schedule\":\"%s\",\"command\":\"%s\",\"user\":\"%s\",\"line_number\":0,\"raw\":\"%s\",\"enabled\":true,\"comment\":\"\"}\n" \
       "$sched" "$cmd_esc" "$cron_user" "$raw_esc"
   done
 fi
@@ -2085,15 +4760,96 @@ for f in /etc/cron.d/*; do
     sched=$(echo "$line" | awk "{print \$1,\$2,\$3,\$4,\$5}")
     cron_user=$(echo "$line" | awk "{print \$6}")
     cmd=$(echo "$line" | awk "{for(i=7;i<=NF;i++) printf \"%s \",\$i; print \"\"}" | sed "s/ $//")
-    cmd_esc=$(printf "%s" "$cmd" | sed "s/\"/\\\\\"/g")
-    raw_esc=$(printf "%s" "$line" | sed "s/\"/\\\\\"/g")
-    printf "{\"schedule\":\"%s\",\"command\":\"%s\",\"user\":\"%s\",\"line_number\":0,\"raw\":\"%s\"}\n" \
+    cmd_esc=$(printf "%s" "$cmd" | sed "s/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g")
+    raw_esc=$(printf "%s" "$line" | sed "s/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g")
+    printf "{\"schedule\":\"%s\",\"command\":\"%s\",\"user\":\"%s\",\"line_number\":0,\"raw\":\"%s\",\"enabled\":true,\"comment\":\"\"}\n" \
       "$sched" "$cmd_esc" "$cron_user" "$raw_esc"
   done
 done
 echo "SYSTEM_CRON_END"
 ' 2>/dev/null
 """
+
+CRON_HISTORY_SCRIPT = r"""
+# Try multiple sources for cron execution history
+if command -v journalctl >/dev/null 2>&1; then
+  journalctl -u cron -u crond --no-pager -n 200 --output=short-iso 2>/dev/null | grep -i "CMD\|CRON" | tail -100
+elif [ -f /var/log/cron ]; then
+  tail -200 /var/log/cron 2>/dev/null | grep -i "CMD\|CRON" | tail -100
+elif [ -f /var/log/syslog ]; then
+  grep -i "CRON" /var/log/syslog 2>/dev/null | tail -100
+else
+  echo "NO_CRON_LOGS"
+fi
+"""
+
+
+def _compute_next_run(schedule: str) -> str:
+    """Compute a human-readable next run time from a cron schedule expression."""
+    import re
+    from datetime import datetime, timezone, timedelta
+
+    if schedule.startswith("@"):
+        specials = {
+            "@reboot": "On reboot",
+            "@hourly": "At the start of next hour",
+            "@daily": "Tomorrow at midnight",
+            "@weekly": "Next Sunday at midnight",
+            "@monthly": "1st of next month",
+            "@yearly": "January 1st",
+            "@annually": "January 1st",
+        }
+        return specials.get(schedule, "")
+
+    parts = schedule.split()
+    if len(parts) < 5:
+        return ""
+
+    try:
+        now = datetime.now(timezone.utc)
+        minute_s, hour_s, dom_s, month_s, dow_s = parts[:5]
+
+        def parse_field(field: str, max_val: int, min_val: int = 0) -> list[int] | None:
+            if field == "*":
+                return None
+            values = set()
+            for part in field.split(","):
+                if "/" in part:
+                    base, step = part.split("/", 1)
+                    step = int(step)
+                    start = min_val if base == "*" else int(base)
+                    for v in range(start, max_val + 1, step):
+                        values.add(v)
+                elif "-" in part:
+                    a, b = part.split("-", 1)
+                    for v in range(int(a), int(b) + 1):
+                        values.add(v)
+                else:
+                    values.add(int(part))
+            return sorted(values) if values else None
+
+        minutes = parse_field(minute_s, 59, 0)
+        hours = parse_field(hour_s, 23, 0)
+
+        # Simple next-run: find next matching minute/hour from now
+        candidate = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        for _ in range(1440 * 7):  # search up to 7 days
+            m_ok = minutes is None or candidate.minute in minutes
+            h_ok = hours is None or candidate.hour in hours
+            if m_ok and h_ok:
+                delta = candidate - now
+                total_min = int(delta.total_seconds() // 60)
+                if total_min < 60:
+                    return f"in {total_min}m"
+                elif total_min < 1440:
+                    return f"in {total_min // 60}h {total_min % 60}m"
+                else:
+                    days = total_min // 1440
+                    return f"in {days}d {(total_min % 1440) // 60}h"
+            candidate += timedelta(minutes=1)
+        return ""
+    except Exception:
+        return ""
 
 
 @router.get("/{connection_id}/cron", response_model=CronListResponse)
@@ -2110,6 +4866,7 @@ async def list_cron_jobs(
     user = ""
     user_jobs: list[CronJob] = []
     system_jobs: list[CronJob] = []
+    env_vars: dict = {}
     section = ""
 
     for line in stdout.split("\n"):
@@ -2118,6 +4875,10 @@ async def list_cron_jobs(
             continue
         if line.startswith("USER:"):
             user = line.split(":", 1)[1]
+        elif line == "ENV_START":
+            section = "env"
+        elif line == "ENV_END":
+            section = ""
         elif line == "USER_CRON_START":
             section = "user"
         elif line == "USER_CRON_END":
@@ -2126,9 +4887,19 @@ async def list_cron_jobs(
             section = "system"
         elif line == "SYSTEM_CRON_END":
             section = ""
+        elif section == "env" and line.startswith("{"):
+            try:
+                ev = json.loads(line)
+                env_vars[ev["key"]] = ev["value"]
+            except (json.JSONDecodeError, KeyError):
+                continue
         elif section in ("user", "system") and line.startswith("{"):
             try:
-                job = CronJob(**json.loads(line))
+                data = json.loads(line)
+                job = CronJob(**data)
+                # Compute next run time server-side
+                if job.enabled:
+                    job.next_run = _compute_next_run(job.schedule)
                 if section == "user":
                     user_jobs.append(job)
                 else:
@@ -2136,11 +4907,17 @@ async def list_cron_jobs(
             except (json.JSONDecodeError, Exception):
                 continue
 
+    active = sum(1 for j in user_jobs if j.enabled)
+    disabled = sum(1 for j in user_jobs if not j.enabled)
+
     return CronListResponse(
         jobs=user_jobs,
         total=len(user_jobs),
+        active=active,
+        disabled=disabled,
         user=user,
         system_jobs=system_jobs,
+        env_vars=env_vars,
     )
 
 
@@ -2153,29 +4930,85 @@ async def add_cron_job(
     """Add a cron job to the current user's crontab."""
     await _verify_connection(connection_id, current_user)
 
-    # Sanitize schedule to prevent shell injection (command is passed via base64)
-    schedule = _sanitize_shell(request.schedule)
-
-    # Encode the full cron line via base64 to avoid any shell expansion
     import base64
-    cron_line = f"{schedule} {request.command}"
-    encoded_line = base64.b64encode(cron_line.encode()).decode()
 
-    # Append to crontab using base64 decode to prevent shell interpretation
-    cmd = f'(crontab -l 2>/dev/null; echo "{encoded_line}" | base64 -d 2>/dev/null || echo "{encoded_line}" | base64 -D 2>/dev/null) | crontab - 2>&1; echo EXIT:$?'
+    # Build full cron line, optionally with comment prefix
+    comment_line = ""
+    if request.comment:
+        safe_comment = request.comment.replace("\n", " ").replace("\r", "")
+        comment_line = f"# {safe_comment}\n"
+
+    cron_line = f"{request.schedule} {request.command}"
+    full_content = comment_line + cron_line + "\n"
+    encoded = base64.b64encode(full_content.encode()).decode()
+
+    # Pipe base64 decode directly to temp file to preserve trailing newline
+    # (command substitution $() strips trailing newlines, so we avoid it)
+    cmd = (
+        f'_tmpf=$(mktemp) && '
+        f'crontab -l 2>/dev/null > "$_tmpf" 2>/dev/null; '
+        f'(echo "{encoded}" | base64 -d 2>/dev/null || echo "{encoded}" | base64 -D 2>/dev/null) >> "$_tmpf" && '
+        f'crontab "$_tmpf" 2>&1; _rc=$?; rm -f "$_tmpf"; echo EXIT:$_rc'
+    )
     result = await _run(connection_id, cmd, timeout=10)
     stdout = result.get("stdout", "").strip()
 
-    exit_code = "1"
-    for line in stdout.split("\n"):
-        if line.startswith("EXIT:"):
-            exit_code = line.replace("EXIT:", "").strip()
-
+    exit_code, clean = _parse_exit_code(stdout)
     if exit_code != "0":
-        error_lines = [l for l in stdout.split("\n") if not l.startswith("EXIT:")]
-        raise HTTPException(status_code=400, detail="\n".join(error_lines) or "Failed to add cron job")
+        raise HTTPException(status_code=400, detail=clean or "Failed to add cron job")
 
     return {"message": "Cron job added successfully"}
+
+
+@router.post("/{connection_id}/cron/update")
+async def update_cron_job(
+    connection_id: str,
+    request: CronJobUpdate,
+    current_user: User = Depends(get_current_user),
+):
+    """Update an existing cron job by replacing the line at the given line number."""
+    await _verify_connection(connection_id, current_user)
+
+    import base64
+
+    line_num = request.line_number
+    new_cron_line = f"{request.schedule} {request.command}"
+    encoded_new = base64.b64encode(new_cron_line.encode()).decode()
+
+    # Replace the specific line in the crontab (line numbers are 1-indexed among non-comment/non-empty lines)
+    cmd = (
+        f'_tmpf=$(mktemp) && '
+        f'_decoded=$(echo "{encoded_new}" | base64 -d 2>/dev/null || echo "{encoded_new}" | base64 -D 2>/dev/null) && '
+        f'crontab -l 2>/dev/null > "$_tmpf" && '
+        f'_line_count=0 && _out=$(mktemp) && '
+        f'while IFS= read -r _line; do '
+        f'  case "$_line" in SHELL=*|PATH=*|MAILTO=*|HOME=*|LOGNAME=*) echo "$_line" >> "$_out"; continue ;; esac; '
+        f'  _stripped=$(echo "$_line" | sed "s/^#\\s*//"); '
+        f'  _first=$(echo "$_stripped" | awk "{{print \\$1}}"); '
+        f'  _is_job=false; '
+        f'  case "$_first" in \\*|[0-9]*|*/[0-9]*|@reboot|@hourly|@daily|@weekly|@monthly|@yearly|@annually) _is_job=true ;; esac; '
+        f'  if echo "$_line" | grep -q "^#" && [ "$_is_job" = "true" ]; then _is_job=true; fi; '
+        f'  if [ "$_is_job" = "true" ]; then '
+        f'    _line_count=$((_line_count + 1)); '
+        f'    if [ "$_line_count" -eq {line_num} ]; then '
+        f'      echo "$_decoded" >> "$_out"; '
+        f'    else '
+        f'      echo "$_line" >> "$_out"; '
+        f'    fi; '
+        f'  else '
+        f'    echo "$_line" >> "$_out"; '
+        f'  fi; '
+        f'done < "$_tmpf" && '
+        f'crontab "$_out" 2>&1; rm -f "$_tmpf" "$_out"; echo EXIT:$?'
+    )
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    exit_code, clean = _parse_exit_code(stdout)
+    if exit_code != "0":
+        raise HTTPException(status_code=400, detail=clean or "Failed to update cron job")
+
+    return {"message": "Cron job updated successfully"}
 
 
 @router.post("/{connection_id}/cron/delete")
@@ -2189,19 +5022,130 @@ async def delete_cron_job(
 
     line_num = request.line_number
 
-    # Remove the specific line from crontab using a temp file to avoid race conditions
-    cmd = f'_tmpf=$(mktemp) && crontab -l 2>/dev/null | grep -v "^#" | grep -v "^$" | sed "{line_num}d" > "$_tmpf" && '
-    cmd += f'(crontab -l 2>/dev/null | grep "^#"; cat "$_tmpf") | crontab - 2>&1; rm -f "$_tmpf"; echo EXIT:$?'
+    # Delete the specific job line (line numbers among non-env/non-blank lines, including disabled jobs)
+    cmd = (
+        f'_tmpf=$(mktemp) && '
+        f'crontab -l 2>/dev/null > "$_tmpf" && '
+        f'_line_count=0 && _out=$(mktemp) && '
+        f'while IFS= read -r _line; do '
+        f'  case "$_line" in SHELL=*|PATH=*|MAILTO=*|HOME=*|LOGNAME=*) echo "$_line" >> "$_out"; continue ;; esac; '
+        f'  _stripped=$(echo "$_line" | sed "s/^#\\s*//"); '
+        f'  _first=$(echo "$_stripped" | awk "{{print \\$1}}"); '
+        f'  _is_job=false; '
+        f'  case "$_first" in \\*|[0-9]*|*/[0-9]*|@reboot|@hourly|@daily|@weekly|@monthly|@yearly|@annually) _is_job=true ;; esac; '
+        f'  if echo "$_line" | grep -q "^#" && [ "$_is_job" = "true" ]; then _is_job=true; fi; '
+        f'  if [ "$_is_job" = "true" ]; then '
+        f'    _line_count=$((_line_count + 1)); '
+        f'    if [ "$_line_count" -ne {line_num} ]; then '
+        f'      echo "$_line" >> "$_out"; '
+        f'    fi; '
+        f'  else '
+        f'    echo "$_line" >> "$_out"; '
+        f'  fi; '
+        f'done < "$_tmpf" && '
+        f'crontab "$_out" 2>&1; rm -f "$_tmpf" "$_out"; echo EXIT:$?'
+    )
     result = await _run(connection_id, cmd, timeout=10)
     stdout = result.get("stdout", "").strip()
 
-    exit_code = "1"
-    for line in stdout.split("\n"):
-        if line.startswith("EXIT:"):
-            exit_code = line.replace("EXIT:", "").strip()
-
+    exit_code, clean = _parse_exit_code(stdout)
     if exit_code != "0":
-        error_lines = [l for l in stdout.split("\n") if not l.startswith("EXIT:")]
-        raise HTTPException(status_code=400, detail="\n".join(error_lines) or "Failed to delete cron job")
+        raise HTTPException(status_code=400, detail=clean or "Failed to delete cron job")
 
     return {"message": "Cron job deleted successfully"}
+
+
+@router.post("/{connection_id}/cron/toggle")
+async def toggle_cron_job(
+    connection_id: str,
+    request: CronJobToggle,
+    current_user: User = Depends(get_current_user),
+):
+    """Enable or disable a cron job by commenting/uncommenting the line."""
+    await _verify_connection(connection_id, current_user)
+
+    line_num = request.line_number
+    enable = "true" if request.enabled else "false"
+
+    cmd = (
+        f'_tmpf=$(mktemp) && '
+        f'crontab -l 2>/dev/null > "$_tmpf" && '
+        f'_line_count=0 && _out=$(mktemp) && '
+        f'while IFS= read -r _line; do '
+        f'  case "$_line" in SHELL=*|PATH=*|MAILTO=*|HOME=*|LOGNAME=*) echo "$_line" >> "$_out"; continue ;; esac; '
+        f'  _stripped=$(echo "$_line" | sed "s/^#\\s*//"); '
+        f'  _first=$(echo "$_stripped" | awk "{{print \\$1}}"); '
+        f'  _is_job=false; '
+        f'  case "$_first" in \\*|[0-9]*|*/[0-9]*|@reboot|@hourly|@daily|@weekly|@monthly|@yearly|@annually) _is_job=true ;; esac; '
+        f'  if echo "$_line" | grep -q "^#" && [ "$_is_job" = "true" ]; then _is_job=true; fi; '
+        f'  if [ "$_is_job" = "true" ]; then '
+        f'    _line_count=$((_line_count + 1)); '
+        f'    if [ "$_line_count" -eq {line_num} ]; then '
+        f'      if [ "{enable}" = "true" ]; then '
+        f'        echo "$_stripped" >> "$_out"; '
+        f'      else '
+        f'        echo "# $_stripped" >> "$_out"; '
+        f'      fi; '
+        f'    else '
+        f'      echo "$_line" >> "$_out"; '
+        f'    fi; '
+        f'  else '
+        f'    echo "$_line" >> "$_out"; '
+        f'  fi; '
+        f'done < "$_tmpf" && '
+        f'crontab "$_out" 2>&1; rm -f "$_tmpf" "$_out"; echo EXIT:$?'
+    )
+    result = await _run(connection_id, cmd, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    exit_code, clean = _parse_exit_code(stdout)
+    if exit_code != "0":
+        action_word = "enable" if request.enabled else "disable"
+        raise HTTPException(status_code=400, detail=clean or f"Failed to {action_word} cron job")
+
+    return {"message": f"Cron job {'enabled' if request.enabled else 'disabled'} successfully"}
+
+
+@router.get("/{connection_id}/cron/history", response_model=CronHistoryResponse)
+async def get_cron_history(
+    connection_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Get recent cron execution history from system logs."""
+    await _verify_connection(connection_id, current_user)
+
+    result = await _run(connection_id, CRON_HISTORY_SCRIPT, timeout=10)
+    stdout = result.get("stdout", "").strip()
+
+    entries: list[CronHistoryEntry] = []
+    if stdout and "NO_CRON_LOGS" not in stdout:
+        for line in stdout.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            # Parse log lines: timestamp hostname CRON[pid]: (user) CMD (command)
+            entry = CronHistoryEntry(message=line)
+            # Try to extract structured parts
+            import re
+            # journalctl ISO format: 2024-01-15T10:30:00+0000 hostname CRON[1234]: ...
+            m = re.match(r'^(\S+)\s+\S+\s+CRON\[(\d+)\]:\s*\((\S+)\)\s+CMD\s+\((.+)\)\s*$', line, re.IGNORECASE)
+            if m:
+                entry.timestamp = m.group(1)
+                entry.pid = m.group(2)
+                entry.user = m.group(3)
+                entry.command = m.group(4)
+            else:
+                # syslog format: Jan 15 10:30:00 hostname CRON[1234]: ...
+                m2 = re.match(r'^(\w+\s+\d+\s+[\d:]+)\s+\S+\s+CRON\[(\d+)\]:\s*\((\S+)\)\s+CMD\s+\((.+)\)\s*$', line, re.IGNORECASE)
+                if m2:
+                    entry.timestamp = m2.group(1)
+                    entry.pid = m2.group(2)
+                    entry.user = m2.group(3)
+                    entry.command = m2.group(4)
+
+            entries.append(entry)
+
+    return CronHistoryResponse(
+        entries=entries,
+        total=len(entries),
+    )

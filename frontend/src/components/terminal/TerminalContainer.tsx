@@ -3,12 +3,12 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { SearchAddon } from '@xterm/addon-search';
-import { getWsUrl } from '@/api/client';
+import { getWsUrl, apiPut } from '@/api/client';
 import { useThemeStore } from '@/store/themeStore';
 import { useAuthStore } from '@/store/authStore';
 import { useTabStore } from '@/store/tabStore';
 import { useSessionStore } from '@/store/sessionStore';
-import { decryptIfPresent } from '@/utils/crypto';
+import { decryptIfPresent, encrypt } from '@/utils/crypto';
 import { TERMINAL_THEMES } from '@/themes/terminal-themes';
 import { useCommandHistory } from '@/hooks/useCommandHistory';
 import { TerminalAutocomplete } from './TerminalAutocomplete';
@@ -34,7 +34,8 @@ interface TerminalContainerProps {
 type PromptMode =
   | null
   | { kind: 'host_key'; keyType: string; fingerprint: string }
-  | { kind: 'password' };
+  | { kind: 'password' }
+  | { kind: 'save_password'; sessionId: string; password: string };
 
 // Cache terminal instances so the buffer persists when the component is hidden/unmounted
 const terminalCache = new Map<
@@ -143,6 +144,11 @@ export const TerminalContainer: React.FC<TerminalContainerProps> = ({
     // ---------------------------------------------------------------
     let promptMode: PromptMode = null;
     let promptBuffer = '';
+    // Track the password entered during auth_retry so we can offer to save it.
+    let lastRetryPassword = '';
+    // Buffer SSH output that arrives while the save_password prompt is active
+    // so the shell prompt doesn't clobber it.
+    let pendingOutput = '';
 
     // Connect WebSocket
     const token = useAuthStore.getState().token;
@@ -309,6 +315,17 @@ export const TerminalContainer: React.FC<TerminalContainerProps> = ({
             if (msg.reconnected) {
               terminal.writeln('\r\n\x1b[32mSession reconnected\x1b[0m\r\n');
             }
+            // Offer to save the password if auth succeeded via manual retry
+            // on a saved session.
+            if (msg.auth_was_retry && msg.session_id && lastRetryPassword) {
+              promptMode = {
+                kind: 'save_password',
+                sessionId: msg.session_id,
+                password: lastRetryPassword,
+              };
+              promptBuffer = '';
+              terminal.write('\r\nSave password for this session? [y/n]: ');
+            }
           } else if (msg.type === 'disconnected') {
             terminal.writeln(`\r\n\x1b[33mDisconnected: ${msg.reason || 'Session ended'}\x1b[0m`);
             useTabStore.getState().updateTab(tabId, { isConnected: false, connectionId: undefined });
@@ -322,7 +339,12 @@ export const TerminalContainer: React.FC<TerminalContainerProps> = ({
             awaitingPong = false;
             missedPongs = 0;
           } else if (msg.type === 'data') {
-            terminal.write(msg.data);
+            if (promptMode?.kind === 'save_password') {
+              // Buffer output so the shell prompt doesn't clobber the y/n prompt.
+              pendingOutput += msg.data;
+            } else {
+              terminal.write(msg.data);
+            }
             useTabStore.getState().updateTab(tabId, { isConnected: true });
           }
         } catch {
@@ -377,13 +399,20 @@ export const TerminalContainer: React.FC<TerminalContainerProps> = ({
           terminal.writeln('^C');
           if (promptMode.kind === 'password') {
             ws.send(JSON.stringify({ type: 'auth_retry_cancel' }));
-          } else {
+          } else if (promptMode.kind === 'host_key') {
             ws.send(JSON.stringify({
               type: 'host_key_response',
               accepted: false,
               key_type: promptMode.keyType,
               fingerprint: promptMode.fingerprint,
             }));
+          } else if (promptMode.kind === 'save_password') {
+            lastRetryPassword = '';
+            // Flush any SSH output that arrived during the prompt.
+            if (pendingOutput) {
+              terminal.write(pendingOutput);
+              pendingOutput = '';
+            }
           }
           promptMode = null;
           promptBuffer = '';
@@ -431,10 +460,52 @@ export const TerminalContainer: React.FC<TerminalContainerProps> = ({
               return;
             }
           } else if (promptMode.kind === 'password') {
+            lastRetryPassword = promptBuffer;
             ws.send(JSON.stringify({
               type: 'auth_retry',
               password: promptBuffer,
             }));
+          } else if (promptMode.kind === 'save_password') {
+            const answer = promptBuffer.trim().toLowerCase();
+            // Helper to flush buffered SSH output and exit prompt mode.
+            const finishSavePrompt = () => {
+              promptMode = null;
+              if (pendingOutput) {
+                terminal.write(pendingOutput);
+                pendingOutput = '';
+              }
+            };
+            lastRetryPassword = '';
+            if (answer === 'y' || answer === 'yes') {
+              const cryptoKey = useAuthStore.getState().cryptoKey;
+              if (cryptoKey) {
+                const saveSessionId = promptMode.sessionId;
+                const savePassword = promptMode.password;
+                // Keep promptMode active during the async save so incoming
+                // SSH data continues to be buffered until we're done.
+                encrypt(savePassword, cryptoKey).then((encrypted) => {
+                  return apiPut(`/api/sessions/${saveSessionId}`, {
+                    encrypted_password: encrypted,
+                  }).then(() => {
+                    terminal.writeln('\x1b[32mPassword saved.\x1b[0m');
+                  }).catch((err) => {
+                    terminal.writeln(`\x1b[31mFailed to save password: ${err}\x1b[0m`);
+                  });
+                }).catch((err) => {
+                  terminal.writeln(`\x1b[31mEncryption error: ${err}\x1b[0m`);
+                }).finally(() => {
+                  finishSavePrompt();
+                });
+              } else {
+                terminal.writeln('\x1b[31mNo encryption key available — password not saved.\x1b[0m');
+                finishSavePrompt();
+              }
+            } else {
+              terminal.writeln('\x1b[33mPassword not saved.\x1b[0m');
+              finishSavePrompt();
+            }
+            promptBuffer = '';
+            return;
           }
 
           promptMode = null;

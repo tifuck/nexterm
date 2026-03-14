@@ -44,6 +44,7 @@ class _PendingConnect:
     cols: int = 80
     rows: int = 24
     auth_attempts: int = 0
+    auth_was_retry: bool = False
 
 
 async def _forward_ssh_to_ws(
@@ -321,7 +322,6 @@ async def ssh_websocket_handler(
 
                     # Success.
                     connection_id = result["connection_id"]
-                    pending = None
 
                     await ssh_proxy.session_register(
                         user_id=user_id,
@@ -335,10 +335,16 @@ async def ssh_websocket_handler(
                         _forward_ssh_to_ws(queue, websocket)
                     )
 
-                    await websocket.send_json({
+                    connected_msg: dict = {
                         "type": "connected",
                         "connection_id": connection_id,
-                    })
+                    }
+                    if pending.session_id and pending.auth_was_retry:
+                        connected_msg["session_id"] = pending.session_id
+                        connected_msg["auth_was_retry"] = True
+                    pending = None
+
+                    await websocket.send_json(connected_msg)
 
                 except Exception as e:
                     logger.error(f"SSH connect error: {e}")
@@ -426,11 +432,16 @@ async def ssh_websocket_handler(
                         _forward_ssh_to_ws(queue, websocket)
                     )
 
-                    await websocket.send_json({
+                    connected_msg: dict = {
                         "type": "connected",
                         "connection_id": connection_id,
-                    })
+                    }
+                    if pending.session_id and pending.auth_was_retry:
+                        connected_msg["session_id"] = pending.session_id
+                        connected_msg["auth_was_retry"] = True
                     pending = None
+
+                    await websocket.send_json(connected_msg)
 
                 except Exception as e:
                     logger.error(f"SSH connect error after host key accept: {e}")
@@ -453,6 +464,11 @@ async def ssh_websocket_handler(
 
                 new_password = msg.get("password", "")
                 pending.password = new_password
+                # Mark that the user manually entered a password via retry.
+                # Set before the attempt so it persists through host_key_verify
+                # interruptions — the flag is still relevant when the
+                # connection eventually succeeds via host_key_response.
+                pending.auth_was_retry = True
 
                 try:
                     result = await _attempt_connect(user_id, pending, cached_known_keys)
@@ -496,11 +512,16 @@ async def ssh_websocket_handler(
                         _forward_ssh_to_ws(queue, websocket)
                     )
 
-                    await websocket.send_json({
+                    connected_msg: dict = {
                         "type": "connected",
                         "connection_id": connection_id,
-                    })
+                    }
+                    if pending.session_id:
+                        connected_msg["session_id"] = pending.session_id
+                        connected_msg["auth_was_retry"] = True
                     pending = None
+
+                    await websocket.send_json(connected_msg)
 
                 except Exception as e:
                     logger.error(f"SSH connect error on auth retry: {e}")

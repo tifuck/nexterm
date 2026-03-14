@@ -348,8 +348,10 @@ const DeleteFolderConfirm: React.FC<DeleteFolderConfirmProps> = ({ folder, sessi
 interface FolderNodeProps {
   folder: SessionFolder;
   sessions: Session[];
+  allFolders: SessionFolder[];
   expandedFolders: Set<string>;
   renamingFolderId: string | null;
+  depth: number;
   onToggleFolder: (folderId: string) => void;
   onConnectSession: (session: Session) => void;
   onContextMenu: (e: React.MouseEvent, session: Session) => void;
@@ -359,14 +361,18 @@ interface FolderNodeProps {
   onDragOver: (e: React.DragEvent, folderId: string) => void;
   onDragLeave: (e: React.DragEvent) => void;
   onDrop: (e: React.DragEvent, folderId: string) => void;
+  onFolderDragStart: (e: React.DragEvent, folderId: string) => void;
+  onFolderDragEnd: () => void;
   dragOverFolderId: string | null;
 }
 
 const FolderNode: React.FC<FolderNodeProps> = ({
   folder,
   sessions,
+  allFolders,
   expandedFolders,
   renamingFolderId,
+  depth,
   onToggleFolder,
   onConnectSession,
   onContextMenu,
@@ -376,6 +382,8 @@ const FolderNode: React.FC<FolderNodeProps> = ({
   onDragOver,
   onDragLeave,
   onDrop,
+  onFolderDragStart,
+  onFolderDragEnd,
   dragOverFolderId,
 }) => {
   const isExpanded = expandedFolders.has(folder.id);
@@ -402,10 +410,18 @@ const FolderNode: React.FC<FolderNodeProps> = ({
   };
 
   const folderColor = folder.color || undefined;
+  const childFolders = allFolders.filter((f) => f.parent_id === folder.id);
 
   return (
     <div>
       <div
+        draggable
+        onDragStart={(e) => {
+          // Don't start drag if we're renaming
+          if (isRenaming) { e.preventDefault(); return; }
+          onFolderDragStart(e, folder.id);
+        }}
+        onDragEnd={onFolderDragEnd}
         onDragOver={(e) => onDragOver(e, folder.id)}
         onDragLeave={onDragLeave}
         onDrop={(e) => onDrop(e, folder.id)}
@@ -414,7 +430,7 @@ const FolderNode: React.FC<FolderNodeProps> = ({
         <button
           onClick={() => onToggleFolder(folder.id)}
           onContextMenu={(e) => { e.preventDefault(); onFolderContextMenu(e, folder); }}
-          className="flex items-center gap-1.5 w-full px-2 py-1.5 text-left rounded-md hover:bg-[var(--bg-hover)] transition-colors group"
+          className="flex items-center gap-1.5 w-full px-2 py-1.5 text-left rounded-md hover:bg-[var(--bg-hover)] transition-colors group cursor-grab active:cursor-grabbing"
         >
           {isExpanded ? (
             <ChevronDown size={12} className="text-[var(--text-tertiary)] flex-shrink-0" />
@@ -455,9 +471,33 @@ const FolderNode: React.FC<FolderNodeProps> = ({
 
       {isExpanded && (
         <div className="ml-4 border-l border-[var(--border-primary)] pl-1">
-          {folderSessions.length === 0 ? (
+          {/* Child folders (only at depth 0) */}
+          {depth === 0 && childFolders.map((child) => (
+            <FolderNode
+              key={child.id}
+              folder={child}
+              sessions={sessions}
+              allFolders={allFolders}
+              expandedFolders={expandedFolders}
+              renamingFolderId={renamingFolderId}
+              depth={1}
+              onToggleFolder={onToggleFolder}
+              onConnectSession={onConnectSession}
+              onContextMenu={onContextMenu}
+              onFolderContextMenu={onFolderContextMenu}
+              onRenameSubmit={onRenameSubmit}
+              onRenameCancel={onRenameCancel}
+              onDragOver={onDragOver}
+              onDragLeave={onDragLeave}
+              onDrop={onDrop}
+              onFolderDragStart={onFolderDragStart}
+              onFolderDragEnd={onFolderDragEnd}
+              dragOverFolderId={dragOverFolderId}
+            />
+          ))}
+          {folderSessions.length === 0 && childFolders.length === 0 ? (
             <div className="px-2 py-1.5 text-[10px] text-[var(--text-muted)] italic">
-              No sessions
+              Empty
             </div>
           ) : (
             folderSessions.map((session) => (
@@ -654,6 +694,7 @@ export const SessionBrowser: React.FC = () => {
   const [colorPickerFolder, setColorPickerFolder] = useState<SessionFolder | null>(null);
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
   const [dragOverRoot, setDragOverRoot] = useState(false);
+  const [draggingFolderId, setDraggingFolderId] = useState<string | null>(null);
 
   const handleToggleFolder = useCallback((folderId: string) => {
     setExpandedFolders((prev) => {
@@ -783,9 +824,28 @@ export const SessionBrowser: React.FC = () => {
   // Drag and drop
   const handleDragOverFolder = useCallback((e: React.DragEvent, folderId: string) => {
     e.preventDefault();
+    const hasFolderDrag = e.dataTransfer.types.includes('application/folder-id');
+    if (hasFolderDrag) {
+      // Only accept folder drops on root-level folders that aren't the folder itself
+      const targetFolder = folders.find((f) => f.id === folderId);
+      if (
+        !targetFolder ||
+        targetFolder.parent_id ||
+        draggingFolderId === folderId
+      ) {
+        e.dataTransfer.dropEffect = 'none';
+        return;
+      }
+      // Don't accept if the dragged folder has children
+      const draggedHasChildren = folders.some((f) => f.parent_id === draggingFolderId);
+      if (draggedHasChildren) {
+        e.dataTransfer.dropEffect = 'none';
+        return;
+      }
+    }
     e.dataTransfer.dropEffect = 'move';
     setDragOverFolderId(folderId);
-  }, []);
+  }, [folders, draggingFolderId]);
 
   const handleDragLeaveFolder = useCallback((e: React.DragEvent) => {
     // Only clear if we're truly leaving (not entering a child element)
@@ -799,6 +859,22 @@ export const SessionBrowser: React.FC = () => {
   const handleDropOnFolder = useCallback(async (e: React.DragEvent, folderId: string) => {
     e.preventDefault();
     setDragOverFolderId(null);
+
+    // Handle folder drop
+    const droppedFolderId = e.dataTransfer.getData('application/folder-id');
+    if (droppedFolderId) {
+      if (droppedFolderId === folderId) return;
+      try {
+        await updateFolder(droppedFolderId, { parent_id: folderId });
+        setExpandedFolders((prev) => new Set(prev).add(folderId));
+        addToast('Folder moved', 'success');
+      } catch {
+        addToast('Failed to move folder', 'error');
+      }
+      return;
+    }
+
+    // Handle session drop
     const sessionId = e.dataTransfer.getData('application/session-id');
     if (!sessionId) return;
     try {
@@ -809,7 +885,18 @@ export const SessionBrowser: React.FC = () => {
     } catch {
       addToast('Failed to move session', 'error');
     }
-  }, [moveSessions, addToast]);
+  }, [moveSessions, updateFolder, addToast]);
+
+  const handleFolderDragStart = useCallback((e: React.DragEvent, folderId: string) => {
+    e.dataTransfer.setData('application/folder-id', folderId);
+    e.dataTransfer.effectAllowed = 'move';
+    setDraggingFolderId(folderId);
+  }, []);
+
+  const handleFolderDragEnd = useCallback(() => {
+    setDraggingFolderId(null);
+    setDragOverFolderId(null);
+  }, []);
 
   const handleDragOverRoot = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -828,6 +915,22 @@ export const SessionBrowser: React.FC = () => {
   const handleDropOnRoot = useCallback(async (e: React.DragEvent) => {
     e.preventDefault();
     setDragOverRoot(false);
+
+    // Handle folder drop (un-nest to root)
+    const droppedFolderId = e.dataTransfer.getData('application/folder-id');
+    if (droppedFolderId) {
+      const folder = folders.find((f) => f.id === droppedFolderId);
+      if (folder && !folder.parent_id) return; // Already root
+      try {
+        await updateFolder(droppedFolderId, { parent_id: null });
+        addToast('Folder moved to root', 'success');
+      } catch {
+        addToast('Failed to move folder', 'error');
+      }
+      return;
+    }
+
+    // Handle session drop
     const sessionId = e.dataTransfer.getData('application/session-id');
     if (!sessionId) return;
     // Check if the session is already at root
@@ -839,7 +942,7 @@ export const SessionBrowser: React.FC = () => {
     } catch {
       addToast('Failed to move session', 'error');
     }
-  }, [moveSessions, addToast, sessions]);
+  }, [moveSessions, updateFolder, addToast, sessions, folders]);
 
   const handleEditClose = useCallback(() => {
     setEditingSession(null);
@@ -879,20 +982,27 @@ export const SessionBrowser: React.FC = () => {
 
   const hasMatchesInFolder = useCallback(
     (folderId: string) => {
-      return filteredSessions.some((s) => s.folder_id === folderId);
+      // Check direct sessions and sessions in child folders
+      if (filteredSessions.some((s) => s.folder_id === folderId)) return true;
+      const childFolderIds = folders.filter((f) => f.parent_id === folderId).map((f) => f.id);
+      return childFolderIds.some((childId) => filteredSessions.some((s) => s.folder_id === childId));
     },
-    [filteredSessions]
+    [filteredSessions, folders]
   );
 
   const visibleFolders = useMemo(() => {
-    if (!searchQuery) return folders;
-    return folders.filter((f) => hasMatchesInFolder(f.id));
+    // Only show root-level folders; child folders render inside their parent
+    const rootFolders = folders.filter((f) => !f.parent_id);
+    if (!searchQuery) return rootFolders;
+    return rootFolders.filter((f) => hasMatchesInFolder(f.id));
   }, [folders, searchQuery, hasMatchesInFolder]);
 
   const deletingFolderSessionCount = useMemo(() => {
     if (!deletingFolder) return 0;
-    return sessions.filter((s) => s.folder_id === deletingFolder.id).length;
-  }, [deletingFolder, sessions]);
+    const childFolderIds = folders.filter((f) => f.parent_id === deletingFolder.id).map((f) => f.id);
+    const allFolderIds = [deletingFolder.id, ...childFolderIds];
+    return sessions.filter((s) => s.folder_id && allFolderIds.includes(s.folder_id)).length;
+  }, [deletingFolder, sessions, folders]);
 
   if (sessions.length === 0 && folders.length === 0) {
     return (
@@ -926,8 +1036,10 @@ export const SessionBrowser: React.FC = () => {
             <FolderNode
               folder={folder}
               sessions={filteredSessions}
+              allFolders={folders}
               expandedFolders={expandedFolders}
               renamingFolderId={renamingFolderId}
+              depth={0}
               onToggleFolder={handleToggleFolder}
               onConnectSession={handleConnectSession}
               onContextMenu={handleContextMenu}
@@ -937,6 +1049,8 @@ export const SessionBrowser: React.FC = () => {
               onDragOver={handleDragOverFolder}
               onDragLeave={handleDragLeaveFolder}
               onDrop={handleDropOnFolder}
+              onFolderDragStart={handleFolderDragStart}
+              onFolderDragEnd={handleFolderDragEnd}
               dragOverFolderId={dragOverFolderId}
             />
             {colorPickerFolder?.id === folder.id && (

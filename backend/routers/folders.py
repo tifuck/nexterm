@@ -67,7 +67,13 @@ async def create_folder(
     current_user: User = Depends(get_current_user),
 ):
     if body.parent_id is not None:
-        await _get_folder_or_404(body.parent_id, str(current_user.id))
+        parent = await _get_folder_or_404(body.parent_id, str(current_user.id))
+        # Enforce max nesting depth of 2: parent must be root-level
+        if parent.parent_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot nest folders more than 2 levels deep",
+            )
 
     async with async_session_factory() as db:
         folder = Folder(
@@ -128,7 +134,25 @@ async def update_folder(
                 raise HTTPException(
                     status_code=400, detail="A folder cannot be its own parent"
                 )
-            await _get_folder_or_404(update_data["parent_id"], str(current_user.id))
+            # Validate target parent exists and belongs to user
+            target_parent = await _get_folder_or_404(update_data["parent_id"], str(current_user.id))
+
+            # Enforce max nesting depth of 2: target parent must be root-level
+            if target_parent.parent_id is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot nest folders more than 2 levels deep",
+                )
+
+            # Prevent nesting a folder that already has children (would create depth 3)
+            children_result = await db.execute(
+                select(Folder).where(Folder.parent_id == folder_id)
+            )
+            if children_result.scalars().first() is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot nest a folder that already contains sub-folders",
+                )
 
         for field, value in update_data.items():
             if hasattr(folder, field):

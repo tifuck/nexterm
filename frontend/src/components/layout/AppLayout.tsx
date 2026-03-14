@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useCallback } from 'react';
 import { useSidebarStore } from '@/store/sidebarStore';
 import { useTabStore } from '@/store/tabStore';
 import { useToolsStore } from '@/store/toolsStore';
@@ -42,21 +42,27 @@ const AppLayout: React.FC = () => {
   const isSSHTab = currentTab?.type === 'ssh' || currentTab?.type === 'telnet';
   const toolsConnectionId = isSSHTab && currentTab?.isConnected ? currentTab?.connectionId : undefined;
 
-  // Auto-close sidebar on small screens
-  useEffect(() => {
-    const handleResize = () => {
-      if (window.innerWidth < MOBILE_BREAKPOINT && isOpen) {
-        toggle();
-      }
-    };
-    // Check on mount
-    if (window.innerWidth < MOBILE_BREAKPOINT && isOpen) {
+  // Close sidebar when viewport shrinks below mobile breakpoint.
+  // Uses a ref so the resize handler can read the latest isOpen without
+  // re-registering the listener (which was causing an immediate re-close
+  // every time the user tried to open the sidebar on mobile).
+  const isOpenRef = useRef(isOpen);
+  useEffect(() => { isOpenRef.current = isOpen; }, [isOpen]);
+
+  const closeSidebarIfMobile = useCallback(() => {
+    if (window.innerWidth < MOBILE_BREAKPOINT && isOpenRef.current) {
       toggle();
     }
+  }, [toggle]);
+
+  useEffect(() => {
+    // Close on mount if already on a small screen
+    closeSidebarIfMobile();
+
+    const handleResize = () => closeSidebarIfMobile();
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
-    // Only run when isOpen changes, not on every render
-  }, [isOpen, toggle]);
+  }, [closeSidebarIfMobile]);
 
   // Clamp sidebar width to viewport on small screens
   const effectiveWidth = Math.min(width, typeof window !== 'undefined' ? window.innerWidth * 0.8 : width);

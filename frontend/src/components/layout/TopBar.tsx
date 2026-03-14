@@ -136,12 +136,6 @@ const TopBar: React.FC<TopBarProps> = ({ sidebarWidth }) => {
               title={isConnected ? 'Server Tools' : 'Connect to SSH to use Server Tools'}
             >
               <Wrench size={16} />
-              {isConnected && (
-                <span
-                  className="w-1.5 h-1.5 rounded-full absolute -top-0.5 -right-0.5"
-                  style={{ backgroundColor: 'var(--success)' }}
-                />
-              )}
             </button>
 
             <div className="relative" ref={menuRef}>

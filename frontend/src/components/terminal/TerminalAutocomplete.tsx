@@ -109,6 +109,12 @@ export const TerminalAutocomplete: React.FC<TerminalAutocompleteProps> = ({
   // Base position is measured once when the dropdown opens.
   const [basePos, setBasePos] = useState<BasePosition | null>(null);
 
+  // Keep inputPrefix in a ref so the measure callback can read the
+  // current value without needing it as a dependency (which would cause
+  // re-measurement on every keystroke, racing the async SSH echo).
+  const inputPrefixRef = useRef(inputPrefix);
+  inputPrefixRef.current = inputPrefix;
+
   // Generation counter: bumped every time isOpen transitions to true.
   // This ensures a fresh measurement even if isOpen goes false→true
   // within a single React batch (where an effect for the false state
@@ -136,15 +142,17 @@ export const TerminalAutocomplete: React.FC<TerminalAutocompleteProps> = ({
   const hoverBg = hexToRgba(theme.foreground ?? '#b3b1ad', 0.08);
 
   // Measure base position when dropdown transitions from closed → open.
+  // Uses inputPrefixRef so this callback identity is stable across
+  // keystrokes — preventing re-measurement that races the SSH echo.
   const measure = useCallback(() => {
     const container = document.querySelector(
       `[data-tab-id="${tabId}"]`,
     ) as HTMLElement | null;
     if (!container) return;
 
-    const pos = measureBasePosition(tabId, container, inputPrefix.length);
+    const pos = measureBasePosition(tabId, container, inputPrefixRef.current.length);
     if (pos) setBasePos(pos);
-  }, [tabId, inputPrefix.length]);
+  }, [tabId]);
 
   useEffect(() => {
     if (!isOpen) {

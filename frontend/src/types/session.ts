@@ -21,7 +21,7 @@ export interface Session {
 export interface Folder {
   id: string;
   name: string;
-  parent_id?: string;
+  parent_id?: string | null;
   color?: string;
   icon?: string;
   sort_order: number;

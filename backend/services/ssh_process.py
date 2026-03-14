@@ -409,11 +409,51 @@ async def _run():
     if os.path.exists(IPC_SOCKET_PATH):
         os.unlink(IPC_SOCKET_PATH)
 
+    # Remove PID file.
+    pid_file = os.path.join(os.path.dirname(IPC_SOCKET_PATH), "ssh_manager.pid")
+    try:
+        os.unlink(pid_file)
+    except FileNotFoundError:
+        pass
+
     logger.info("SSH manager process stopped")
 
 
 def run_ssh_process():
-    """Entry point for multiprocessing.Process (or direct invocation)."""
+    """Entry point for multiprocessing.Process (or direct invocation).
+
+    On Linux, sets PR_SET_PDEATHSIG so the kernel automatically sends
+    SIGTERM to this process when the parent (uvicorn master) dies — even
+    on SIGKILL.  This is the most reliable guard against orphaned SSH
+    manager processes lingering across restarts.
+    """
+    # --- Linux: request SIGTERM when parent dies ---
+    try:
+        import ctypes
+        import ctypes.util
+
+        _PR_SET_PDEATHSIG = 1
+        libc_name = ctypes.util.find_library("c")
+        if libc_name:
+            libc = ctypes.CDLL(libc_name, use_errno=True)
+            result = libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+            if result == 0:
+                logger.info("PR_SET_PDEATHSIG set — will auto-terminate when parent exits")
+            else:
+                logger.debug("prctl(PR_SET_PDEATHSIG) returned %d", result)
+    except Exception as exc:
+        # Non-Linux platforms (macOS, FreeBSD) don't support prctl;
+        # fall back to daemon=True + signal handlers in run.py.
+        logger.debug("PR_SET_PDEATHSIG not available: %s", exc)
+
+    # --- Write our PID to the PID file as a backup ---
+    pid_file = os.path.join(os.path.dirname(IPC_SOCKET_PATH), "ssh_manager.pid")
+    try:
+        with open(pid_file, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
     asyncio.run(_run())
 
 

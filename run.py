@@ -17,6 +17,84 @@ from backend.services.ipc_protocol import IPC_SOCKET_PATH
 
 logger = logging.getLogger("nexterm.run")
 
+# PID file for the SSH manager process — lives next to the IPC socket.
+_SSH_MANAGER_PID_FILE = os.path.join(os.path.dirname(IPC_SOCKET_PATH), "ssh_manager.pid")
+
+
+def _kill_stale_ssh_manager():
+    """Detect and kill an orphaned SSH manager process from a previous run.
+
+    Checks the PID file and, as a fallback, the stale socket file.  This
+    prevents ``python -c 'from multiprocessing.spawn import ...'`` orphans
+    from accumulating across restarts.
+    """
+    stale_pid = None
+
+    # 1. Try reading a PID from the PID file.
+    if os.path.exists(_SSH_MANAGER_PID_FILE):
+        try:
+            with open(_SSH_MANAGER_PID_FILE) as f:
+                stale_pid = int(f.read().strip())
+        except (ValueError, OSError):
+            pass
+
+    # 2. If we got a PID, check if it is still alive and kill it.
+    if stale_pid:
+        try:
+            os.kill(stale_pid, 0)  # probe — raises OSError if gone
+            logger.warning(
+                "Killing orphaned SSH manager process (PID %d) from a previous run",
+                stale_pid,
+            )
+            os.kill(stale_pid, signal.SIGTERM)
+            # Give it a moment to shut down gracefully.
+            for _ in range(20):  # up to 2 s
+                time.sleep(0.1)
+                try:
+                    os.kill(stale_pid, 0)
+                except OSError:
+                    break
+            else:
+                # Still alive — force kill.
+                try:
+                    os.kill(stale_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        except OSError:
+            pass  # process already gone
+
+    # 3. Remove stale PID file.
+    try:
+        os.unlink(_SSH_MANAGER_PID_FILE)
+    except FileNotFoundError:
+        pass
+
+    # 4. Remove stale socket file so the new manager can bind.
+    if os.path.exists(IPC_SOCKET_PATH):
+        logger.info("Removing stale IPC socket: %s", IPC_SOCKET_PATH)
+        try:
+            os.unlink(IPC_SOCKET_PATH)
+        except OSError:
+            pass
+
+
+def _write_pid_file(pid: int):
+    """Persist the SSH manager PID so future runs can clean it up."""
+    try:
+        os.makedirs(os.path.dirname(_SSH_MANAGER_PID_FILE), exist_ok=True)
+        with open(_SSH_MANAGER_PID_FILE, "w") as f:
+            f.write(str(pid))
+    except OSError as exc:
+        logger.warning("Could not write SSH manager PID file: %s", exc)
+
+
+def _remove_pid_file():
+    """Remove the PID file on clean shutdown."""
+    try:
+        os.unlink(_SSH_MANAGER_PID_FILE)
+    except FileNotFoundError:
+        pass
+
 
 async def _ensure_admin_user():
     """Create the admin user from environment variables if no admin exists.
@@ -66,12 +144,19 @@ def main():
     # ------------------------------------------------------------------
     from backend.services.ssh_process import run_ssh_process
 
+    # Kill any orphaned SSH manager left over from a previous unclean exit.
+    _kill_stale_ssh_manager()
+
     ssh_proc = multiprocessing.Process(
         target=run_ssh_process,
         name="nexterm-ssh-manager",
         daemon=True,
     )
     ssh_proc.start()
+
+    # Record the PID so future runs can clean up if we die uncleanly.
+    if ssh_proc.pid:
+        _write_pid_file(ssh_proc.pid)
 
     # Wait for the Unix socket to become available.
     for _ in range(60):  # Up to 30 seconds
@@ -81,6 +166,7 @@ def main():
     else:
         print("[ERROR] SSH manager process did not start in time")
         ssh_proc.terminate()
+        _remove_pid_file()
         sys.exit(1)
 
     # ------------------------------------------------------------------
@@ -98,11 +184,13 @@ def main():
             ssh_proc.join(timeout=5)
             if ssh_proc.is_alive():
                 ssh_proc.kill()
+        _remove_pid_file()
 
     atexit.register(_cleanup)
 
-    # Also handle SIGTERM/SIGINT so the SSH process is cleaned up
-    # even when uvicorn is killed directly.
+    # Also handle SIGTERM, SIGINT, and SIGHUP so the SSH process is
+    # cleaned up even when uvicorn is killed directly or the controlling
+    # terminal disconnects.
     original_sigterm = signal.getsignal(signal.SIGTERM)
     original_sigint = signal.getsignal(signal.SIGINT)
 
@@ -118,6 +206,10 @@ def main():
 
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
+    # SIGHUP — sent when the controlling terminal closes (e.g. SSH
+    # session to the host running nexterm is disconnected).
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _signal_handler)
 
     # ------------------------------------------------------------------
     # Launch uvicorn

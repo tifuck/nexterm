@@ -910,29 +910,47 @@ OPEN_PORTS_SCRIPT = r"""
 
 FAILED_LOGINS_SCRIPT = r"""
 sh -c '
-# Try journalctl first, fallback to log files
+LOG=""
+DATEFMT="iso"
+
+# Try journalctl first with both unit names (sshd.service for RHEL, ssh.service for Debian/Ubuntu)
 if command -v journalctl >/dev/null 2>&1; then
-  journalctl _SYSTEMD_UNIT=sshd.service --no-pager -n 200 --grep="Failed|Invalid" -o short-iso 2>/dev/null | tail -50 | while IFS= read -r line; do
-    date=$(echo "$line" | awk "{print \$1}")
-    user=$(echo "$line" | grep -oP "(?:Failed password for( invalid user)?|Invalid user) \K\S+" || echo "unknown")
-    source=$(echo "$line" | grep -oP "from \K\S+" || echo "unknown")
-    printf "{\"date\":\"%s\",\"user\":\"%s\",\"source\":\"%s\",\"service\":\"sshd\"}\n" "$date" "$user" "$source"
-  done
-elif [ -f /var/log/auth.log ]; then
-  grep -i "failed\|invalid" /var/log/auth.log 2>/dev/null | tail -50 | while IFS= read -r line; do
-    date=$(echo "$line" | awk "{print \$1,\$2,\$3}")
-    user=$(echo "$line" | grep -oP "(?:Failed password for( invalid user)?|Invalid user) \K\S+" || echo "unknown")
-    source=$(echo "$line" | grep -oP "from \K\S+" || echo "unknown")
-    printf "{\"date\":\"%s\",\"user\":\"%s\",\"source\":\"%s\",\"service\":\"sshd\"}\n" "$date" "$user" "$source"
-  done
-elif [ -f /var/log/secure ]; then
-  grep -i "failed\|invalid" /var/log/secure 2>/dev/null | tail -50 | while IFS= read -r line; do
-    date=$(echo "$line" | awk "{print \$1,\$2,\$3}")
-    user=$(echo "$line" | grep -oP "(?:Failed password for( invalid user)?|Invalid user) \K\S+" || echo "unknown")
-    source=$(echo "$line" | grep -oP "from \K\S+" || echo "unknown")
-    printf "{\"date\":\"%s\",\"user\":\"%s\",\"source\":\"%s\",\"service\":\"sshd\"}\n" "$date" "$user" "$source"
-  done
+  LOG=$(journalctl _SYSTEMD_UNIT=sshd.service --no-pager -n 500 -o short-iso 2>/dev/null | grep -iE "Failed password|Invalid user" | tail -200)
+  if [ -z "$LOG" ]; then
+    LOG=$(journalctl _SYSTEMD_UNIT=ssh.service --no-pager -n 500 -o short-iso 2>/dev/null | grep -iE "Failed password|Invalid user" | tail -200)
+  fi
 fi
+
+# Fallback to log files if journalctl produced nothing
+if [ -z "$LOG" ] && [ -f /var/log/auth.log ]; then
+  LOG=$(grep -iE "Failed password|Invalid user" /var/log/auth.log 2>/dev/null | tail -200)
+  DATEFMT="syslog"
+fi
+if [ -z "$LOG" ] && [ -f /var/log/secure ]; then
+  LOG=$(grep -iE "Failed password|Invalid user" /var/log/secure 2>/dev/null | tail -200)
+  DATEFMT="syslog"
+fi
+
+[ -z "$LOG" ] && exit 0
+
+echo "$LOG" | while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  # Extract username (POSIX sed, no grep -oP)
+  user=$(echo "$line" | sed -n "s/.*Failed password for invalid user \([^ ]*\).*/\1/p")
+  [ -z "$user" ] && user=$(echo "$line" | sed -n "s/.*Failed password for \([^ ]*\).*/\1/p")
+  [ -z "$user" ] && user=$(echo "$line" | sed -n "s/.*Invalid user \([^ ]*\).*/\1/p")
+  [ -z "$user" ] && user="unknown"
+  # Extract source IP (POSIX sed)
+  source=$(echo "$line" | sed -n "s/.*from \([^ ]*\).*/\1/p")
+  [ -z "$source" ] && source="unknown"
+  # Extract date based on log format
+  if [ "$DATEFMT" = "iso" ]; then
+    date=$(echo "$line" | awk "{print \$1}")
+  else
+    date=$(echo "$line" | awk "{print \$1,\$2,\$3}")
+  fi
+  printf "{\"date\":\"%s\",\"user\":\"%s\",\"source\":\"%s\",\"service\":\"sshd\"}\n" "$date" "$user" "$source"
+done
 ' 2>/dev/null
 """
 

@@ -12,6 +12,12 @@
  * Positioning strategy:
  * We measure the terminal cursor once when the dropdown first opens to
  * establish a "prompt anchor" (the pixel X where the shell prompt ends).
+ * Because the SSH echo for the triggering keystroke (and any preceding
+ * backspace) may still be in flight, we measure twice: immediately (so the
+ * overlay appears without delay) and again after a short timeout to let
+ * pending echoes settle.  The second measurement silently corrects the
+ * anchor if needed.
+ *
  * Subsequent ghost/dropdown positions are computed purely from
  * inputPrefix.length * cellWidth, avoiding any dependency on the async
  * SSH echo timing that updates terminal.buffer.active.cursorX.
@@ -53,7 +59,11 @@ function hexToRgba(hex: string, alpha: number): string {
 
 /**
  * Measure the terminal and compute the prompt anchor position.
- * Called once when the dropdown first opens.
+ *
+ * Reads terminal.buffer.active.cursorX/Y to determine where the cursor
+ * currently sits, then subtracts prefixLength cells to find where the
+ * shell prompt ends.  Because echoes are asynchronous, the caller should
+ * invoke this twice (immediately + after a short delay) to ensure accuracy.
  */
 function measureBasePosition(
   tabId: string,
@@ -143,7 +153,7 @@ export const TerminalAutocomplete: React.FC<TerminalAutocompleteProps> = ({
 
   // Measure base position when dropdown transitions from closed → open.
   // Uses inputPrefixRef so this callback identity is stable across
-  // keystrokes — preventing re-measurement that races the SSH echo.
+  // keystrokes — preventing re-measurement on every keystroke.
   const measure = useCallback(() => {
     const container = document.querySelector(
       `[data-tab-id="${tabId}"]`,
@@ -159,12 +169,14 @@ export const TerminalAutocomplete: React.FC<TerminalAutocompleteProps> = ({
       setBasePos(null);
       return;
     }
-    // Measure after one animation frame so the terminal has processed
-    // the echo for the character that triggered the dropdown.
-    const raf = requestAnimationFrame(() => {
-      measure();
-    });
-    return () => cancelAnimationFrame(raf);
+    // Measure immediately so the overlay appears without delay.
+    // The terminal cursor may not yet reflect pending echoes (the
+    // triggering character or a preceding backspace), so re-measure
+    // after 50 ms to let in-flight echoes settle and silently correct
+    // the prompt anchor if needed.
+    measure();
+    const timer = setTimeout(measure, 50);
+    return () => clearTimeout(timer);
   }, [openGen, isOpen, measure]);
 
   // Scroll the selected item into view when navigating.
@@ -182,9 +194,10 @@ export const TerminalAutocomplete: React.FC<TerminalAutocompleteProps> = ({
 
   // Derive current cursor X from the stable prompt anchor + prefix length.
   const cursorX = basePos.promptX + inputPrefix.length * basePos.cellWidth;
-  // The ghost text starts one cell after the cursor (the cursor block
-  // occupies the cell at cursorX).
-  const ghostX = cursorX + basePos.cellWidth;
+  // The ghost text starts at the cursor position -- the cell where the
+  // next character would be typed.  This matches fish-shell-style inline
+  // suggestions where the ghost overlaps/replaces the cursor block.
+  const ghostX = cursorX;
 
   // The ghost text shows the remaining portion of the top (or selected) suggestion.
   const ghostSuggestion = selectedIndex >= 0 ? suggestions[selectedIndex] : suggestions[0];

@@ -32,6 +32,9 @@ update.log
 AGENTS.md
 CLAUDE.md
 
+# Local push script (not for distribution)
+push.sh
+
 # IDE / Editor
 .vscode/
 .idea/

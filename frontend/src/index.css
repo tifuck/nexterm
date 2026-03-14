@@ -1,0 +1,208 @@
+@import '@xterm/xterm/css/xterm.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --surface-50: #f5f5f5;
+  --surface-100: #e0e0e0;
+  --surface-200: #b0b8c1;
+  --surface-300: #8b949e;
+  --surface-400: #6e7681;
+  --surface-500: #484f58;
+  --surface-600: #1e1e1e;
+  --surface-700: #141414;
+  --surface-800: #0a0a0a;
+  --surface-900: #050505;
+  --surface-950: '#000000';
+
+  /* Default dark theme (near-black) */
+  --bg-primary: #050505;
+  --bg-secondary: #0a0a0a;
+  --bg-tertiary: #111111;
+  --bg-surface: #161616;
+  --bg-hover: #1a1a1a;
+  --bg-active: #222222;
+  --bg-input: #0d0d0d;
+  --bg-modal: #0a0a0a;
+  --bg-tooltip: #1a1a1a;
+
+  --text-primary: #e0e0e0;
+  --text-secondary: #8b949e;
+  --text-tertiary: #6b7280;
+  --text-muted: #4b5563;
+  --text-accent: #00e5ff;
+
+  --border: #1e1e1e;
+  --border-primary: #1e1e1e;
+  --border-secondary: #2a2a2a;
+  --border-focus: #00e5ff;
+
+  --accent: #00e5ff;
+  --accent-hover: #00c8e0;
+  --accent-muted: rgba(0, 229, 255, 0.15);
+
+  --success: #3fb950;
+  --warning: #f0b429;
+  --danger: #f85149;
+  --danger-hover: #da3633;
+  --error: #f85149;
+
+  --accent-contrast: #050505;
+
+  --protocol-ssh: #00e5ff;
+  --protocol-rdp: #ff9800;
+  --protocol-vnc: #ab47bc;
+  --protocol-telnet: #66bb6a;
+  --protocol-ftp: #fdd835;
+
+  --scrollbar-track: #050505;
+  --scrollbar-thumb: #1e1e1e;
+  --scrollbar-thumb-hover: #2a2a2a;
+
+  --shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    Oxygen, Ubuntu, Cantarell, sans-serif;
+}
+
+/* Scrollbar styles */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-thumb-hover);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+/* Selection colors */
+::selection {
+  background-color: var(--accent-muted);
+  color: var(--text-primary);
+}
+
+::-moz-selection {
+  background-color: var(--accent-muted);
+  color: var(--text-primary);
+}
+
+/* Utility classes */
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Animation keyframes */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes slideInLeft {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes slideOutLeft {
+  from { transform: translateX(0); }
+  to { transform: translateX(-100%); }
+}
+
+@keyframes scaleIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes connectedPulse {
+  0% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.5); }
+  70% { box-shadow: 0 0 0 6px rgba(63, 185, 80, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 200ms ease-out forwards;
+}
+
+.animate-scale-in {
+  animation: scaleIn 200ms ease-out forwards;
+}
+
+.animate-slide-down {
+  animation: slideDown 200ms ease-out forwards;
+}
+
+.animate-slide-up {
+  animation: slideUp 200ms ease-out forwards;
+}
+
+.animate-connected-pulse {
+  animation: connectedPulse 1.5s ease-out 3;
+}
+
+/* Skeleton loading shimmer */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-tertiary) 25%,
+    var(--bg-hover) 50%,
+    var(--bg-tertiary) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: 4px;
+}

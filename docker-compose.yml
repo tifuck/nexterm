@@ -1,0 +1,38 @@
+# ============================================================================
+# Nexterm — Docker Compose
+# ============================================================================
+# Usage:
+#   docker compose up -d                    # Start Nexterm
+#   docker compose --profile rdp up -d      # Start with RDP support (guacd)
+#   docker compose down                     # Stop
+#   docker compose logs -f nexterm          # View logs
+# ============================================================================
+
+services:
+  nexterm:
+    build: .
+    container_name: nexterm
+    ports:
+      - "${NEXTERM_PORT:-8443}:8443"
+    volumes:
+      - nexterm-data:/app/data
+      - nexterm-certs:/app/certs
+    environment:
+      - NEXTERM_ADMIN_USER=${NEXTERM_ADMIN_USER:-admin}
+      - NEXTERM_ADMIN_PASSWORD=${NEXTERM_ADMIN_PASSWORD:-changeme}
+      - NEXTERM_PORT=8443
+      - NEXTERM_HOST=0.0.0.0
+    restart: unless-stopped
+
+  # Optional: Apache Guacamole daemon for RDP/VNC support
+  # Enable with: docker compose --profile rdp up -d
+  guacd:
+    image: guacamole/guacd
+    container_name: nexterm-guacd
+    profiles:
+      - rdp
+    restart: unless-stopped
+
+volumes:
+  nexterm-data:
+  nexterm-certs:

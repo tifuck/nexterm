@@ -1,0 +1,149 @@
+"""JWT authentication middleware and dependencies."""
+
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from fastapi import Depends, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
+
+from backend.config import config
+from backend.database import async_session_factory
+from backend.models.user import User
+
+# Optional bearer — allows routes to work without auth header when needed
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+ALGORITHM = "HS256"
+
+
+# ---------------------------------------------------------------------------
+# Token creation
+# ---------------------------------------------------------------------------
+
+def create_access_token(user_id: str, username: str, is_admin: bool) -> str:
+    """Create a short-lived JWT access token."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "username": username,
+        "is_admin": is_admin,
+        "exp": now + timedelta(minutes=config.jwt_access_expire_minutes),
+        "iat": now,
+    }
+    return jwt.encode(payload, config.secret_key, algorithm=ALGORITHM)
+
+
+def create_refresh_token(user_id: str) -> str:
+    """Create a long-lived JWT refresh token."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "type": "refresh",
+        "exp": now + timedelta(minutes=config.jwt_refresh_expire_days * 24 * 60),
+        "iat": now,
+    }
+    return jwt.encode(payload, config.secret_key, algorithm=ALGORITHM)
+
+
+# ---------------------------------------------------------------------------
+# Token verification
+# ---------------------------------------------------------------------------
+
+def verify_token(token: str) -> dict:
+    """Decode and validate a JWT. Returns the payload dict.
+
+    Raises HTTPException 401 on invalid or expired tokens.
+    """
+    try:
+        payload: dict = jwt.decode(token, config.secret_key, algorithms=[ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI dependencies
+# ---------------------------------------------------------------------------
+
+def _extract_token(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> str | None:
+    """Try to extract a bearer token from the Authorization header or cookie."""
+    if credentials is not None:
+        return credentials.credentials
+
+    # Fallback: look for an access_token cookie
+    token = request.cookies.get("access_token")
+    if token:
+        return token
+
+    return None
+
+
+async def get_current_user(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> User:
+    """Dependency that returns the authenticated User or raises 401."""
+    token = _extract_token(request, credentials)
+    if token is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    payload = verify_token(token)
+
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    async with async_session_factory() as session:
+        result = await session.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
+
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    if not user.is_active:
+        raise HTTPException(status_code=401, detail="User account is disabled")
+
+    return user
+
+
+async def get_current_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Dependency that ensures the current user is an admin."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+    return current_user
+
+
+async def get_optional_user(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> User | None:
+    """Like get_current_user but returns None instead of raising."""
+    token = _extract_token(request, credentials)
+    if token is None:
+        return None
+
+    try:
+        payload = verify_token(token)
+    except HTTPException:
+        return None
+
+    user_id = payload.get("sub")
+    if user_id is None:
+        return None
+
+    async with async_session_factory() as session:
+        result = await session.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
+
+    if user is None or not user.is_active:
+        return None
+
+    return user

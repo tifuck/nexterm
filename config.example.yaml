@@ -1,0 +1,77 @@
+# ============================================================================
+# Nexterm Configuration
+# ============================================================================
+# Copy this to config.yaml and modify as needed.
+# The install script generates config.yaml automatically.
+#
+# Environment Variable Overrides:
+#   Every setting can be overridden with a NEXTERM_ prefixed env var.
+#   This is useful for Docker deployments and CI/CD pipelines.
+#
+#   Examples:
+#     NEXTERM_APP_NAME=MyTerminal
+#     NEXTERM_PORT=9000
+#     NEXTERM_SECRET_KEY=your-secret-key
+#     NEXTERM_DEBUG=true
+#     NEXTERM_REGISTRATION_ENABLED=false
+#     NEXTERM_DATABASE_URL=sqlite+aiosqlite:///data/nexterm.db
+#     NEXTERM_HTTPS_ENABLED=false
+#     NEXTERM_GUACD_ENABLED=true
+#     NEXTERM_GUACD_HOST=guacd
+#     NEXTERM_ADMIN_USER=admin          (auto-creates admin on first run)
+#     NEXTERM_ADMIN_PASSWORD=changeme   (auto-creates admin on first run)
+# ============================================================================
+
+app:
+  name: "TERMINAL"
+  host: "0.0.0.0"
+  port: 8443
+  debug: false
+  # Auto-generated on install — change this to a random string
+  secret_key: "CHANGE_ME_TO_A_RANDOM_SECRET_KEY"
+
+auth:
+  registration_enabled: true
+  jwt_access_token_expire_minutes: 60
+  jwt_refresh_token_expire_days: 7
+  max_login_attempts: 5
+  lockout_duration_minutes: 15
+
+database:
+  # SQLite with WAL mode for concurrent access
+  url: "sqlite+aiosqlite:///data/nexterm.db"
+
+https:
+  enabled: true
+  cert_file: "certs/server.crt"
+  key_file: "certs/server.key"
+  auto_generate_cert: true
+
+encryption:
+  # PBKDF2 iterations for credential encryption key derivation
+  kdf_iterations: 600000
+
+sessions:
+  max_active_per_user: 20
+  # How long SSH sessions stay alive after tab is closed (minutes)
+  keep_alive_minutes: 30
+  ssh_keepalive_interval: 60
+
+guacd:
+  enabled: false
+  host: "localhost"
+  port: 4822
+
+ai:
+  enabled: true
+  # Per-user API keys are stored in the database, not here
+
+metrics:
+  enabled: true
+  interval_seconds: 5
+
+deployment:
+  # "local" for LAN access, "production" for internet-facing
+  mode: "local"
+  allowed_origins: ["*"]
+  trusted_proxies: []

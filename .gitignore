@@ -1,0 +1,45 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# Runtime data (generated at install/runtime)
+data/
+certs/
+
+# Generated config (contains secret key)
+config.yaml
+
+# Generated systemd service files
+*.service
+
+# Install/update logs
+install.log
+update.log
+
+# AI agent instructions (development only)
+AGENTS.md
+CLAUDE.md
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini

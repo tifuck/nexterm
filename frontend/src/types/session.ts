@@ -22,7 +22,7 @@ export interface Folder {
   id: string;
   name: string;
   parent_id?: string | null;
-  color?: string;
+  color?: string | null;
   icon?: string;
   sort_order: number;
   children?: Folder[];

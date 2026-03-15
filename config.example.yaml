@@ -73,5 +73,9 @@ metrics:
 deployment:
   # "local" for LAN access, "production" for internet-facing
   mode: "local"
+  # List the origins that may make cross-origin requests.
+  # ["*"] is treated as empty (no cross-origin) when credentials are used.
+  # For cross-origin setups, list specific origins:
+  #   allowed_origins: ["https://app.example.com"]
   allowed_origins: ["*"]
   trusted_proxies: []

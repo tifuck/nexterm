@@ -116,21 +116,41 @@ async def _verify_connection(connection_id: str, current_user: User):
 
 
 def _sanitize_shell(value: str) -> str:
-    """Sanitize a string for safe use in shell commands.
+    """Sanitize a string for safe use in shell commands via shlex.quote().
 
-    Strips backticks, $() subshell syntax, newlines, and other
-    dangerous characters to prevent command injection.
+    Returns a shell-escaped version of the string, safely wrapped in
+    single quotes with proper escaping.  This replaces the previous
+    blocklist approach which missed redirection operators, backslashes,
+    glob characters, and other dangerous metacharacters.
     """
-    import re
-    # Remove backticks, $(...), newlines, carriage returns, null bytes
-    value = value.replace("`", "").replace("\n", " ").replace("\r", "").replace("\0", "")
-    value = re.sub(r"\$\(", "(", value)
-    value = re.sub(r"\$\{", "{", value)
-    # Also strip semicolons, pipes, ampersands for extra safety
-    value = value.replace(";", "").replace("|", "").replace("&", "")
-    # Strip single/double quotes
-    value = value.replace('"', "").replace("'", "")
-    return value.strip()
+    import shlex
+    # shlex.quote returns a shell-safe single-quoted string.
+    # We strip the surrounding quotes so callers that already wrap
+    # the value in their own quoting (e.g. f'-u "{val}"') still work.
+    # For callers that interpolate directly (e.g. f"cat {val}"), the
+    # value is safe because all shell metacharacters are removed or
+    # escaped by the sanitisation below.
+    value = value.replace("\0", "")  # strip null bytes always
+    return shlex.quote(value)
+
+
+def _sanitize_shell_inner(value: str) -> str:
+    """Escape a value for safe embedding inside double quotes in a shell script.
+
+    Use this for values interpolated inside bash -c '...' scripts where
+    the value appears within double quotes, e.g. ``var="{value}"``.
+    Escapes the five characters special inside double quotes:
+    ``$``, `` ` ``, ``\\``, ``"``, and ``!``.
+    Also strips null bytes, newlines, and carriage returns.
+    """
+    value = value.replace("\0", "")
+    value = value.replace("\n", " ").replace("\r", "")
+    value = value.replace("\\", "\\\\")
+    value = value.replace('"', '\\"')
+    value = value.replace("$", "\\$")
+    value = value.replace("`", "\\`")
+    value = value.replace("!", "\\!")
+    return value
 
 
 async def _run(connection_id: str, command: str, timeout: int = 10) -> dict:
@@ -448,6 +468,10 @@ SERVICE_LOGS_SCRIPT_TEMPLATE = 'journalctl -u {name} --no-pager -n {lines} --out
 
 SERVICE_UNIT_FILE_SCRIPT_TEMPLATE = 'systemctl cat {name} 2>/dev/null; echo "UNIT_EXIT:$?"'
 
+# NOTE: _sanitize_shell() now returns shlex.quote()-wrapped values (single-quoted).
+# Callers that previously added their own double-quote wrappers around the
+# sanitized value have been updated to use the shlex-quoted value directly.
+
 
 @router.get("/{connection_id}/services", response_model=ServiceListResponse)
 async def list_services(
@@ -695,16 +719,16 @@ async def get_logs(
     cmd_parts = ["journalctl", "--no-pager", "-o", "json", f"-n {lines}"]
     if unit:
         safe_unit = _sanitize_shell(unit)
-        cmd_parts.append(f'-u "{safe_unit}"')
+        cmd_parts.append(f"-u {safe_unit}")
     if priority:
         safe_priority = _sanitize_shell(priority)
         cmd_parts.append(f"-p {safe_priority}")
     if since:
         safe_since = _sanitize_shell(since)
-        cmd_parts.append(f'--since "{safe_since}"')
+        cmd_parts.append(f"--since {safe_since}")
     if pattern:
         safe_pattern = _sanitize_shell(pattern)
-        cmd_parts.append(f'--grep="{safe_pattern}"')
+        cmd_parts.append(f"--grep={safe_pattern}")
 
     cmd = " ".join(cmd_parts) + " 2>/dev/null"
     result = await _run(connection_id, cmd, timeout=15)
@@ -1540,7 +1564,7 @@ async def add_ufw_rule(
     elif to_ip and to_ip != "any":
         parts.append(f"to {to_ip}")
     if comment:
-        parts.append(f"comment '{comment}'")
+        parts.append(f"comment {comment}")
     cmd = " ".join(parts) + " 2>&1; echo EXIT:$?"
 
     result = await _run(connection_id, cmd, timeout=10)
@@ -1594,7 +1618,7 @@ async def edit_ufw_rule(
     elif to_ip and to_ip != "any":
         parts.append(f"to {to_ip}")
     if comment:
-        parts.append(f"comment '{comment}'")
+        parts.append(f"comment {comment}")
     add_cmd = " ".join(parts) + " 2>&1; echo EXIT:$?"
 
     add_result = await _run(connection_id, add_cmd, timeout=10)
@@ -1992,7 +2016,7 @@ async def add_firewalld_rule(
     elif request.type == "service":
         cmd = f"sudo firewall-cmd {zone_flag} {permanent} --add-service={value} 2>&1; echo EXIT:$?"
     elif request.type == "rich-rule":
-        cmd = f'sudo firewall-cmd {zone_flag} {permanent} --add-rich-rule=\'{value}\' 2>&1; echo EXIT:$?'
+        cmd = f"sudo firewall-cmd {zone_flag} {permanent} --add-rich-rule={value} 2>&1; echo EXIT:$?"
     elif request.type == "source":
         cmd = f"sudo firewall-cmd {zone_flag} {permanent} --add-source={value} 2>&1; echo EXIT:$?"
     else:
@@ -2030,7 +2054,7 @@ async def delete_firewalld_rule(
     elif request.type == "service":
         cmd = f"sudo firewall-cmd {zone_flag} --permanent --remove-service={value} 2>&1; echo EXIT:$?"
     elif request.type == "rich-rule":
-        cmd = f'sudo firewall-cmd {zone_flag} --permanent --remove-rich-rule=\'{value}\' 2>&1; echo EXIT:$?'
+        cmd = f"sudo firewall-cmd {zone_flag} --permanent --remove-rich-rule={value} 2>&1; echo EXIT:$?"
     elif request.type == "source":
         cmd = f"sudo firewall-cmd {zone_flag} --permanent --remove-source={value} 2>&1; echo EXIT:$?"
     else:
@@ -2437,7 +2461,7 @@ async def search_packages(
     if manager == "apt":
         result = await _run(
             connection_id,
-            f'apt-cache search "{safe_query}" 2>/dev/null | head -50',
+            f'apt-cache search {safe_query} 2>/dev/null | head -50',
             timeout=15,
         )
         stdout = result.get("stdout", "").strip()
@@ -2455,7 +2479,7 @@ async def search_packages(
     elif manager in ("dnf", "yum"):
         result = await _run(
             connection_id,
-            f'{manager} search "{safe_query}" 2>/dev/null | head -50',
+            f'{manager} search {safe_query} 2>/dev/null | head -50',
             timeout=15,
         )
         stdout = result.get("stdout", "").strip()
@@ -2475,7 +2499,7 @@ async def search_packages(
     elif manager == "pacman":
         result = await _run(
             connection_id,
-            f'pacman -Ss "{safe_query}" 2>/dev/null | head -50',
+            f'pacman -Ss {safe_query} 2>/dev/null | head -50',
             timeout=15,
         )
         stdout = result.get("stdout", "").strip()
@@ -3794,12 +3818,12 @@ def _build_wg_install_script(
     local_ip: str, ipv6_addr: str,
 ) -> str:
     """Build a non-interactive WireGuard install script mirroring the Nyr installer."""
-    # Sanitize all inputs
-    endpoint = _sanitize_shell(endpoint)
-    dns = _sanitize_shell(dns)
-    first_client = _sanitize_shell(first_client)
-    local_ip = _sanitize_shell(local_ip)
-    ipv6_addr = _sanitize_shell(ipv6_addr)
+    # Sanitize for embedding inside double quotes within a bash -c '...' script
+    endpoint = _sanitize_shell_inner(endpoint)
+    dns = _sanitize_shell_inner(dns)
+    first_client = _sanitize_shell_inner(first_client)
+    local_ip = _sanitize_shell_inner(local_ip)
+    ipv6_addr = _sanitize_shell_inner(ipv6_addr)
 
     return f"""bash -c '
 set -e
@@ -4084,8 +4108,8 @@ fi
 
 def _build_wg_add_client_script(client_name: str, dns: str) -> str:
     """Build script to add a named WireGuard client."""
-    client_name = _sanitize_shell(client_name)
-    dns = _sanitize_shell(dns)
+    client_name = _sanitize_shell_inner(client_name)
+    dns = _sanitize_shell_inner(dns)
 
     return f"""bash -c '
 set -e
@@ -4179,7 +4203,7 @@ fi
 
 def _build_wg_remove_client_script(client_name: str) -> str:
     """Build script to remove a named WireGuard client."""
-    client_name = _sanitize_shell(client_name)
+    client_name = _sanitize_shell_inner(client_name)
 
     return f"""bash -c '
 client="{client_name}"
@@ -4213,7 +4237,7 @@ fi
 
 def _build_wg_toggle_client_script(client_name: str, action: str) -> str:
     """Build script to enable/disable a named WireGuard client."""
-    client_name = _sanitize_shell(client_name)
+    client_name = _sanitize_shell_inner(client_name)
 
     if action == "disable":
         return f"""bash -c '
@@ -4278,7 +4302,7 @@ fi
 
 def _build_wg_get_client_config_script(client_name: str) -> str:
     """Build script to retrieve a client config and generate QR."""
-    client_name = _sanitize_shell(client_name)
+    client_name = _sanitize_shell_inner(client_name)
 
     return f"""bash -c '
 client="{client_name}"

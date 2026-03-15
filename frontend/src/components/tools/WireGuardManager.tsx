@@ -1,4 +1,5 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import DOMPurify from 'dompurify';
 import {
   Network,
   RefreshCw,
@@ -740,7 +741,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
                 <div className="flex justify-center">
                   <div
                     className="bg-white p-3 rounded-lg"
-                    dangerouslySetInnerHTML={{ __html: viewingConfig.qr_svg }}
+                    dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(viewingConfig.qr_svg, { USE_PROFILES: { svg: true, svgFilters: true }, ADD_TAGS: ['svg', 'path', 'rect', 'circle', 'g', 'defs', 'use'], FORBID_ATTR: ['xlink:href', 'href'] }) }}
                     style={{ maxWidth: 240 }}
                   />
                 </div>

@@ -2,12 +2,11 @@
 import asyncio
 import json
 import logging
-import re
 from fastapi import WebSocket, WebSocketDisconnect, Query
 from backend.services.ssh_proxy import ssh_proxy
 from backend.middleware.auth import verify_token
 from backend.config import config
-from backend.routers.tools import _build_wg_install_script, _sanitize_shell, _parse_exit_code
+from backend.routers.tools import _build_wg_install_script, _sanitize_shell, _sanitize_shell_inner, _parse_exit_code
 
 logger = logging.getLogger(__name__)
 
@@ -555,28 +554,18 @@ async def _tail_logs(
     lines: int = 50,
 ):
     """Poll journalctl for new log lines and stream them to the client."""
-    import re
-
-    def _ws_sanitize(value: str) -> str:
-        value = value.replace("`", "").replace("\n", " ").replace("\r", "").replace("\0", "")
-        value = re.sub(r"\$\(", "(", value)
-        value = re.sub(r"\$\{", "{", value)
-        value = value.replace(";", "").replace("|", "").replace("&", "")
-        value = value.replace('"', "").replace("'", "")
-        return value.strip()
-
     poll_interval = 2
     cursor = ""
-    safe_unit = _ws_sanitize(unit) if unit else ""
-    safe_pattern = _ws_sanitize(pattern) if pattern else ""
+    safe_unit = _sanitize_shell(unit) if unit else ""
+    safe_pattern = _sanitize_shell(pattern) if pattern else ""
 
     try:
         # Initial fetch
         cmd_parts = ["journalctl", "--no-pager", "-o", "short-iso", f"-n {lines}"]
         if safe_unit:
-            cmd_parts.append(f'-u "{safe_unit}"')
+            cmd_parts.append(f"-u {safe_unit}")
         if safe_pattern:
-            cmd_parts.append(f'--grep="{safe_pattern}"')
+            cmd_parts.append(f"--grep={safe_pattern}")
 
         # Add --show-cursor to get the cursor position
         cmd_parts.append("--show-cursor")
@@ -608,11 +597,11 @@ async def _tail_logs(
 
             poll_parts = ["journalctl", "--no-pager", "-o", "short-iso"]
             if safe_unit:
-                poll_parts.append(f'-u "{safe_unit}"')
+                poll_parts.append(f"-u {safe_unit}")
             if safe_pattern:
-                poll_parts.append(f'--grep="{safe_pattern}"')
+                poll_parts.append(f"--grep={safe_pattern}")
             if cursor:
-                poll_parts.append(f'--after-cursor="{cursor}"')
+                poll_parts.append(f"--after-cursor={_sanitize_shell(cursor)}")
             else:
                 poll_parts.append("--since '2 seconds ago'")
             poll_parts.append("--show-cursor")
@@ -661,12 +650,12 @@ async def _stream_wg_install(
     pid = ""
 
     try:
-        endpoint = _sanitize_shell(install_config.get("endpoint", ""))
+        endpoint = _sanitize_shell_inner(install_config.get("endpoint", ""))
         port = int(install_config.get("port", 51820))
-        dns = _sanitize_shell(install_config.get("dns", "1.1.1.1, 1.0.0.1"))
-        first_client = _sanitize_shell(install_config.get("first_client_name", "client"))
-        local_ip = _sanitize_shell(install_config.get("local_ip", ""))
-        ipv6_addr = _sanitize_shell(install_config.get("ipv6_addr", ""))
+        dns = _sanitize_shell_inner(install_config.get("dns", "1.1.1.1, 1.0.0.1"))
+        first_client = _sanitize_shell_inner(install_config.get("first_client_name", "client"))
+        local_ip = _sanitize_shell_inner(install_config.get("local_ip", ""))
+        ipv6_addr = _sanitize_shell_inner(install_config.get("ipv6_addr", ""))
 
         if not endpoint:
             await websocket.send_json({

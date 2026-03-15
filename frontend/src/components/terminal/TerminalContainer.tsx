@@ -73,6 +73,16 @@ export const TerminalContainer: React.FC<TerminalContainerProps> = ({
   connectionConfigRef.current = connectionConfig;
   sessionIdRef.current = sessionId;
 
+  // Auto-focus terminal when this tab becomes active
+  const activeTab = useTabStore((s) => s.activeTab);
+  useEffect(() => {
+    if (activeTab !== tabId) return;
+    const cached = terminalCache.get(tabId);
+    if (!cached) return;
+    const timer = setTimeout(() => cached.terminal.focus(), 50);
+    return () => clearTimeout(timer);
+  }, [activeTab, tabId]);
+
   const getTheme = useCallback(() => {
     const base = TERMINAL_THEMES[terminalTheme] ?? TERMINAL_THEMES.nextermDark;
     if (cursorColor) {

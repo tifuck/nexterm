@@ -92,13 +92,63 @@ app = FastAPI(
 )
 
 # CORS middleware
+# When allowed_origins is ["*"], restrict to same-origin only for security.
+# Explicitly configure origins in config.yaml for cross-origin access.
+_origins = config.allowed_origins
+if _origins == ["*"]:
+    # Wildcard with credentials is dangerous — restrict to no cross-origin.
+    # Users must explicitly list allowed origins in config.yaml.
+    _origins = []
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.allowed_origins,
+    allow_origins=_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Security headers middleware
+# ---------------------------------------------------------------------------
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add standard security headers to every HTTP response."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault(
+            "Referrer-Policy", "strict-origin-when-cross-origin"
+        )
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=()",
+        )
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            (
+                "default-src 'self'; "
+                "script-src 'self'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: blob:; "
+                "font-src 'self' data:; "
+                "connect-src 'self' ws: wss:; "
+                "frame-ancestors 'none'"
+            ),
+        )
+        if config.https_enabled:
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                "max-age=31536000; includeSubDomains",
+            )
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
 
 # Register API routers
 app.include_router(auth_router)

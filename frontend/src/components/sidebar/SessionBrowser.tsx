@@ -233,7 +233,7 @@ const ColorPicker: React.FC<ColorPickerProps> = ({ folder, onClose, onSelect }) 
         {FOLDER_COLORS.map((color, i) => (
           <button
             key={i}
-            onClick={() => { onSelect(folder.id, color ?? ''); onClose(); }}
+            onClick={() => { onSelect(folder.id, color); onClose(); }}
             className={`w-5 h-5 rounded-full border-2 transition-transform active:scale-90 ${
               (folder.color ?? null) === color
                 ? 'border-white scale-110'
@@ -789,7 +789,7 @@ export const SessionBrowser: React.FC = () => {
 
   const handleFolderColorSelect = useCallback(async (folderId: string, color: string | null) => {
     try {
-      await updateFolder(folderId, { color: color || undefined });
+      await updateFolder(folderId, { color: color });
     } catch {
       addToast('Failed to update folder color', 'error');
     }

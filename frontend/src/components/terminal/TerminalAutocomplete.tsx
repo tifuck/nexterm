@@ -34,6 +34,8 @@ interface TerminalAutocompleteProps {
   selectedIndex: number;
   isOpen: boolean;
   inputPrefix: string;
+  /** Called when a suggestion is double-clicked/tapped to fill the command. */
+  onSelect?: (command: string) => void;
 }
 
 interface BasePosition {
@@ -113,6 +115,7 @@ export const TerminalAutocomplete: React.FC<TerminalAutocompleteProps> = ({
   selectedIndex,
   isOpen,
   inputPrefix,
+  onSelect,
 }) => {
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -282,6 +285,7 @@ export const TerminalAutocomplete: React.FC<TerminalAutocompleteProps> = ({
                   (e.currentTarget as HTMLElement).style.backgroundColor = 'transparent';
                 }
               }}
+              onDoubleClick={() => onSelect?.(cmd)}
             >
               <span style={{ color: isSelected ? '#fff' : accentColor, fontWeight: isSelected ? 600 : 400 }}>
                 {cmd.slice(0, inputPrefix.length)}

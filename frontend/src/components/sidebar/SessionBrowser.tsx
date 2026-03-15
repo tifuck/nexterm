@@ -722,6 +722,12 @@ export const SessionBrowser: React.FC = () => {
           username: session.username ?? '',
         },
       });
+
+      // Auto-close sidebar on mobile so the terminal is immediately visible
+      if (window.innerWidth < 640) {
+        const { isOpen, toggle } = useSidebarStore.getState();
+        if (isOpen) toggle();
+      }
     },
     [addTab]
   );

@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { Search, ZoomIn, ZoomOut, RotateCcw, Maximize2, Minimize2, X } from 'lucide-react';
+import { Search, ZoomIn, ZoomOut, RotateCcw, Maximize2, Minimize2, X, MoreVertical } from 'lucide-react';
 import { getTerminalSearchAddon, getTerminalInstance, getTerminalFitAddon } from './TerminalContainer';
 
 interface TerminalToolbarProps {
@@ -15,8 +15,17 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({ tabId }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Detect mobile viewport
+  useEffect(() => {
+    const check = () => setIsMobile(window.innerWidth < 640);
+    check();
+    window.addEventListener('resize', check);
+    return () => window.removeEventListener('resize', check);
+  }, []);
 
   const showToolbar = useCallback(() => {
     if (hideTimeoutRef.current) {
@@ -33,6 +42,10 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({ tabId }) => {
       }
     }, 300);
   }, [isSearchOpen]);
+
+  const toggleToolbar = useCallback(() => {
+    setIsVisible((v) => !v);
+  }, []);
 
   const handleSearch = useCallback(
     (query: string) => {
@@ -134,18 +147,31 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({ tabId }) => {
 
   return (
     <>
-      {/* Enlarged hover trigger zone - covers top-right corner */}
-      <div
-        className="absolute top-0 right-0 w-48 h-12 z-10"
-        onMouseEnter={showToolbar}
-        onMouseLeave={hideToolbar}
-      />
+      {/* Desktop: enlarged hover trigger zone - covers top-right corner */}
+      {!isMobile && (
+        <div
+          className="absolute top-0 right-0 w-48 h-12 z-10"
+          onMouseEnter={showToolbar}
+          onMouseLeave={hideToolbar}
+        />
+      )}
+
+      {/* Mobile: always-visible toggle button */}
+      {isMobile && (
+        <button
+          onClick={toggleToolbar}
+          className="absolute top-1.5 right-1.5 z-30 p-1.5 rounded-md transition-colors"
+          style={{ backgroundColor: 'rgba(15, 20, 25, 0.7)' }}
+        >
+          <MoreVertical size={16} className={isVisible ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)]'} />
+        </button>
+      )}
 
       {/* Toolbar */}
       <div
-        className="absolute top-2 right-2 z-20 flex flex-col items-end gap-1"
-        onMouseEnter={showToolbar}
-        onMouseLeave={hideToolbar}
+        className={`absolute ${isMobile ? 'top-9' : 'top-2'} right-2 z-20 flex flex-col items-end gap-1`}
+        onMouseEnter={isMobile ? undefined : showToolbar}
+        onMouseLeave={isMobile ? undefined : hideToolbar}
       >
         {/* Toolbar buttons */}
         <div

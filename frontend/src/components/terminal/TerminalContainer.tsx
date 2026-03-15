@@ -107,10 +107,14 @@ export const TerminalContainer: React.FC<TerminalContainerProps> = ({
       terminal.open(containerRef.current);
       fitAddon.fit();
     } else {
+      // Use a smaller default font size on mobile viewports for better readability
+      const isMobile = window.innerWidth < 640;
+      const defaultFontSize = isMobile ? 12 : 14;
+
       terminal = new Terminal({
         cursorBlink,
         cursorStyle,
-        fontSize: fontSize ?? 14,
+        fontSize: fontSize ?? defaultFontSize,
         fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', Menlo, Monaco, monospace",
         theme: getTheme(),
         allowProposedApi: true,
@@ -666,6 +670,20 @@ export const TerminalContainer: React.FC<TerminalContainerProps> = ({
     }
   }, [tabId, cursorBlink]);
 
+  // Handle autocomplete suggestion selection via double-click/tap.
+  // Fills the command into the terminal without executing it.
+  const handleSuggestionSelect = useCallback((command: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    // Clear current input line, then type the selected command
+    ws.send(JSON.stringify({ type: 'data', data: '\x15' }));
+    ws.send(JSON.stringify({ type: 'data', data: command }));
+
+    // Close the autocomplete dropdown
+    historyRef.current.closeSuggestions();
+  }, []);
+
   const themeBg = getTheme().background ?? '#000000';
 
   return (
@@ -682,6 +700,7 @@ export const TerminalContainer: React.FC<TerminalContainerProps> = ({
         selectedIndex={history.selectedIndex}
         isOpen={history.isOpen}
         inputPrefix={history.inputBuffer}
+        onSelect={handleSuggestionSelect}
       />
     </>
   );

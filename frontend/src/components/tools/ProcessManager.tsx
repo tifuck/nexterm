@@ -193,7 +193,7 @@ export const ProcessManager: React.FC<Props> = ({ connectionId }) => {
             {sorted.map((p) => (
               <tr
                 key={p.pid}
-                className="border-b border-[var(--border)]/30 hover:bg-[var(--bg-hover)] transition-colors"
+                className="border-b border-[var(--border)] hover:bg-[var(--bg-hover)] transition-colors"
               >
                 <td className="px-2 py-1 tabular-nums text-[var(--text-secondary)]">{p.pid}</td>
                 <td className="px-2 py-1 text-[var(--text-secondary)]">{p.user}</td>

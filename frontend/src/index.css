@@ -70,10 +70,18 @@ body,
   height: 100%;
   margin: 0;
   padding: 0;
+  overflow: hidden;
   background-color: var(--bg-primary);
   color: var(--text-primary);
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
     Oxygen, Ubuntu, Cantarell, sans-serif;
+}
+
+/* Dynamic viewport height — uses 100dvh where supported (fixes mobile
+   browser address-bar height mismatch), falls back to 100vh. */
+.h-dvh {
+  height: 100vh;
+  height: 100dvh;
 }
 
 /* Scrollbar styles */

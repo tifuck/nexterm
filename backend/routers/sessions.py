@@ -1,4 +1,5 @@
 """Session CRUD routes."""
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -15,6 +16,9 @@ from backend.schemas.session import (
     SessionResponse,
     SessionUpdate,
 )
+from backend.services.ssh_proxy import ssh_proxy
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -211,6 +215,40 @@ async def get_all_credentials(
         )
         for s in sessions
     ]
+
+
+# ---------------------------------------------------------------------------
+# GET /{session_id}/active — list active SSH connections for this session
+# ---------------------------------------------------------------------------
+
+@router.get("/{session_id}/active")
+async def get_active_connections(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Return active SSH connections for a saved session.
+
+    Used by the frontend to detect when a session is already connected
+    (possibly on another device) and offer to attach to it.
+    """
+    # Verify ownership
+    await _get_session_or_404(session_id, str(current_user.id))
+
+    try:
+        connections = await ssh_proxy.find_active_by_session_id(
+            str(current_user.id), session_id,
+        )
+        # Filter to only return useful fields
+        return [
+            {
+                "connection_id": c["connection_id"],
+                "created_at": c.get("created_at", ""),
+            }
+            for c in connections
+        ]
+    except Exception as e:
+        logger.error("Failed to query active connections: %s", e)
+        return []
 
 
 # ---------------------------------------------------------------------------

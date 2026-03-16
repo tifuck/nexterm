@@ -12,11 +12,10 @@
  * Positioning strategy:
  * We measure the terminal cursor once when the dropdown first opens to
  * establish a "prompt anchor" (the pixel X where the shell prompt ends).
- * Because the SSH echo for the triggering keystroke (and any preceding
- * backspace) may still be in flight, we measure twice: immediately (so the
- * overlay appears without delay) and again after a short timeout to let
- * pending echoes settle.  The second measurement silently corrects the
- * anchor if needed.
+ * The prompt boundary is detected by reading the current line text from
+ * the xterm.js buffer and finding common prompt suffixes ($ , # , > , % ).
+ * This avoids echo-timing issues where the cursor position hasn't been
+ * updated yet (which caused an off-by-one in the ghost text position).
  *
  * Subsequent ghost/dropdown positions are computed purely from
  * inputPrefix.length * cellWidth, avoiding any dependency on the async
@@ -59,13 +58,21 @@ function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
+/** Common shell prompt suffixes used to detect where the prompt ends. */
+const PROMPT_SUFFIXES = ['$ ', '# ', '> ', '% '];
+
 /**
  * Measure the terminal and compute the prompt anchor position.
  *
- * Reads terminal.buffer.active.cursorX/Y to determine where the cursor
- * currently sits, then subtracts prefixLength cells to find where the
- * shell prompt ends.  Because echoes are asynchronous, the caller should
- * invoke this twice (immediately + after a short delay) to ensure accuracy.
+ * Reads the current terminal line text to find the prompt boundary using
+ * common prompt suffixes (``$ ``, ``# ``, ``> ``, ``% ``), then computes
+ * the prompt end position in pixels.  This is more reliable than the old
+ * approach of ``cursorX - prefixLength`` which suffered from echo-timing
+ * issues (the cursor position may not yet reflect in-flight echoes,
+ * causing an off-by-one in the prompt anchor).
+ *
+ * Falls back to the cursor-minus-prefix approach if the line text cannot
+ * be read.
  */
 function measureBasePosition(
   tabId: string,
@@ -87,14 +94,40 @@ function measureBasePosition(
   const cellWidth = screenRect.width / terminal.cols;
   const cellHeight = screenRect.height / terminal.rows;
 
-  const cursorX = terminal.buffer.active.cursorX;
-  const cursorY = terminal.buffer.active.cursorY;
-
-  const cursorPixelX = screenRect.left - parentRect.left + cursorX * cellWidth;
+  const buffer = terminal.buffer.active;
+  const cursorY = buffer.cursorY;
   const cursorPixelY = screenRect.top - parentRect.top + cursorY * cellHeight;
 
-  // The prompt ends at cursorX minus the characters the user has already typed.
-  const promptX = cursorPixelX - prefixLength * cellWidth;
+  // Try to find the prompt boundary from the actual line text.
+  // This avoids echo-timing issues where cursorX hasn't been updated yet.
+  let promptEndCol: number | null = null;
+  const lineIndex = buffer.baseY + cursorY;
+  const line = buffer.getLine(lineIndex);
+  if (line) {
+    const fullLine = line.translateToString(true);
+    if (fullLine) {
+      for (const suffix of PROMPT_SUFFIXES) {
+        const idx = fullLine.lastIndexOf(suffix);
+        if (idx >= 0) {
+          const candidate = idx + suffix.length;
+          if (promptEndCol === null || candidate > promptEndCol) {
+            promptEndCol = candidate;
+          }
+        }
+      }
+    }
+  }
+
+  let promptX: number;
+  if (promptEndCol !== null) {
+    // Derive prompt position directly from the detected prompt column.
+    promptX = screenRect.left - parentRect.left + promptEndCol * cellWidth;
+  } else {
+    // Fallback: use cursorX minus prefix length.
+    const cursorX = buffer.cursorX;
+    const cursorPixelX = screenRect.left - parentRect.left + cursorX * cellWidth;
+    promptX = cursorPixelX - prefixLength * cellWidth;
+  }
 
   return {
     promptX,

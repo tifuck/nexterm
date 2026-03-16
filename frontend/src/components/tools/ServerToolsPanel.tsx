@@ -95,7 +95,7 @@ export const ServerToolsPanel: React.FC<Props> = () => {
         }`}
       >
         {/* Header */}
-        <div className="flex items-center gap-2 px-4 py-3 border-b border-[var(--border)]">
+        <div className="flex items-center gap-2 px-4 h-[40px] shrink-0 border-b border-[var(--border)]">
           <Server size={16} className="text-[var(--accent)]" />
           <h2 className="text-sm font-semibold text-[var(--text-primary)] flex-1">
             Server Tools
@@ -141,11 +141,6 @@ export const ServerToolsPanel: React.FC<Props> = () => {
               </div>
             );
           })}
-        </div>
-
-        {/* Footer */}
-        <div className="px-4 py-2.5 border-t border-[var(--border)] text-[10px] text-[var(--text-muted)]">
-          Phase 1–3 — More tools coming soon
         </div>
       </div>
     </>

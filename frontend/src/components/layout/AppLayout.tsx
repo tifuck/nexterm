@@ -68,7 +68,7 @@ const AppLayout: React.FC = () => {
   const effectiveWidth = Math.min(width, typeof window !== 'undefined' ? window.innerWidth * 0.8 : width);
 
   return (
-    <div className="flex flex-col h-screen w-screen overflow-hidden bg-[var(--bg-primary)] text-[var(--text-primary)]">
+    <div className="flex flex-col h-dvh w-screen overflow-hidden fixed inset-0 bg-[var(--bg-primary)] text-[var(--text-primary)]">
       {/* Shared top bar spanning full width */}
       <TopBar sidebarWidth={isOpen ? effectiveWidth : 0} sidebarOpen={isOpen} />
 

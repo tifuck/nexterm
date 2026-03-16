@@ -1,10 +1,17 @@
 """SFTP file operations REST API."""
 import logging
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+import mimetypes
+import os
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Query
 from fastapi.responses import StreamingResponse
-from backend.middleware.auth import get_current_user
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
+from backend.middleware.auth import get_current_user, verify_token
+from backend.database import async_session_factory
 from backend.models.user import User
 from backend.services.ssh_proxy import ssh_proxy
+
+_bearer_scheme = HTTPBearer(auto_error=False)
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +104,63 @@ async def download_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# GET /preview -- serve a file inline for browser preview (images, audio, video, PDF)
+# ---------------------------------------------------------------------------
+@router.get("/{connection_id}/preview")
+async def preview_file(
+    connection_id: str,
+    request: Request,
+    path: str = Query(description="File path to preview"),
+    token: str | None = Query(default=None, description="JWT token for inline auth"),
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+):
+    """Serve a file inline with the correct MIME type for browser preview."""
+    # Authenticate via query-param token (for <img>/<video>/<audio>/<iframe>)
+    # or via standard Authorization header.
+    jwt_token = token
+    if not jwt_token and credentials:
+        jwt_token = credentials.credentials
+    if not jwt_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    payload = verify_token(jwt_token)
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    async with async_session_factory() as session:
+        result = await session.execute(select(User).where(User.id == user_id))
+        current_user = result.scalar_one_or_none()
+
+    if not current_user or not current_user.is_active:
+        raise HTTPException(status_code=401, detail="User not found or disabled")
+
+    await _verify_connection(connection_id, current_user)
+
+    try:
+        await ssh_proxy.sftp_open(connection_id)
+        content = await ssh_proxy.sftp_read(connection_id, path)
+
+        filename = path.split("/")[-1] if "/" in path else path
+        mime_type, _ = mimetypes.guess_type(filename)
+        if not mime_type:
+            mime_type = "application/octet-stream"
+
+        return StreamingResponse(
+            iter([content]),
+            media_type=mime_type,
+            headers={
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "Content-Length": str(len(content)),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/{connection_id}/read")
 async def read_file(
     connection_id: str,
@@ -135,11 +199,26 @@ async def upload_file(
 ):
     """Upload a file via SFTP."""
     await _verify_connection(connection_id, current_user)
-    
+
+    # Enforce a maximum upload size (100 MB) to prevent memory exhaustion.
+    MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
+
     try:
         await ssh_proxy.sftp_open(connection_id)
-        content = await file.read()
-        dest_path = f"{path.rstrip('/')}/{file.filename}"
+
+        # Read with size limit
+        content = await file.read(MAX_UPLOAD_SIZE + 1)
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum upload size is {MAX_UPLOAD_SIZE // (1024 * 1024)} MB",
+            )
+
+        # Sanitise filename to prevent path traversal
+        filename = os.path.basename(file.filename or "upload")
+        if not filename or filename in (".", ".."):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        dest_path = f"{path.rstrip('/')}/{filename}"
         await ssh_proxy.sftp_write(connection_id, dest_path, content)
         return {"message": "File uploaded", "path": dest_path, "size": len(content)}
     except Exception as e:

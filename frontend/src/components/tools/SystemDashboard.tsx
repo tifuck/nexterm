@@ -19,8 +19,7 @@ import {
   Tooltip,
 } from 'recharts';
 import { ToolModal } from './ToolModal';
-import { apiGet } from '@/api/client';
-import { getWsUrl } from '@/api/client';
+import { apiGet, getWsUrl, ensureFreshToken } from '@/api/client';
 
 interface DashboardMetrics {
   cpu_percent: number;
@@ -135,9 +134,10 @@ export const SystemDashboard: React.FC<Props> = ({ connectionId }) => {
     let retryTimeout: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
 
-    const connect = () => {
+    const connect = async () => {
       if (cancelled) return;
 
+      await ensureFreshToken();
       const wsUrl = getWsUrl('/ws/tools');
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
@@ -557,7 +557,7 @@ const TopProcessTable: React.FC<{
       </thead>
       <tbody>
         {processes.map((p, i) => (
-          <tr key={i} className="border-b border-[var(--border)]/50 text-[var(--text-secondary)]">
+          <tr key={i} className="border-b border-[var(--border-secondary)] text-[var(--text-secondary)]">
             <td className="py-1 tabular-nums">{p.pid}</td>
             <td className="py-1">{p.user}</td>
             <td className="py-1 text-right tabular-nums text-[var(--accent)]">

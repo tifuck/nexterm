@@ -13,7 +13,7 @@ const StatusBar: React.FC = () => {
   const appName = useConfigStore((s) => s.appName);
 
   const current = tabs.find((t) => t.id === activeTab);
-  const isSession = current && current.type !== 'home' && current.type !== 'editor';
+  const isSession = current && current.type !== 'home' && current.type !== 'editor' && current.type !== 'preview';
   const isConnected = isSession && current.isConnected;
 
   return (

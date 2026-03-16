@@ -5,6 +5,7 @@ import {
   Loader2,
   AlertCircle,
   FileText,
+  Server,
   X,
   RotateCcw,
 } from 'lucide-react';
@@ -24,9 +25,28 @@ interface FileEditorProps {
 
 const FileEditor: React.FC<FileEditorProps> = ({ tab }) => {
   const updateTab = useTabStore((s) => s.updateTab);
+  const tabs = useTabStore((s) => s.tabs);
   const connectionId = tab.connectionId!;
   const filePath = tab.meta?.filePath as string;
   const language = (tab.meta?.language as string) || 'plaintext';
+
+  // Find the parent SSH/telnet tab to get server info
+  const parentTab = tabs.find(
+    (t) => (t.type === 'ssh' || t.type === 'telnet') && t.connectionId === connectionId
+  );
+  const serverName = parentTab?.title || '';
+  const serverHost = parentTab?.meta?.host || '';
+  const serverPort = parentTab?.meta?.port;
+  const serverUser = parentTab?.meta?.username || '';
+  const serverLabel = (() => {
+    const userHost = serverUser && serverHost
+      ? `${serverUser}@${serverHost}${serverPort && serverPort !== 22 ? ':' + serverPort : ''}`
+      : serverHost || '';
+    if (serverName && userHost && serverName !== userHost) {
+      return `${serverName} (${userHost})`;
+    }
+    return serverName || userHost || '';
+  })();
 
   const [content, setContent] = useState<string>('');
   const [originalContent, setOriginalContent] = useState<string>('');
@@ -37,6 +57,7 @@ const FileEditor: React.FC<FileEditorProps> = ({ tab }) => {
   const [isDirty, setIsDirty] = useState(false);
 
   const editorRef = useRef<any>(null);
+  const handleSaveRef = useRef<() => void>(() => {});
 
   // Load file content
   useEffect(() => {
@@ -91,12 +112,13 @@ const FileEditor: React.FC<FileEditorProps> = ({ tab }) => {
   const handleEditorMount: OnMount = useCallback((editor) => {
     editorRef.current = editor;
 
-    // Add Ctrl+S keybinding
+    // Add Ctrl+S keybinding — uses a ref so it always calls the latest
+    // handleSave with current content, not the stale initial closure.
     editor.addCommand(
       // Monaco KeyMod.CtrlCmd | Monaco KeyCode.KeyS
       2048 | 49, // CtrlCmd = 2048, KeyS = 49
       () => {
-        handleSave();
+        handleSaveRef.current();
       }
     );
   }, []);
@@ -119,6 +141,9 @@ const FileEditor: React.FC<FileEditorProps> = ({ tab }) => {
       setIsSaving(false);
     }
   }, [connectionId, filePath, content, isSaving]);
+
+  // Keep the ref in sync so Ctrl+S always invokes the latest handleSave
+  handleSaveRef.current = handleSave;
 
   const handleRevert = useCallback(() => {
     setContent(originalContent);
@@ -177,6 +202,15 @@ const FileEditor: React.FC<FileEditorProps> = ({ tab }) => {
       {/* Toolbar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-[var(--border-primary)] bg-[var(--bg-secondary)]">
         <div className="flex items-center gap-2 min-w-0">
+          {serverLabel && (
+            <>
+              <Server size={13} className="text-[var(--accent)] flex-shrink-0" />
+              <span className="text-[11px] text-[var(--accent)] font-medium flex-shrink-0 truncate max-w-[250px]" title={serverLabel}>
+                {serverLabel}
+              </span>
+              <span className="text-[var(--text-muted)] flex-shrink-0">/</span>
+            </>
+          )}
           <FileText size={14} className="text-[var(--text-muted)] flex-shrink-0" />
           <span className="text-xs text-[var(--text-secondary)] truncate" title={filePath}>
             {filePath}

@@ -167,7 +167,7 @@ async def register(body: RegisterRequest):
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh(body: RefreshRequest):
     """Exchange a valid refresh token for a new access + refresh token pair."""
-    payload = verify_token(body.refresh_token)
+    payload = verify_token(body.refresh_token, allow_refresh=True)
 
     if payload.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Invalid token type")

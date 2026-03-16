@@ -177,10 +177,18 @@ def decrypt_sensitive(stored: str | None) -> str | None:
     svc = get_encryption_service()
     try:
         return svc.decrypt(stored)
-    except (InvalidToken, Exception):
-        # Fallback: legacy base64-only encoding from the MVP placeholder.
+    except InvalidToken:
+        # Legacy base64-only encoding from the MVP placeholder.
+        # Log a warning so admins know there is unencrypted data.
+        logger.warning(
+            "Fernet decryption failed — attempting legacy base64 decode. "
+            "Re-save the credential to upgrade it to encrypted storage."
+        )
         try:
             return base64.b64decode(stored.encode("utf-8")).decode("utf-8")
         except Exception:
-            logger.warning("Failed to decrypt credential value; returning None")
+            logger.error("Failed to decrypt credential value (neither Fernet nor legacy base64)")
             return None
+    except Exception:
+        logger.error("Unexpected error decrypting credential value")
+        return None

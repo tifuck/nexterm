@@ -14,7 +14,7 @@ import {
   ChevronDown,
 } from 'lucide-react';
 import { ToolModal } from './ToolModal';
-import { apiGet, apiPost, getWsUrl } from '@/api/client';
+import { apiGet, apiPost, getWsUrl, ensureFreshToken } from '@/api/client';
 
 interface LogEntry {
   timestamp: string;
@@ -85,7 +85,8 @@ export const LogViewer: React.FC<Props> = ({ connectionId }) => {
   }, [entries, tailLines, autoScroll]);
 
   // Live tailing via WebSocket
-  const startTailing = useCallback(() => {
+  const startTailing = useCallback(async () => {
+    await ensureFreshToken();
     const wsUrl = getWsUrl('/ws/tools');
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;

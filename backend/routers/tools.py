@@ -1406,12 +1406,23 @@ sudo ufw status numbered 2>/dev/null | grep "^\[" | while IFS= read -r line; do
   v6="false"
   echo "$rest" | grep -q "(v6)" && v6="true"
 
-  # Parse action
-  action=$(echo "$rest" | awk "{print \$1}" | tr "[:upper:]" "[:lower:]")
+  # Parse action - match known UFW action keywords
+  action=""
+  if echo "$rest" | grep -qi "LIMIT"; then
+    action="limit"
+  elif echo "$rest" | grep -qi "ALLOW"; then
+    action="allow"
+  elif echo "$rest" | grep -qi "DENY"; then
+    action="deny"
+  elif echo "$rest" | grep -qi "REJECT"; then
+    action="reject"
+  else
+    action=$(echo "$rest" | awk "{print \$2}" | tr "[:upper:]" "[:lower:]")
+  fi
 
-  # Parse direction
+  # Parse direction - only match OUT immediately after an action keyword
   direction="in"
-  echo "$rest" | grep -qi "out" && direction="out"
+  echo "$rest" | grep -qiP "(ALLOW|DENY|REJECT|LIMIT)\s+OUT" && direction="out"
 
   # Parse protocol from the raw line
   proto=""
@@ -1421,18 +1432,17 @@ sudo ufw status numbered 2>/dev/null | grep "^\[" | while IFS= read -r line; do
     proto="udp"
   fi
 
-  # Extract port
+  # Extract port - only from the To column (first field) to avoid matching IPs
+  to_field=$(echo "$rest" | awk "{print \$1}")
   port=""
-  if echo "$rest" | grep -qP "\d+(/tcp|/udp)?"; then
-    port=$(echo "$rest" | grep -oP "\d+([:/]\d+)?(?=/tcp|/udp| )" | head -1)
+  if echo "$to_field" | grep -qP "\d+"; then
+    port=$(echo "$to_field" | grep -oP "\d+([:/]\d+)?")
   fi
-  [ -z "$port" ] && port=$(echo "$rest" | grep -oP "^\S+" | grep -oP "\d+([:/]\d+)?" | head -1)
 
-  # Extract from IP
+  # Extract from IP - positionally after ACTION DIRECTION (e.g. "ALLOW IN")
   from_ip="Anywhere"
-  if echo "$rest" | grep -q "from"; then
-    from_ip=$(echo "$rest" | sed -n "s/.*from \([^ ]*\).*/\1/p")
-  fi
+  extracted=$(echo "$rest" | sed -n "s/.*\(ALLOW\|DENY\|REJECT\|LIMIT\)\s\+\(IN\|OUT\)\s\+\(\S\+\).*/\3/Ip")
+  [ -n "$extracted" ] && from_ip="$extracted"
 
   # Extract comment
   comment=""

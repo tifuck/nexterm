@@ -26,6 +26,7 @@ echo "[entrypoint] Initialising database..."
 python3 -c "
 import asyncio, sys
 sys.path.insert(0, '.')
+import backend.models          # register all models with Base.metadata
 from backend.database import init_db
 asyncio.run(init_db())
 " || { echo "[entrypoint] ERROR: Database initialisation failed"; exit 1; }

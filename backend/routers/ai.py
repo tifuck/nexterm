@@ -1,6 +1,8 @@
 """AI assistance endpoints."""
+import ipaddress
 import json
 import logging
+from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -9,6 +11,65 @@ from backend.models.user import User
 from backend.config import config
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# SSRF protection for user-supplied Ollama URLs
+# ---------------------------------------------------------------------------
+
+_ALLOWED_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _validate_ollama_url(url: str) -> None:
+    """Reject Ollama base URLs that could cause SSRF.
+
+    Only allows localhost addresses and private/link-local RFC 1918
+    addresses.  Blocks cloud metadata endpoints, public IPs, and
+    non-HTTP(S) schemes.
+
+    Raises:
+        HTTPException 400 on invalid or disallowed URLs.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Ollama base URL")
+
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ollama URL must use http or https scheme, got '{parsed.scheme}'",
+        )
+
+    hostname = parsed.hostname or ""
+
+    # Allow well-known localhost names
+    if hostname in _ALLOWED_OLLAMA_HOSTS:
+        return
+
+    # Allow Docker-style service names (alphanumeric + hyphens, no dots)
+    # that resolve internally (e.g. "ollama", "my-ollama-service")
+    if hostname and "." not in hostname and hostname.replace("-", "").isalnum():
+        return
+
+    # Allow private network IPs (RFC 1918 / RFC 4193)
+    try:
+        addr = ipaddress.ip_address(hostname)
+        if addr.is_private or addr.is_loopback:
+            return
+        raise HTTPException(
+            status_code=400,
+            detail="Ollama URL must point to a private or localhost address",
+        )
+    except ValueError:
+        pass
+
+    # Allow fully-qualified hostnames that resolve to common internal TLDs
+    # but block everything else to prevent SSRF to cloud metadata, etc.
+    raise HTTPException(
+        status_code=400,
+        detail="Ollama URL must point to localhost or a private network address",
+    )
+
 
 router = APIRouter(prefix="/api/ai", tags=["ai"])
 
@@ -40,16 +101,24 @@ async def get_ai_client(user: User):
     """Get the AI client based on user's settings."""
     if not config.ai_enabled:
         raise HTTPException(status_code=403, detail="AI features are disabled")
-    
+
+    from backend.services.encryption import decrypt_sensitive
+
     ai_settings = {}
     if user.ai_settings_json:
         try:
             ai_settings = json.loads(user.ai_settings_json)
         except json.JSONDecodeError:
             pass
-    
+
     provider = ai_settings.get("provider", "")
-    api_key = ai_settings.get("api_key", "")
+    # Support both legacy plaintext "api_key" and new encrypted "api_key_encrypted"
+    api_key = ""
+    if ai_settings.get("api_key_encrypted"):
+        api_key = decrypt_sensitive(ai_settings["api_key_encrypted"]) or ""
+    elif ai_settings.get("api_key"):
+        # Legacy plaintext — will be upgraded on next settings save
+        api_key = ai_settings["api_key"]
     model = ai_settings.get("model", "")
     base_url = ai_settings.get("base_url", "")
     
@@ -106,6 +175,7 @@ async def call_ai(settings: dict, system_prompt: str, user_prompt: str) -> str:
         try:
             import httpx
             base_url = settings.get("base_url") or "http://localhost:11434"
+            _validate_ollama_url(base_url)
             async with httpx.AsyncClient(timeout=60) as client:
                 response = await client.post(
                     f"{base_url}/api/chat",
@@ -206,23 +276,26 @@ async def update_ai_settings(
     db=Depends(lambda: None),  # placeholder
 ):
     """Update user's AI provider settings."""
-    from backend.database import get_db, async_session_factory
-    
+    from backend.database import async_session_factory
+    from backend.services.encryption import encrypt_sensitive
+    from sqlalchemy import select
+
     async with async_session_factory() as session:
-        from sqlalchemy import select
         result = await session.execute(
             select(User).where(User.id == current_user.id)
         )
         user = result.scalar_one_or_none()
         if user:
+            # Encrypt the API key at rest instead of storing plaintext
+            encrypted_key = encrypt_sensitive(settings.api_key) if settings.api_key else ""
             user.ai_settings_json = json.dumps({
                 "provider": settings.provider,
-                "api_key": settings.api_key or "",
+                "api_key_encrypted": encrypted_key,
                 "model": settings.model or "",
                 "base_url": settings.base_url or "",
             })
             await session.commit()
-    
+
     return {"message": "AI settings updated"}
 
 
@@ -238,13 +311,26 @@ async def get_ai_settings(
         except json.JSONDecodeError:
             pass
     
-    # Mask API key
-    if ai_settings.get("api_key"):
+    # Determine if an API key exists (encrypted or legacy plaintext)
+    from backend.services.encryption import decrypt_sensitive
+
+    has_key = False
+    masked_key = ""
+    if ai_settings.get("api_key_encrypted"):
+        decrypted = decrypt_sensitive(ai_settings["api_key_encrypted"])
+        if decrypted:
+            has_key = True
+            masked_key = f"{decrypted[:8]}...{decrypted[-4:]}" if len(decrypted) > 12 else "***"
+    elif ai_settings.get("api_key"):
         key = ai_settings["api_key"]
-        ai_settings["api_key_masked"] = f"{key[:8]}...{key[-4:]}" if len(key) > 12 else "***"
-        ai_settings["has_api_key"] = True
-    else:
-        ai_settings["has_api_key"] = False
-    
+        has_key = True
+        masked_key = f"{key[:8]}...{key[-4:]}" if len(key) > 12 else "***"
+
+    ai_settings["has_api_key"] = has_key
+    if has_key:
+        ai_settings["api_key_masked"] = masked_key
+
+    # Never return the raw or encrypted key to the client
     ai_settings.pop("api_key", None)
+    ai_settings.pop("api_key_encrypted", None)
     return ai_settings

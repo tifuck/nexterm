@@ -19,7 +19,7 @@ services:
       - nexterm-certs:/app/certs
     environment:
       - NEXTERM_ADMIN_USER=${NEXTERM_ADMIN_USER:-admin}
-      - NEXTERM_ADMIN_PASSWORD=${NEXTERM_ADMIN_PASSWORD:-changeme}
+      - NEXTERM_ADMIN_PASSWORD=${NEXTERM_ADMIN_PASSWORD:?NEXTERM_ADMIN_PASSWORD must be set — do not use a default}
       - NEXTERM_PORT=8443
       - NEXTERM_HOST=0.0.0.0
     restart: unless-stopped

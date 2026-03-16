@@ -17,13 +17,28 @@
  * maintain ref-backed mirrors of the critical fields and expose a
  * getState() function that always returns the synchronous truth.
  *
+ * No-echo detection:
+ * When the remote server disables echo (e.g. sudo, su, passwd, mysql -p,
+ * SSH within SSH), typed characters are NOT echoed back.  We detect this
+ * by tracking characters sent to the server and checking whether the
+ * server echoes them within a short window (~150 ms).  While in no-echo
+ * mode, autocomplete is fully suppressed (both ghost text and dropdown).
+ *
+ * Terminal buffer sync:
+ * When the user presses Up/Down arrow to recall shell history, the remote
+ * server rewrites the current line.  Our keystroke-based inputBuffer has
+ * no visibility into this, so it drifts.  To fix this, we set a "dirty"
+ * flag on arrow keys and, on the next printable keystroke, read the
+ * actual current line from the xterm.js buffer to resynchronise.
+ *
  * Limitations:
  * - Raw SSH has no clean command boundaries; the input buffer is best-effort.
- * - Line editing (arrow keys, Ctrl+A/E) may cause the buffer to drift.
+ * - Line editing (Ctrl+A/E) may cause the buffer to drift.
  *   We reset on Enter/Ctrl+C which handles most cases.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Terminal } from '@xterm/xterm';
 import { apiGet, apiPost } from '@/api/client';
 
 /** Maximum number of suggestions to show in the dropdown. */
@@ -32,13 +47,35 @@ const MAX_SUGGESTIONS = 8;
 /** Minimum interval between remote history fetches (ms). */
 const THROTTLE_MS = 5000;
 
+/**
+ * How long to wait (ms) for the server to echo a character before
+ * concluding we are in no-echo mode (password prompt).
+ */
+const ECHO_TIMEOUT_MS = 150;
+
+/** Common shell prompt suffixes used to detect where the prompt ends. */
+const PROMPT_SUFFIXES = ['$ ', '# ', '> ', '% '];
+
 interface CommandHistoryState {
   suggestions: string[];
   isOpen: boolean;
   selectedIndex: number;
 }
 
-export function useCommandHistory(sessionId?: string, connectionId?: string) {
+/**
+ * @param sessionId  - Saved session ID (for recording commands against).
+ * @param connectionId - Active SSH connection ID (triggers history fetch).
+ * @param getTerminal - Callback that returns the xterm.js Terminal instance
+ *                      for the current tab.  Used to read the terminal buffer
+ *                      when syncing after arrow-key history recall.  Passed
+ *                      as a callback to avoid a circular import from
+ *                      TerminalContainer.
+ */
+export function useCommandHistory(
+  sessionId?: string,
+  connectionId?: string,
+  getTerminal?: () => Terminal | null,
+) {
   const inputBuffer = useRef('');
   const [state, setState] = useState<CommandHistoryState>({
     suggestions: [],
@@ -53,6 +90,25 @@ export function useCommandHistory(sessionId?: string, connectionId?: string) {
   const isOpenRef = useRef(false);
   const selectedIndexRef = useRef(-1);
   const suggestionsRef = useRef<string[]>([]);
+
+  // ---------------------------------------------------------------
+  // No-echo detection refs
+  // ---------------------------------------------------------------
+  /** True when we believe the remote PTY has echo disabled (password prompt). */
+  const noEchoMode = useRef(false);
+  /** Characters sent to the server that we expect to be echoed back. */
+  const pendingEchoChars = useRef<{ char: string; time: number }[]>([]);
+  /** Timer for checking whether echoed characters have timed out. */
+  const echoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ---------------------------------------------------------------
+  // Terminal buffer sync refs (arrow-key history recall)
+  // ---------------------------------------------------------------
+  /** Set true when Up/Down arrow is detected; cleared after next buffer sync. */
+  const bufferDirty = useRef(false);
+
+  const getTerminalRef = useRef(getTerminal);
+  getTerminalRef.current = getTerminal;
 
   /** Helper: update both React state and the ref mirrors atomically. */
   const setStateSync = useCallback((next: CommandHistoryState) => {
@@ -152,11 +208,180 @@ export function useCommandHistory(sessionId?: string, connectionId?: string) {
     };
   }, [connectionId, fetchRemoteHistory]);
 
+  // Close the autocomplete dropdown immediately when the connection drops.
+  useEffect(() => {
+    if (!connectionId && isOpenRef.current) {
+      setStateSync({ isOpen: false, suggestions: [], selectedIndex: -1 });
+    }
+  }, [connectionId, setStateSync]);
+
+  // -----------------------------------------------------------------
+  // No-echo detection (password prompt suppression)
+  // -----------------------------------------------------------------
+
+  /** Clear all echo-tracking state and cancel any pending timer. */
+  const resetEchoState = useCallback(() => {
+    noEchoMode.current = false;
+    pendingEchoChars.current = [];
+    if (echoTimerRef.current) {
+      clearTimeout(echoTimerRef.current);
+      echoTimerRef.current = null;
+    }
+  }, []);
+
+  /**
+   * Check whether pending echo characters have timed out.  If any sent
+   * character has not been echoed within ECHO_TIMEOUT_MS, we conclude
+   * the remote PTY has echo disabled and suppress autocomplete.
+   */
+  const checkEchoTimeout = useCallback(() => {
+    echoTimerRef.current = null;
+    const now = Date.now();
+    const pending = pendingEchoChars.current;
+
+    // Find chars that have exceeded the timeout window
+    const timedOut = pending.filter((p) => now - p.time >= ECHO_TIMEOUT_MS);
+
+    if (timedOut.length > 0) {
+      // Server did not echo these characters → no-echo mode
+      noEchoMode.current = true;
+      pendingEchoChars.current = [];
+      inputBuffer.current = '';
+      if (isOpenRef.current) {
+        setStateSync({ isOpen: false, suggestions: [], selectedIndex: -1 });
+      }
+      return;
+    }
+
+    // Still have pending chars within the window — reschedule
+    if (pending.length > 0) {
+      const oldest = pending[0].time;
+      const remaining = ECHO_TIMEOUT_MS - (now - oldest);
+      echoTimerRef.current = setTimeout(checkEchoTimeout, Math.max(remaining, 10));
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [setStateSync]);
+
+  /**
+   * Called by TerminalContainer when a printable character is about to be
+   * sent to the SSH server.  Registers the character for echo tracking.
+   */
+  const onKeystrokeSent = useCallback((data: string) => {
+    // Only track printable, non-escape characters
+    if (data.startsWith('\x1b') || data.length === 0) return;
+    // Don't accumulate while already in no-echo mode
+    if (noEchoMode.current) return;
+
+    const now = Date.now();
+    for (const ch of data) {
+      if (ch >= ' ' && ch <= '~') {
+        pendingEchoChars.current.push({ char: ch, time: now });
+      }
+    }
+
+    // Start the timeout check if not already scheduled
+    if (pendingEchoChars.current.length > 0 && !echoTimerRef.current) {
+      echoTimerRef.current = setTimeout(checkEchoTimeout, ECHO_TIMEOUT_MS);
+    }
+  }, [checkEchoTimeout]);
+
+  /**
+   * Called by TerminalContainer when data arrives from the SSH server
+   * (msg.type === 'data').  Used to confirm echo of sent characters.
+   */
+  const onServerOutput = useCallback((data: string) => {
+    const pending = pendingEchoChars.current;
+    if (pending.length === 0) return;
+
+    // Walk through the server output and match pending chars in order.
+    // The server may echo multiple characters in a single message.
+    let pi = 0;
+    for (let si = 0; si < data.length && pi < pending.length; si++) {
+      if (data[si] === pending[pi].char) {
+        pi++;
+      }
+    }
+
+    if (pi > 0) {
+      // Some characters were echoed — remove the matched ones
+      pendingEchoChars.current = pending.slice(pi);
+
+      // If we were in no-echo mode and now see echoes, exit no-echo mode
+      if (noEchoMode.current) {
+        noEchoMode.current = false;
+      }
+    }
+
+    // If all pending chars are cleared, cancel the timer
+    if (pendingEchoChars.current.length === 0 && echoTimerRef.current) {
+      clearTimeout(echoTimerRef.current);
+      echoTimerRef.current = null;
+    }
+  }, []);
+
+  // -----------------------------------------------------------------
+  // Terminal buffer sync (arrow-key history recall)
+  // -----------------------------------------------------------------
+
+  /**
+   * Read the current command from the xterm.js terminal buffer.
+   *
+   * After the user presses Up/Down to recall shell history, the remote
+   * server rewrites the line.  This function reads the actual text from
+   * the terminal buffer and extracts the command portion after the prompt.
+   */
+  const syncBufferFromTerminal = useCallback(() => {
+    const terminal = getTerminalRef.current?.();
+    if (!terminal) return;
+
+    const buffer = terminal.buffer.active;
+    const lineIndex = buffer.baseY + buffer.cursorY;
+    const line = buffer.getLine(lineIndex);
+    if (!line) return;
+
+    const fullLine = line.translateToString(true);
+    if (!fullLine) return;
+
+    // Find the prompt boundary: look for the LAST occurrence of a
+    // common prompt suffix (e.g. "$ ", "# ", "> ", "% ").  This
+    // handles typical bash/zsh/fish/sh prompts.
+    let promptEnd = 0;
+    for (const suffix of PROMPT_SUFFIXES) {
+      const idx = fullLine.lastIndexOf(suffix);
+      if (idx >= 0) {
+        const candidate = idx + suffix.length;
+        if (candidate > promptEnd) {
+          promptEnd = candidate;
+        }
+      }
+    }
+
+    // Extract the command text from after the prompt to end of line
+    const commandText = fullLine.slice(promptEnd).trimEnd();
+    inputBuffer.current = commandText;
+  }, []);
+
   // -----------------------------------------------------------------
   // Client-side prefix matching against cached history
   // -----------------------------------------------------------------
 
   const updateSuggestions = useCallback(() => {
+    // Don't show suggestions when not connected
+    if (!connectionIdRef.current) {
+      if (isOpenRef.current) {
+        setStateSync({ isOpen: false, suggestions: [], selectedIndex: -1 });
+      }
+      return;
+    }
+
+    // Suppress autocomplete entirely while in no-echo mode (password prompt)
+    if (noEchoMode.current) {
+      if (isOpenRef.current) {
+        setStateSync({ isOpen: false, suggestions: [], selectedIndex: -1 });
+      }
+      return;
+    }
+
     const prefix = inputBuffer.current;
     if (prefix.length < 1) {
       if (isOpenRef.current) {
@@ -204,6 +429,8 @@ export function useCommandHistory(sessionId?: string, connectionId?: string) {
           requestHistoryRefresh();
         }
         inputBuffer.current = '';
+        bufferDirty.current = false;
+        resetEchoState();
         if (isOpenRef.current) {
           setStateSync({ isOpen: false, suggestions: [], selectedIndex: -1 });
         }
@@ -213,6 +440,8 @@ export function useCommandHistory(sessionId?: string, connectionId?: string) {
       // Ctrl+C -- reset buffer
       if (data === '\x03') {
         inputBuffer.current = '';
+        bufferDirty.current = false;
+        resetEchoState();
         if (isOpenRef.current) {
           setStateSync({ isOpen: false, suggestions: [], selectedIndex: -1 });
         }
@@ -221,6 +450,16 @@ export function useCommandHistory(sessionId?: string, connectionId?: string) {
 
       // Backspace (DEL or BS)
       if (data === '\x7f' || data === '\b') {
+        if (bufferDirty.current) {
+          // The buffer was dirtied by arrow keys; sync from terminal first.
+          // Use a small delay to let the backspace echo settle.
+          bufferDirty.current = false;
+          setTimeout(() => {
+            syncBufferFromTerminal();
+            updateSuggestions();
+          }, 50);
+          return;
+        }
         inputBuffer.current = inputBuffer.current.slice(0, -1);
         updateSuggestions();
         return;
@@ -228,6 +467,13 @@ export function useCommandHistory(sessionId?: string, connectionId?: string) {
 
       // Regular printable character(s) (handle multi-char paste, ignore escape sequences)
       if (data.length >= 1 && !data.startsWith('\x1b')) {
+        // If the buffer was dirtied by Up/Down arrow (shell history recall),
+        // sync from the terminal before appending the new character.
+        if (bufferDirty.current) {
+          bufferDirty.current = false;
+          syncBufferFromTerminal();
+        }
+
         let appended = false;
         for (const ch of data) {
           if (ch >= ' ' && ch <= '~') {
@@ -239,11 +485,22 @@ export function useCommandHistory(sessionId?: string, connectionId?: string) {
         return;
       }
 
-      // Escape sequences (arrows, etc.) -- handled by the terminal container
-      // for navigation; don't modify buffer.
-      // Other control chars -- ignore.
+      // Escape sequences: detect Up/Down arrow for buffer sync.
+      // When the user presses Up/Down, the remote shell replaces the
+      // current line with a history entry.  Mark the buffer as dirty
+      // so the next printable keystroke triggers a terminal buffer sync.
+      if (data === '\x1b[A' || data === '\x1b[B') {
+        bufferDirty.current = true;
+        // Also close suggestions since the line content is changing
+        if (isOpenRef.current) {
+          setStateSync({ isOpen: false, suggestions: [], selectedIndex: -1 });
+        }
+        return;
+      }
+
+      // Other escape sequences / control chars -- ignore.
     },
-    [updateSuggestions, requestHistoryRefresh, setStateSync],
+    [updateSuggestions, requestHistoryRefresh, setStateSync, resetEchoState, syncBufferFromTerminal],
   );
 
   // -----------------------------------------------------------------
@@ -311,6 +568,16 @@ export function useCommandHistory(sessionId?: string, connectionId?: string) {
     inputBuffer: inputBuffer.current,
   }), []);
 
+  // Clean up echo timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (echoTimerRef.current) {
+        clearTimeout(echoTimerRef.current);
+        echoTimerRef.current = null;
+      }
+    };
+  }, []);
+
   return {
     /** Current input buffer content. */
     get inputBuffer() {
@@ -334,5 +601,9 @@ export function useCommandHistory(sessionId?: string, connectionId?: string) {
     closeSuggestions,
     /** Force a remote history refresh. */
     refreshHistory,
+    /** Notify the hook that a printable keystroke was sent to SSH. */
+    onKeystrokeSent,
+    /** Notify the hook that data arrived from the SSH server. */
+    onServerOutput,
   };
 }

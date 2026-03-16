@@ -1,6 +1,7 @@
 """Self-signed certificate generation utility."""
 
 import datetime
+import os
 from pathlib import Path
 
 from cryptography import x509
@@ -69,14 +70,14 @@ def generate_self_signed_cert(
         .sign(private_key, hashes.SHA256())
     )
 
-    # Write private key
-    key_path.write_bytes(
-        private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
+    # Write private key with restrictive permissions (owner-only read/write)
+    key_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
     )
+    key_path.write_bytes(key_bytes)
+    os.chmod(str(key_path), 0o600)
 
     # Write certificate
     cert_path.write_bytes(

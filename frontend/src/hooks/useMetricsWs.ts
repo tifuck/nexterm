@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { getWsUrl } from '@/api/client';
+import { getWsUrl, ensureFreshToken } from '@/api/client';
 import { useTabStore } from '@/store/tabStore';
 import { useMetricsStore } from '@/store/metricsStore';
 
@@ -62,7 +62,8 @@ export function useMetricsWs(): void {
     // Tear down any existing WS before opening a new one
     cleanup();
 
-    function connect() {
+    async function connect() {
+      await ensureFreshToken();
       const wsUrl = getWsUrl('/ws/metrics');
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;

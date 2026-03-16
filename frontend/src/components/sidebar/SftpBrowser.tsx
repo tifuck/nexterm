@@ -16,9 +16,14 @@ import {
   Home,
   Eye,
   EyeOff,
+  Image,
+  Film,
+  Music,
+  FileType,
 } from 'lucide-react';
 import { apiGet, apiDelete, apiPost, apiUpload } from '@/api/client';
 import { useTabStore } from '@/store/tabStore';
+import { useSidebarStore } from '@/store/sidebarStore';
 import { useToastStore } from '@/store/toastStore';
 
 /** Raw entry shape from the backend /ls endpoint */
@@ -64,32 +69,67 @@ interface SftpBrowserProps {
   connectionId: string;
 }
 
-/** File extensions that can be opened in the editor */
-const TEXT_EXTENSIONS = new Set([
-  '.txt', '.md', '.json', '.yaml', '.yml', '.toml', '.xml', '.html',
-  '.css', '.js', '.ts', '.jsx', '.tsx', '.py', '.sh', '.bash', '.zsh',
-  '.conf', '.cfg', '.ini', '.log', '.env', '.csv', '.sql', '.rb',
-  '.go', '.rs', '.c', '.h', '.cpp', '.hpp', '.java', '.kt', '.swift',
-  '.php', '.pl', '.lua', '.vim', '.dockerfile', '.gitignore', '.editorconfig',
-  '.prettierrc', '.eslintrc', '.babelrc', '.makefile', '.cmake',
+/** Extensions known to be binary — everything else is assumed editable as text */
+const BINARY_EXTENSIONS = new Set([
+  // Images
+  '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.tiff', '.tif',
+  '.psd', '.raw', '.heic', '.heif', '.avif', '.jxl',
+  // Audio
+  '.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a', '.opus', '.aiff',
+  // Video
+  '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg', '.3gp',
+  // Archives
+  '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar', '.zst', '.lz', '.lzma',
+  '.tgz', '.tbz2', '.war', '.jar', '.ear',
+  // Executables / compiled
+  '.exe', '.dll', '.so', '.dylib', '.bin', '.o', '.a', '.lib',
+  '.pyc', '.pyo', '.class', '.wasm', '.elf',
+  // Documents (non-text)
+  '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  '.odt', '.ods', '.odp', '.rtf',
+  // Databases
+  '.db', '.sqlite', '.sqlite3', '.mdb',
+  // Fonts
+  '.ttf', '.otf', '.woff', '.woff2', '.eot',
+  // Disk images
+  '.iso', '.img', '.dmg', '.vmdk', '.vdi', '.qcow2',
+  // Swap / temp
+  '.swp', '.swo',
 ]);
 
-/** Names (no extension) treated as text */
-const TEXT_NAMES = new Set([
-  'makefile', 'dockerfile', 'vagrantfile', 'gemfile', 'rakefile',
-  'procfile', 'readme', 'license', 'changelog', 'authors',
-  '.gitignore', '.gitattributes', '.dockerignore', '.env',
-  '.editorconfig', '.prettierrc', '.eslintrc', '.babelrc',
-]);
+/** Extensions that can be previewed inline (image, audio, video, PDF) */
+const PREVIEW_EXTENSIONS: Record<string, 'image' | 'audio' | 'video' | 'pdf'> = {
+  // Images (SVG excluded — it's text/XML, opened in editor)
+  '.png': 'image', '.jpg': 'image', '.jpeg': 'image', '.gif': 'image',
+  '.bmp': 'image', '.ico': 'image', '.webp': 'image', '.avif': 'image',
+  '.tiff': 'image', '.tif': 'image',
+  // Audio
+  '.mp3': 'audio', '.wav': 'audio', '.flac': 'audio', '.aac': 'audio',
+  '.ogg': 'audio', '.m4a': 'audio', '.opus': 'audio',
+  // Video
+  '.mp4': 'video', '.webm': 'video', '.mov': 'video', '.m4v': 'video',
+  '.mkv': 'video', '.avi': 'video',
+  // PDF
+  '.pdf': 'pdf',
+};
 
-function isTextFile(name: string): boolean {
+type PreviewType = 'image' | 'audio' | 'video' | 'pdf';
+
+/** Check whether a file should be opened in the text editor (denylist approach). */
+function isEditableFile(name: string): boolean {
   const lower = name.toLowerCase();
-  if (TEXT_NAMES.has(lower)) return true;
   const dotIdx = lower.lastIndexOf('.');
-  if (dotIdx >= 0) {
-    return TEXT_EXTENSIONS.has(lower.slice(dotIdx));
-  }
-  return false;
+  // Extensionless files (or dot-files with no further extension) default to editable
+  if (dotIdx <= 0) return true;
+  return !BINARY_EXTENSIONS.has(lower.slice(dotIdx));
+}
+
+/** Get the preview type for a binary file, or null if not previewable. */
+function getPreviewType(name: string): PreviewType | null {
+  const lower = name.toLowerCase();
+  const dotIdx = lower.lastIndexOf('.');
+  if (dotIdx < 0) return null;
+  return PREVIEW_EXTENSIONS[lower.slice(dotIdx)] || null;
 }
 
 function formatFileSize(bytes: number): string {
@@ -103,7 +143,20 @@ function getFileIcon(entry: FileEntry): React.ReactNode {
   if (entry.type === 'directory') {
     return <Folder size={14} className="text-[var(--accent)] flex-shrink-0" />;
   }
-  if (isTextFile(entry.name)) {
+  const preview = getPreviewType(entry.name);
+  if (preview === 'image') {
+    return <Image size={14} className="text-purple-400 flex-shrink-0" />;
+  }
+  if (preview === 'video') {
+    return <Film size={14} className="text-blue-400 flex-shrink-0" />;
+  }
+  if (preview === 'audio') {
+    return <Music size={14} className="text-green-400 flex-shrink-0" />;
+  }
+  if (preview === 'pdf') {
+    return <FileType size={14} className="text-red-400 flex-shrink-0" />;
+  }
+  if (isEditableFile(entry.name)) {
     return <FileText size={14} className="text-[var(--text-secondary)] flex-shrink-0" />;
   }
   return <File size={14} className="text-[var(--text-tertiary)] flex-shrink-0" />;
@@ -386,7 +439,7 @@ const EntryRow: React.FC<EntryRowProps> = ({
       onNavigate(fullPath);
       return;
     }
-    if (isTextFile(entry.name)) {
+    if (isEditableFile(entry.name)) {
       const tabId = `editor-${connectionId}-${fullPath}`;
       addTab({
         id: tabId,
@@ -399,6 +452,25 @@ const EntryRow: React.FC<EntryRowProps> = ({
           language: getLanguageForFile(entry.name),
         },
       });
+      useSidebarStore.getState().collapseForEditor();
+      return;
+    }
+    const previewType = getPreviewType(entry.name);
+    if (previewType) {
+      const tabId = `preview-${connectionId}-${fullPath}`;
+      addTab({
+        id: tabId,
+        type: 'preview',
+        title: entry.name,
+        connectionId,
+        isConnected: true,
+        meta: {
+          filePath: fullPath,
+          previewType,
+          fileSize: entry.size,
+        },
+      });
+      useSidebarStore.getState().collapseForEditor();
     }
   }, [entry, fullPath, connectionId, addTab, onNavigate]);
 
@@ -432,15 +504,17 @@ const EntryRow: React.FC<EntryRowProps> = ({
       onDoubleClick={handleDoubleClick}
       onContextMenu={(e) => onContextMenu(e, entry)}
       className={`flex items-center gap-1.5 w-full px-2 py-1 text-left rounded hover:bg-[var(--bg-hover)] transition-colors group select-none ${
-        entry.type === 'directory' || isTextFile(entry.name) ? 'cursor-pointer' : 'cursor-default'
+        entry.type === 'directory' || isEditableFile(entry.name) || getPreviewType(entry.name) ? 'cursor-pointer' : 'cursor-default'
       }`}
       style={{ paddingLeft: '8px' }}
       title={
         entry.type === 'directory'
           ? 'Double-click to open'
-          : isTextFile(entry.name)
+          : isEditableFile(entry.name)
             ? 'Double-click to edit'
-            : entry.name
+            : getPreviewType(entry.name)
+              ? 'Double-click to preview'
+              : entry.name
       }
     >
       {getFileIcon(entry)}
@@ -838,7 +912,7 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
     // File context menu
     const items: ContextMenuItem[] = [];
 
-    if (isTextFile(entry.name)) {
+    if (isEditableFile(entry.name)) {
       items.push({
         label: 'Edit',
         icon: <FilePlus size={13} />,
@@ -852,6 +926,27 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
             isConnected: true,
             meta: { filePath: fullPath, language: getLanguageForFile(entry.name) },
           });
+          useSidebarStore.getState().collapseForEditor();
+        },
+      });
+    }
+
+    const previewType = getPreviewType(entry.name);
+    if (previewType) {
+      items.push({
+        label: 'Preview',
+        icon: <Eye size={13} />,
+        action: () => {
+          const tabId = `preview-${connectionId}-${fullPath}`;
+          useTabStore.getState().addTab({
+            id: tabId,
+            type: 'preview',
+            title: entry.name,
+            connectionId,
+            isConnected: true,
+            meta: { filePath: fullPath, previewType, fileSize: entry.size },
+          });
+          useSidebarStore.getState().collapseForEditor();
         },
       });
     }

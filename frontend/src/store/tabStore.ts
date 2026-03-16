@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { Tab } from '../types/session';
 import { destroyTerminal } from '../components/terminal/TerminalContainer';
+import { useSplitStore } from './splitStore';
+import { useSidebarStore } from './sidebarStore';
 
 interface TabState {
   tabs: Tab[];
@@ -47,6 +49,19 @@ export const useTabStore = create<TabState>()(
     const tab = tabs[tabIndex];
     if (tab.type === 'ssh' || tab.type === 'telnet') {
       destroyTerminal(tabId);
+    }
+
+    // Remove from any split panes
+    useSplitStore.getState().removeTabFromPanes(tabId);
+
+    // Restore sidebar if closing a fullscreen tab and landing on a non-fullscreen tab
+    const isFullscreen = tab.type === 'editor' || tab.type === 'preview';
+    if (isFullscreen && activeTab === tabId) {
+      const nextTab = filteredTabs.find((t) => t.id === newActiveTab);
+      const nextIsFullscreen = nextTab?.type === 'editor' || nextTab?.type === 'preview';
+      if (!nextIsFullscreen) {
+        useSidebarStore.getState().restoreFromEditor();
+      }
     }
 
     set((state) => ({
@@ -114,11 +129,16 @@ export const useTabStore = create<TabState>()(
     {
       name: 'nexterm_tabs',
       partialize: (state) => ({
-        tabs: state.tabs.map((t) => ({
-          ...t,
-          // Mark all connection-based tabs as disconnected on restore
-          isConnected: false,
-        })),
+        tabs: state.tabs.map((t) => {
+          // Strip sensitive credentials from meta before persisting to localStorage
+          const { password, sshKey, ...safeMeta } = (t.meta || {}) as Record<string, any>;
+          return {
+            ...t,
+            meta: safeMeta,
+            // Mark all connection-based tabs as disconnected on restore
+            isConnected: false,
+          };
+        }),
         activeTab: state.activeTab,
         // Don't persist recentlyClosed
       }),

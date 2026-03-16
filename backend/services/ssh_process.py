@@ -60,20 +60,53 @@ def _remove_subscriber(connection_id: str, writer: asyncio.StreamWriter) -> None
 
 
 def _make_ipc_callback(connection_id: str):
-    """Create a ws_callback that broadcasts SSH output to all IPC subscribers."""
+    """Create a ws_callback that broadcasts SSH output to all IPC subscribers.
 
-    async def _broadcast(data: bytes) -> None:
+    When ``data`` is ``None`` the SSH session has ended.  A special
+    ``"disconnected"`` IPC message is broadcast so worker-side proxies
+    can notify the frontend immediately.
+    """
+
+    async def _broadcast(data: bytes | None) -> None:
         subs = _subscribers.get(connection_id)
         if not subs:
+            logger.debug(
+                "Broadcast: conn=%s — no subscribers, dropping",
+                connection_id[:8],
+            )
             return
-        msg = encode_message({
-            "id": None,
-            "method": "stream",
-            "params": {
-                "connection_id": connection_id,
-                "data": base64.b64encode(data).decode("ascii"),
-            },
-        })
+
+        if len(subs) > 1 and data is not None:
+            logger.debug(
+                "Broadcast: conn=%s ipc_subscribers=%d bytes=%d",
+                connection_id[:8], len(subs), len(data),
+            )
+
+        # Sentinel: SSH session ended — broadcast a disconnect notification
+        # instead of a data stream message.
+        if data is None:
+            reason = "SSH session ended"
+            conn = await ssh_manager.get_connection(connection_id)
+            if conn and conn.disconnected_reason:
+                reason = conn.disconnected_reason
+            msg = encode_message({
+                "id": None,
+                "method": "disconnected",
+                "params": {
+                    "connection_id": connection_id,
+                    "reason": reason,
+                },
+            })
+        else:
+            msg = encode_message({
+                "id": None,
+                "method": "stream",
+                "params": {
+                    "connection_id": connection_id,
+                    "data": base64.b64encode(data).decode("ascii"),
+                },
+            })
+
         dead: list[asyncio.StreamWriter] = []
         for writer in list(subs):
             try:
@@ -166,6 +199,12 @@ async def _handle_request(method: str, params: dict, writer: asyncio.StreamWrite
     if method == "subscribe":
         conn_id = params["connection_id"]
         _add_subscriber(conn_id, writer)
+        ssh_manager.mark_subscribed(conn_id)
+        sub_count = len(_subscribers.get(conn_id, set()))
+        logger.info(
+            "SSH process subscribe: conn=%s ipc_subscribers=%d writer_id=%d",
+            conn_id[:8], sub_count, id(writer),
+        )
         # Make sure the broadcast callback is installed (idempotent for
         # connections created via the ``connect`` method, but necessary
         # when a worker subscribes to a connection that was originally
@@ -175,10 +214,25 @@ async def _handle_request(method: str, params: dict, writer: asyncio.StreamWrite
             ssh_manager.register_ws_callback(
                 conn_id, _make_ipc_callback(conn_id)
             )
+        else:
+            logger.warning(
+                "SSH process subscribe: conn=%s NOT FOUND — callback not installed",
+                conn_id[:8],
+            )
         return {"ok": True}
 
     if method == "unsubscribe":
-        _remove_subscriber(params["connection_id"], writer)
+        conn_id = params["connection_id"]
+        _remove_subscriber(conn_id, writer)
+        remaining = len(_subscribers.get(conn_id, set()))
+        logger.info(
+            "SSH process unsubscribe: conn=%s remaining_ipc_subs=%d",
+            conn_id[:8], remaining,
+        )
+        # If no more subscribers remain, mark the connection as orphaned
+        # so cleanup_stale() can eventually reclaim it.
+        if conn_id not in _subscribers:
+            ssh_manager.mark_unsubscribed(conn_id)
         return {"ok": True}
 
     # ----- Command execution (metrics, history) -----
@@ -276,6 +330,7 @@ async def _handle_request(method: str, params: dict, writer: asyncio.StreamWrite
             tab_id=params["tab_id"],
             connection_id=params["connection_id"],
             session_type=params["session_type"],
+            session_id=params.get("session_id"),
         )
         return {"ok": True}
 
@@ -291,6 +346,12 @@ async def _handle_request(method: str, params: dict, writer: asyncio.StreamWrite
             sessions = session_manager.get_user_sessions(user_id)
         else:
             sessions = []
+        return {"sessions": sessions}
+
+    if method == "session_find_by_saved_id":
+        sessions = session_manager.get_connections_by_session_id(
+            params["user_id"], params["session_id"],
+        )
         return {"sessions": sessions}
 
     if method == "list_connections":
@@ -337,6 +398,10 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         # Clean up all subscriptions owned by this writer.
         for conn_id in list(_subscribers.keys()):
             _remove_subscriber(conn_id, writer)
+            # If no more subscribers remain, mark the connection as
+            # orphaned so cleanup_stale() can eventually reclaim it.
+            if conn_id not in _subscribers:
+                ssh_manager.mark_unsubscribed(conn_id)
 
         writer.close()
         try:

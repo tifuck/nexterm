@@ -50,13 +50,24 @@ def create_refresh_token(user_id: str) -> str:
 # Token verification
 # ---------------------------------------------------------------------------
 
-def verify_token(token: str) -> dict:
+def verify_token(token: str, *, allow_refresh: bool = False) -> dict:
     """Decode and validate a JWT. Returns the payload dict.
+
+    By default, refresh tokens are rejected.  Pass ``allow_refresh=True``
+    to accept refresh tokens (only appropriate in the /refresh endpoint).
 
     Raises HTTPException 401 on invalid or expired tokens.
     """
     try:
         payload: dict = jwt.decode(token, config.secret_key, algorithms=[ALGORITHM])
+
+        # Prevent refresh tokens from being used as access tokens.
+        if payload.get("type") == "refresh" and not allow_refresh:
+            raise HTTPException(
+                status_code=401,
+                detail="Refresh token cannot be used for authentication",
+            )
+
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")

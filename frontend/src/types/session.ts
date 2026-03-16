@@ -31,7 +31,7 @@ export interface Folder {
 
 export interface Tab {
   id: string;
-  type: 'home' | SessionType | 'editor' | 'settings';
+  type: 'home' | SessionType | 'editor' | 'preview' | 'settings';
   title: string;
   sessionId?: string;
   connectionId?: string;

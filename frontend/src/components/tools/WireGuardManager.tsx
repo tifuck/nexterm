@@ -35,7 +35,7 @@ import {
   CheckCircle,
 } from 'lucide-react';
 import { ToolModal } from './ToolModal';
-import { apiGet, apiPost, getWsUrl } from '@/api/client';
+import { apiGet, apiPost, getWsUrl, ensureFreshToken } from '@/api/client';
 import { useToastStore } from '@/store/toastStore';
 
 // ---------------------------------------------------------------------------
@@ -232,7 +232,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
   // Install via WebSocket
   // -------------------------------------------------------------------
 
-  const startInstall = useCallback(() => {
+  const startInstall = useCallback(async () => {
     if (!installConfig.endpoint) {
       addToast('Please specify a server endpoint/IP', 'error');
       return;
@@ -242,6 +242,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
     setInstallOutput([]);
     setInstallStatus('running');
 
+    await ensureFreshToken();
     const ws = new WebSocket(getWsUrl('/ws/tools'));
     wsRef.current = ws;
 

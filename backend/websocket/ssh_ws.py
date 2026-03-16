@@ -50,19 +50,45 @@ class _PendingConnect:
 async def _forward_ssh_to_ws(
     queue: asyncio.Queue,
     websocket: WebSocket,
+    connection_id: str,
+    ssh_proxy,
 ) -> None:
-    """Read SSH output from the IPC subscription queue and forward to the WebSocket."""
+    """Read SSH output from the IPC subscription queue and forward to the WebSocket.
+
+    A ``None`` sentinel in the queue signals that the SSH session has
+    ended.  When received, a ``{"type": "disconnected"}`` message is sent
+    to the frontend and the forwarder exits.
+    """
+    ws_id = id(websocket)
+    logger.debug("Forward task started: conn=%s ws=%d", connection_id[:8], ws_id)
     try:
         while True:
-            data: bytes = await queue.get()
+            data: bytes | None = await queue.get()
+
+            if data is None:
+                # SSH session ended — notify the frontend immediately.
+                reason = "SSH session ended"
+                try:
+                    conn = await ssh_proxy.get_connection(connection_id)
+                    if conn and conn.disconnected_reason:
+                        reason = conn.disconnected_reason
+                except Exception:
+                    pass
+                logger.debug("Forward task: conn=%s ws=%d — session ended", connection_id[:8], ws_id)
+                await websocket.send_json({
+                    "type": "disconnected",
+                    "reason": reason,
+                })
+                break
+
             await websocket.send_json({
                 "type": "data",
                 "data": data.decode("utf-8", errors="replace"),
             })
     except (asyncio.CancelledError, WebSocketDisconnect):
-        pass
-    except Exception:
-        pass
+        logger.debug("Forward task stopped: conn=%s ws=%d (cancelled/disconnect)", connection_id[:8], ws_id)
+    except Exception as e:
+        logger.error("Forward task error: conn=%s ws=%d — %s", connection_id[:8], ws_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +216,7 @@ async def ssh_websocket_handler(
     user_id = None
     username = None
     connection_id = None
+    subscription_id: str | None = None
     forward_task: asyncio.Task | None = None
 
     # Pending connection state for interactive prompts.
@@ -328,11 +355,12 @@ async def ssh_websocket_handler(
                         tab_id=tab_id,
                         connection_id=connection_id,
                         session_type="ssh",
+                        session_id=pending.session_id,
                     )
 
-                    queue = await ssh_proxy.subscribe(connection_id)
+                    queue, subscription_id = await ssh_proxy.subscribe(connection_id)
                     forward_task = asyncio.create_task(
-                        _forward_ssh_to_ws(queue, websocket)
+                        _forward_ssh_to_ws(queue, websocket, connection_id, ssh_proxy)
                     )
 
                     connected_msg: dict = {
@@ -425,11 +453,12 @@ async def ssh_websocket_handler(
                         tab_id=tab_id,
                         connection_id=connection_id,
                         session_type="ssh",
+                        session_id=pending.session_id,
                     )
 
-                    queue = await ssh_proxy.subscribe(connection_id)
+                    queue, subscription_id = await ssh_proxy.subscribe(connection_id)
                     forward_task = asyncio.create_task(
-                        _forward_ssh_to_ws(queue, websocket)
+                        _forward_ssh_to_ws(queue, websocket, connection_id, ssh_proxy)
                     )
 
                     connected_msg: dict = {
@@ -505,11 +534,12 @@ async def ssh_websocket_handler(
                         tab_id=tab_id,
                         connection_id=connection_id,
                         session_type="ssh",
+                        session_id=pending.session_id,
                     )
 
-                    queue = await ssh_proxy.subscribe(connection_id)
+                    queue, subscription_id = await ssh_proxy.subscribe(connection_id)
                     forward_task = asyncio.create_task(
-                        _forward_ssh_to_ws(queue, websocket)
+                        _forward_ssh_to_ws(queue, websocket, connection_id, ssh_proxy)
                     )
 
                     connected_msg: dict = {
@@ -552,6 +582,11 @@ async def ssh_websocket_handler(
 
                 recon_id = msg.get("connection_id", "")
                 tab_id = msg.get("tab_id", "")
+                logger.info(
+                    "Reconnect request: conn=%s user=%s tab=%s ws=%d",
+                    recon_id[:8], str(user_id)[:8], tab_id[:8] if tab_id else "?",
+                    id(websocket),
+                )
                 conn = await ssh_proxy.get_connection(recon_id)
 
                 if conn and conn.user_id == user_id:
@@ -577,11 +612,11 @@ async def ssh_websocket_handler(
                         continue
 
                     # Subscribe to live SSH output and start forwarding.
-                    queue = await ssh_proxy.subscribe(connection_id)
+                    queue, subscription_id = await ssh_proxy.subscribe(connection_id)
                     if forward_task and not forward_task.done():
                         forward_task.cancel()
                     forward_task = asyncio.create_task(
-                        _forward_ssh_to_ws(queue, websocket)
+                        _forward_ssh_to_ws(queue, websocket, connection_id, ssh_proxy)
                     )
 
                     await websocket.send_json({
@@ -615,9 +650,20 @@ async def ssh_websocket_handler(
                     rows = int(msg.get("rows", 24))
                     await ssh_proxy.resize(connection_id, cols, rows)
 
-            # Keepalive
+            # Keepalive — also acts as a safety net for detecting SSH
+            # disconnections that the sentinel mechanism may have missed.
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
+                if connection_id:
+                    try:
+                        conn = await ssh_proxy.get_connection(connection_id)
+                        if conn and conn.disconnected_reason:
+                            await websocket.send_json({
+                                "type": "disconnected",
+                                "reason": conn.disconnected_reason,
+                            })
+                    except Exception:
+                        pass
 
     except WebSocketDisconnect:
         pass
@@ -628,10 +674,11 @@ async def ssh_websocket_handler(
         if forward_task and not forward_task.done():
             forward_task.cancel()
 
-        # Unsubscribe from IPC streaming but keep the SSH session alive
-        # for potential reconnection.
+        # Unsubscribe this specific WebSocket's subscription from IPC
+        # streaming but keep the SSH session alive for potential
+        # reconnection.  Other attached tabs retain their subscriptions.
         if connection_id:
-            await ssh_proxy.unsubscribe(connection_id)
+            await ssh_proxy.unsubscribe(connection_id, subscription_id)
 
         # Note: We do NOT disconnect the SSH session here.
         # The session stays alive for reconnection within keep_alive_minutes.

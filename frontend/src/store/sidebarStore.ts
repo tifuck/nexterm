@@ -7,10 +7,13 @@ interface SidebarState {
   width: number;
   activePanel: SidebarPanel;
   searchQuery: string;
+  _wasOpenBeforeEditor: boolean;
   toggle: () => void;
   setWidth: (n: number) => void;
   setActivePanel: (p: SidebarPanel) => void;
   setSearchQuery: (s: string) => void;
+  collapseForEditor: () => void;
+  restoreFromEditor: () => void;
 }
 
 function loadWidth(): number {
@@ -45,6 +48,7 @@ export const useSidebarStore = create<SidebarState>((set) => ({
   width: loadWidth(),
   activePanel: loadActivePanel(),
   searchQuery: '',
+  _wasOpenBeforeEditor: false,
 
   toggle: () => {
     set((state) => ({ isOpen: !state.isOpen }));
@@ -71,5 +75,18 @@ export const useSidebarStore = create<SidebarState>((set) => ({
 
   setSearchQuery: (s: string) => {
     set({ searchQuery: s });
+  },
+
+  collapseForEditor: () => {
+    set((state) => ({
+      _wasOpenBeforeEditor: state.isOpen,
+      isOpen: false,
+    }));
+  },
+
+  restoreFromEditor: () => {
+    set((state) => ({
+      isOpen: state._wasOpenBeforeEditor,
+    }));
   },
 }));

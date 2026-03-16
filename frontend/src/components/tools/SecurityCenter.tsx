@@ -219,7 +219,7 @@ const PortsTab: React.FC<{ ports: OpenPort[] }> = ({ ports }) => {
         {ports.map((p, i) => (
           <tr
             key={i}
-            className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-secondary)] transition-colors"
+            className="border-b border-[var(--border-secondary)] hover:bg-[var(--bg-secondary)] transition-colors"
           >
             <td className="py-1.5 px-2 font-mono font-medium text-[var(--text-primary)]">
               {p.port}
@@ -308,7 +308,7 @@ const LoginsTab: React.FC<{ logins: FailedLogin[] }> = ({ logins }) => {
           {logins.map((l, i) => (
             <tr
               key={i}
-              className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-secondary)] transition-colors"
+              className="border-b border-[var(--border-secondary)] hover:bg-[var(--bg-secondary)] transition-colors"
             >
               <td className="py-1.5 px-2 text-[var(--text-secondary)] font-mono text-[10px]">{l.date}</td>
               <td className="py-1.5 px-2 font-medium text-[var(--text-primary)]">{l.user}</td>
@@ -347,7 +347,7 @@ const UsersTab: React.FC<{ users: UserPrivilege[] }> = ({ users }) => {
         {users.map((u) => (
           <tr
             key={u.username}
-            className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-secondary)] transition-colors"
+            className="border-b border-[var(--border-secondary)] hover:bg-[var(--bg-secondary)] transition-colors"
           >
             <td className="py-1.5 px-2 font-medium text-[var(--text-primary)] font-mono">
               {u.username}

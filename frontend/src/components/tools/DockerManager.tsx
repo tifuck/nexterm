@@ -36,7 +36,7 @@ import {
   CircleDot,
 } from 'lucide-react';
 import { ToolModal } from './ToolModal';
-import { apiGet, apiPost, apiDelete, getWsUrl } from '@/api/client';
+import { apiGet, apiPost, apiDelete, getWsUrl, ensureFreshToken } from '@/api/client';
 import { useToastStore } from '@/store/toastStore';
 
 // ---------------------------------------------------------------------------
@@ -327,11 +327,12 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
   // Install via WebSocket
   // -------------------------------------------------------------------
 
-  const startInstall = useCallback(() => {
+  const startInstall = useCallback(async () => {
     setView('installing');
     setInstallOutput([]);
     setInstallStatus('running');
 
+    await ensureFreshToken();
     const ws = new WebSocket(getWsUrl('/ws/tools'));
     wsRef.current = ws;
 
@@ -419,7 +420,7 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
   // Container logs streaming
   // -------------------------------------------------------------------
 
-  const startLogStream = useCallback((containerId: string) => {
+  const startLogStream = useCallback(async (containerId: string) => {
     // If already streaming this container, stop
     if (logsOpen === containerId && logsStreaming) {
       stopLogStream();
@@ -436,6 +437,7 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
     setLogsContent([]);
     setLogsStreaming(true);
 
+    await ensureFreshToken();
     const ws = new WebSocket(getWsUrl('/ws/tools'));
     logsWsRef.current = ws;
 
@@ -526,7 +528,7 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
   // Image pull via WebSocket
   // -------------------------------------------------------------------
 
-  const startPull = useCallback(() => {
+  const startPull = useCallback(async () => {
     if (!pullImageName.trim()) {
       addToast('Enter an image name to pull', 'error');
       return;
@@ -535,6 +537,7 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
     setPullOutput([]);
     setPullStatus('running');
 
+    await ensureFreshToken();
     const ws = new WebSocket(getWsUrl('/ws/tools'));
     pullWsRef.current = ws;
 
@@ -1332,7 +1335,7 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
                 </thead>
                 <tbody>
                   {images.map((img, i) => (
-                    <tr key={i} className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-secondary)] transition-colors group">
+                    <tr key={i} className="border-b border-[var(--border-secondary)] hover:bg-[var(--bg-secondary)] transition-colors group">
                       <td className="py-1.5 px-2 font-mono font-medium text-[var(--text-primary)] truncate max-w-[200px]">
                         {img.repository}
                       </td>
@@ -1394,7 +1397,7 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
                   {networks.map((net) => {
                     const isBuiltin = ['bridge', 'host', 'none'].includes(net.name);
                     return (
-                      <tr key={net.id} className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-secondary)] transition-colors group">
+                      <tr key={net.id} className="border-b border-[var(--border-secondary)] hover:bg-[var(--bg-secondary)] transition-colors group">
                         <td className="py-1.5 px-2 font-mono font-medium text-[var(--text-primary)]">
                           <div className="flex items-center gap-1.5">
                             {net.name}
@@ -1456,7 +1459,7 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
                 </thead>
                 <tbody>
                   {volumes.map((vol) => (
-                    <tr key={vol.name} className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-secondary)] transition-colors group">
+                    <tr key={vol.name} className="border-b border-[var(--border-secondary)] hover:bg-[var(--bg-secondary)] transition-colors group">
                       <td className="py-1.5 px-2 font-mono font-medium text-[var(--text-primary)] truncate max-w-[200px]">{vol.name}</td>
                       <td className="py-1.5 px-2 text-[var(--text-secondary)]">{vol.driver}</td>
                       <td className="py-1.5 px-2 font-mono text-[var(--text-muted)] text-[10px] truncate max-w-[250px]">{vol.mountpoint}</td>

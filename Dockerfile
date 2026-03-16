@@ -14,7 +14,7 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --silent
 
 COPY frontend/ ./
-RUN npx vite build
+RUN npm run build
 
 
 # -- Stage 2: Python runtime ----------------------------------------------

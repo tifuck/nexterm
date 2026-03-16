@@ -4,7 +4,9 @@ import { useSidebarStore } from '@/store/sidebarStore';
 import { useAuthStore } from '@/store/authStore';
 import { useTabStore } from '@/store/tabStore';
 import { useToolsStore } from '@/store/toolsStore';
+import { useSplitStore } from '@/store/splitStore';
 import TabBar from '../tabs/TabBar';
+import SplitLayoutMenu from './SplitLayoutMenu';
 
 type SidebarPanel = 'sessions' | 'sftp';
 
@@ -18,7 +20,10 @@ const TopBar: React.FC<TopBarProps> = ({ sidebarWidth }) => {
   const { user, logout } = useAuthStore();
   const addTab = useTabStore((s) => s.addTab);
   const [showUserMenu, setShowUserMenu] = useState(false);
+  const [showSplitMenu, setShowSplitMenu] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const splitMenuRef = useRef<HTMLDivElement>(null);
+  const splitLayout = useSplitStore((s) => s.layout);
 
   // Sidebar panel state
   const activePanel = useSidebarStore((s) => s.activePanel);
@@ -41,16 +46,19 @@ const TopBar: React.FC<TopBarProps> = ({ sidebarWidth }) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setShowUserMenu(false);
       }
+      if (splitMenuRef.current && !splitMenuRef.current.contains(e.target as Node)) {
+        setShowSplitMenu(false);
+      }
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
   return (
-      <div className="flex items-stretch min-h-[38px] bg-[var(--bg-secondary)] border-b border-[var(--border)] shrink-0">
-        {/* Sidebar panel tabs — width matches the sidebar below */}
+      <div className="flex items-end min-h-[38px] bg-[var(--bg-secondary)] border-b border-[var(--border)] shrink-0">
+        {/* Sidebar panel tabs — width matches the sidebar below, fixed height */}
         <div
-          className="shrink-0 overflow-hidden transition-[width] duration-200 ease-out flex"
+          className="shrink-0 overflow-hidden transition-[width] duration-200 ease-out flex h-[38px] self-end"
           style={{ width: sidebarWidth }}
         >
           <div className="flex flex-1 min-w-0" style={{ width: sidebarWidth, minWidth: sidebarWidth }}>
@@ -115,13 +123,22 @@ const TopBar: React.FC<TopBarProps> = ({ sidebarWidth }) => {
 
           {/* Right: grid + user (outside overflow-hidden so dropdown works) */}
           <div className="flex items-center shrink-0 gap-1 sm:gap-2 mb-1">
-            <button
-              className="hidden sm:flex p-1.5 rounded text-[var(--text-muted)] opacity-40 cursor-not-allowed"
-              title="Tile view (coming soon)"
-              disabled
-            >
-              <LayoutGrid size={16} />
-            </button>
+            <div className="relative" ref={splitMenuRef}>
+              <button
+                onClick={() => setShowSplitMenu(!showSplitMenu)}
+                className={`hidden sm:flex p-1.5 rounded transition-colors ${
+                  splitLayout !== 'single'
+                    ? 'text-[var(--accent)] bg-[var(--accent-muted)]'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)]'
+                }`}
+                title="Split view"
+              >
+                <LayoutGrid size={16} />
+              </button>
+              {showSplitMenu && (
+                <SplitLayoutMenu onClose={() => setShowSplitMenu(false)} />
+              )}
+            </div>
 
             <button
               onClick={toggleTools}

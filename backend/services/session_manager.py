@@ -20,6 +20,7 @@ class ActiveSessionManager:
         tab_id: str,
         connection_id: str,
         session_type: str,
+        session_id: str | None = None,
     ) -> None:
         """Register a new active session for a user.
 
@@ -28,6 +29,7 @@ class ActiveSessionManager:
             tab_id: Unique identifier for the browser tab or session tab.
             connection_id: The SSH/SFTP connection ID.
             session_type: Type of session (e.g. "ssh", "sftp").
+            session_id: Optional saved session ID (from the database).
         """
         if user_id not in self._user_sessions:
             self._user_sessions[user_id] = {}
@@ -35,6 +37,7 @@ class ActiveSessionManager:
         self._user_sessions[user_id][tab_id] = {
             "connection_id": connection_id,
             "session_type": session_type,
+            "session_id": session_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -91,13 +94,32 @@ class ActiveSessionManager:
         Args:
             connection_id: The connection ID to look up and remove.
         """
-        for user_id, tabs in self._user_sessions.items():
-            for tab_id, info in tabs.items():
+        for user_id, tabs in list(self._user_sessions.items()):
+            for tab_id, info in list(tabs.items()):
                 if info["connection_id"] == connection_id:
-                    tabs.pop(tab_id)
+                    del tabs[tab_id]
                     if not tabs:
                         del self._user_sessions[user_id]
                     return
+
+    def get_connections_by_session_id(
+        self, user_id: str, session_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return all active connections for a given saved session and user.
+
+        Args:
+            user_id: The user's ID.
+            session_id: The saved session's database ID.
+
+        Returns:
+            A list of dicts with tab_id, connection_id, session_type,
+            session_id, and created_at for each matching active connection.
+        """
+        results: list[dict[str, Any]] = []
+        for tab_id, info in self._user_sessions.get(user_id, {}).items():
+            if info.get("session_id") == session_id:
+                results.append({"tab_id": tab_id, **info})
+        return results
 
     def has_capacity(self, user_id: str, max_sessions: int) -> bool:
         """Check if a user can open more sessions.

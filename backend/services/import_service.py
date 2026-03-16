@@ -3,8 +3,15 @@ import configparser
 import io
 import logging
 import re
-import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import ParseError
 from typing import Optional
+
+try:
+    from defusedxml import ElementTree as ET
+except ImportError:
+    # defusedxml is the preferred choice for safe XML parsing.
+    # Fall back to stdlib with a secure parser that disables external entities.
+    import xml.etree.ElementTree as ET
 
 from backend.schemas.import_session import ImportedSession
 
@@ -282,7 +289,7 @@ def parse_mremoteng(content: str) -> tuple[list[ImportedSession], list[str]]:
 
     try:
         root = ET.fromstring(content)
-    except ET.ParseError as e:
+    except (ParseError, Exception) as e:
         warnings.append(f"Failed to parse XML: {e}")
         return sessions, warnings
 

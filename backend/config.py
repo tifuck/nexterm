@@ -125,10 +125,35 @@ class AppConfig:
             return self._secret_key
         key = self._env("SECRET_KEY") or self.get("app.secret_key", "")
         if not key or key == "CHANGE_ME_TO_A_RANDOM_SECRET_KEY":
-            # Generate and persist so all workers share the same key
+            # Generate a real key and persist it to config.yaml so that
+            # all workers share the same key and it survives restarts.
             key = secrets.token_hex(32)
+            logger.warning(
+                "No secret key configured — generated a new one. "
+                "Set 'app.secret_key' in config.yaml to avoid key rotation on restart."
+            )
+            self._persist_secret_key(key)
         self._secret_key = key
         return key
+
+    def _persist_secret_key(self, key: str) -> None:
+        """Write the generated secret key back to config.yaml."""
+        try:
+            if CONFIG_PATH.exists():
+                text = CONFIG_PATH.read_text()
+                # Replace the placeholder or empty value
+                import re
+                text = re.sub(
+                    r'(secret_key:\s*)(CHANGE_ME_TO_A_RANDOM_SECRET_KEY|""?|\'\'?|\s*$)',
+                    rf'\g<1>"{key}"',
+                    text,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+                CONFIG_PATH.write_text(text)
+                logger.info("Secret key written to %s", CONFIG_PATH)
+        except Exception as e:
+            logger.error("Failed to persist secret key to config.yaml: %s", e)
 
     # -- Auth ----------------------------------------------------------------
     @property

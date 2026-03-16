@@ -9,7 +9,7 @@ import base64
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from backend.services.ipc_protocol import IPC_SOCKET_PATH, encode_message, read_message
 
@@ -36,7 +36,10 @@ class SSHProxy:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._pending: dict[str, asyncio.Future] = {}
-        self._subscriptions: dict[str, asyncio.Queue] = {}
+        # Maps connection_id -> {subscription_id -> Queue}.
+        # Multiple WebSocket handlers in the same worker can subscribe
+        # to the same connection_id (session sharing / attach).
+        self._subscriptions: dict[str, dict[str, asyncio.Queue]] = {}
         self._read_task: asyncio.Task | None = None
         self._connected = False
 
@@ -107,17 +110,42 @@ class SSHProxy:
 
                 msg_id = msg.get("id")
 
-                # Stream push (id is None) — route to subscription queue.
+                # Stream push (id is None) — route to all subscription queues
+                # for this connection_id (supports session sharing).
                 if msg_id is None and msg.get("method") == "stream":
                     params = msg.get("params", {})
                     conn_id = params.get("connection_id", "")
-                    queue = self._subscriptions.get(conn_id)
-                    if queue is not None:
+                    queues = self._subscriptions.get(conn_id)
+                    if queues:
                         data = base64.b64decode(params.get("data", ""))
-                        try:
-                            queue.put_nowait(data)
-                        except asyncio.QueueFull:
-                            pass  # Drop if consumer is too slow.
+                        n_queues = len(queues)
+                        if n_queues > 1:
+                            logger.debug(
+                                "Proxy stream fan-out: conn=%s queues=%d bytes=%d",
+                                conn_id[:8], n_queues, len(data),
+                            )
+                        for q in queues.values():
+                            try:
+                                q.put_nowait(data)
+                            except asyncio.QueueFull:
+                                logger.warning(
+                                    "Proxy stream queue full: conn=%s", conn_id[:8],
+                                )
+                    continue
+
+                # Disconnect notification — push a None sentinel into all
+                # subscription queues so _forward_ssh_to_ws can notify
+                # each frontend immediately.
+                if msg_id is None and msg.get("method") == "disconnected":
+                    params = msg.get("params", {})
+                    conn_id = params.get("connection_id", "")
+                    queues = self._subscriptions.get(conn_id)
+                    if queues:
+                        for q in queues.values():
+                            try:
+                                q.put_nowait(None)
+                            except asyncio.QueueFull:
+                                pass
                     continue
 
                 # Regular response — resolve the pending future.
@@ -248,24 +276,63 @@ class SSHProxy:
     # Streaming subscription
     # ------------------------------------------------------------------
 
-    async def subscribe(self, connection_id: str) -> asyncio.Queue:
+    async def subscribe(self, connection_id: str) -> Tuple[asyncio.Queue, str]:
         """Subscribe to live SSH output for a connection.
 
-        Returns an asyncio.Queue that receives ``bytes`` chunks as the
-        SSH process produces output.
+        Returns:
+            A tuple of (queue, subscription_id).  The queue receives
+            ``bytes`` chunks as the SSH process produces output.  The
+            subscription_id must be passed to ``unsubscribe`` later.
         """
+        sub_id = str(uuid.uuid4())
         queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
-        self._subscriptions[connection_id] = queue
+        if connection_id not in self._subscriptions:
+            self._subscriptions[connection_id] = {}
+        self._subscriptions[connection_id][sub_id] = queue
+        total = len(self._subscriptions[connection_id])
+        logger.info(
+            "Proxy subscribe: conn=%s sub=%s total_local_subs=%d",
+            connection_id[:8], sub_id[:8], total,
+        )
         await self._request("subscribe", connection_id=connection_id)
-        return queue
+        return queue, sub_id
 
-    async def unsubscribe(self, connection_id: str) -> None:
-        """Stop receiving SSH output for a connection."""
-        self._subscriptions.pop(connection_id, None)
-        try:
-            await self._request("unsubscribe", connection_id=connection_id)
-        except Exception:
-            pass  # Best-effort; the connection may already be gone.
+    async def unsubscribe(self, connection_id: str, subscription_id: str | None = None) -> None:
+        """Stop receiving SSH output for a connection.
+
+        Args:
+            connection_id: The SSH connection to unsubscribe from.
+            subscription_id: The specific subscription to remove.  If
+                ``None``, all subscriptions for the connection are removed
+                (backwards-compatible fallback).
+        """
+        subs = self._subscriptions.get(connection_id)
+        if subs is not None:
+            if subscription_id and subscription_id in subs:
+                del subs[subscription_id]
+                if not subs:
+                    del self._subscriptions[connection_id]
+            elif subscription_id is None:
+                # Fallback: remove all subscriptions for this connection.
+                del self._subscriptions[connection_id]
+
+        # Only tell the SSH process to unsubscribe if no local
+        # subscriptions remain for this connection_id, so other
+        # attached tabs keep receiving data.
+        remaining = self._subscriptions.get(connection_id)
+        remaining_count = len(remaining) if remaining else 0
+        logger.info(
+            "Proxy unsubscribe: conn=%s sub=%s remaining=%d ipc_unsub=%s",
+            connection_id[:8],
+            (subscription_id or "ALL")[:8],
+            remaining_count,
+            "yes" if not remaining else "no",
+        )
+        if not remaining:
+            try:
+                await self._request("unsubscribe", connection_id=connection_id)
+            except Exception:
+                pass  # Best-effort; the connection may already be gone.
 
     # ------------------------------------------------------------------
     # Command execution (for metrics, remote history)
@@ -356,7 +423,12 @@ class SSHProxy:
         return result.get("ok", False)
 
     async def session_register(
-        self, user_id, tab_id: str, connection_id: str, session_type: str,
+        self,
+        user_id,
+        tab_id: str,
+        connection_id: str,
+        session_type: str,
+        session_id: str | None = None,
     ) -> None:
         await self._request(
             "session_register",
@@ -364,12 +436,29 @@ class SSHProxy:
             tab_id=tab_id,
             connection_id=connection_id,
             session_type=session_type,
+            session_id=session_id,
         )
 
     async def session_unregister(self, user_id, tab_id: str) -> None:
         await self._request(
             "session_unregister", user_id=user_id, tab_id=tab_id,
         )
+
+    async def find_active_by_session_id(
+        self, user_id: str, session_id: str,
+    ) -> list[dict]:
+        """Find active connections for a saved session.
+
+        Returns:
+            List of dicts with connection_id, session_type, created_at,
+            etc. for each active connection matching the saved session.
+        """
+        result = await self._request(
+            "session_find_by_saved_id",
+            user_id=user_id,
+            session_id=session_id,
+        )
+        return result.get("sessions", [])
 
     async def list_connections(self) -> list[str]:
         result = await self._request("list_connections")

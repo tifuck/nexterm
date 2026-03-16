@@ -835,7 +835,7 @@ export const FirewallManager: React.FC<Props> = ({ connectionId }) => {
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               {overview.backends.map(b => (
-                <div key={b.name} className={`p-3 rounded-lg border transition-colors ${b.installed ? 'border-[var(--border)] bg-[var(--bg-secondary)]' : 'border-[var(--border)]/50 bg-[var(--bg-secondary)]/50 opacity-50'}`}>
+                <div key={b.name} className={`p-3 rounded-lg border transition-colors ${b.installed ? 'border-[var(--border)] bg-[var(--bg-secondary)]' : 'border-[var(--border-secondary)] bg-[var(--bg-secondary)]/50 opacity-50'}`}>
                   <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-2">
                       <span className={`w-2 h-2 rounded-full ${b.active ? 'bg-[var(--success)]' : b.installed ? 'bg-[var(--text-muted)]' : 'bg-[var(--border)]'}`} />
@@ -1112,7 +1112,7 @@ export const FirewallManager: React.FC<Props> = ({ connectionId }) => {
                   </thead>
                   <tbody>
                     {ufwStatus.rules.map((rule, i) => (
-                      <tr key={i} className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-secondary)] transition-colors group">
+                      <tr key={i} className="border-b border-[var(--border-secondary)] hover:bg-[var(--bg-secondary)] transition-colors group">
                         <td className="py-1.5 px-2 text-[var(--text-muted)] font-mono">{rule.number}</td>
                         <td className="py-1.5 px-2">
                           <ActionBadge action={rule.action} />
@@ -1313,7 +1313,7 @@ export const FirewallManager: React.FC<Props> = ({ connectionId }) => {
                     </thead>
                     <tbody>
                       {chainRules.map((rule, i) => (
-                        <tr key={i} className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-secondary)] transition-colors group">
+                        <tr key={i} className="border-b border-[var(--border-secondary)] hover:bg-[var(--bg-secondary)] transition-colors group">
                           <td className="py-1.5 px-2 text-[var(--text-muted)] font-mono">{rule.number}</td>
                           <td className="py-1.5 px-2">
                             <ActionBadge action={rule.target} />
@@ -1490,7 +1490,7 @@ export const FirewallManager: React.FC<Props> = ({ connectionId }) => {
                         </div>
                         <div className="space-y-1">
                           {typeRules.map((rule, i) => (
-                            <div key={i} className="flex items-center gap-2 px-3 py-2 rounded bg-[var(--bg-secondary)] border border-[var(--border)]/50 group hover:border-[var(--border)] transition-colors">
+                            <div key={i} className="flex items-center gap-2 px-3 py-2 rounded bg-[var(--bg-secondary)] border border-[var(--border-secondary)] group hover:border-[var(--border)] transition-colors">
                               <span className="text-[9px] px-1.5 py-0.5 rounded bg-[var(--success)]/15 text-[var(--success)] font-medium">{rule.type}</span>
                               <span className="text-xs text-[var(--text-primary)] font-mono flex-1">{rule.value}</span>
                               <span className="text-[10px] text-[var(--text-muted)]">{rule.zone}</span>

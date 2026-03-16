@@ -652,7 +652,7 @@ const UpdatesTab: React.FC<{
               {updates.updates.map((pkg, i) => (
                 <tr
                   key={i}
-                  className="border-b border-[var(--border)]/50 hover:bg-[var(--bg-secondary)] transition-colors"
+                  className="border-b border-[var(--border-secondary)] hover:bg-[var(--bg-secondary)] transition-colors"
                 >
                   <td className="py-1.5 px-2 font-medium text-[var(--text-primary)] font-mono">
                     {pkg.name}

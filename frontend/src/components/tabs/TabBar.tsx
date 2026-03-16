@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Home, X, Plus, Terminal, Monitor, Eye, FileEdit, Globe, Settings } from 'lucide-react';
+import { Home, X, Plus, Terminal, Monitor, Eye, FileEdit, Globe, Settings, Image } from 'lucide-react';
 import { useTabStore } from '@/store/tabStore';
 import { useSidebarStore } from '@/store/sidebarStore';
+import { useSplitStore } from '@/store/splitStore';
 import type { Tab } from '@/types/session';
 import { PROTOCOL_COLORS } from '@/utils/protocolColors';
 
@@ -12,6 +13,7 @@ const typeIcon: Record<string, React.ReactNode> = {
   rdp: <Monitor size={12} />,
   vnc: <Eye size={12} />,
   editor: <FileEdit size={12} />,
+  preview: <Image size={12} />,
   ftp: <FileEdit size={12} />,
   settings: <Settings size={12} />,
 };
@@ -23,11 +25,17 @@ const typeDotColor: Record<string, string> = {
   rdp: PROTOCOL_COLORS.rdp,
   vnc: PROTOCOL_COLORS.vnc,
   editor: PROTOCOL_COLORS.ftp,
+  preview: '#a78bfa', // purple-400
   ftp: PROTOCOL_COLORS.ftp,
   settings: 'var(--text-secondary)',
 };
 
 const MAX_TABS = 20;
+
+/** Tab types that auto-collapse the sidebar for a full-width view. */
+function isFullscreenTab(type: string): boolean {
+  return type === 'editor' || type === 'preview';
+}
 
 const TabBar: React.FC = () => {
   const tabs = useTabStore((s) => s.tabs);
@@ -71,8 +79,17 @@ const TabBar: React.FC = () => {
       <div className="flex items-end shrink-0">
         <button
           onClick={() => {
+            // Restore sidebar if leaving an editor/preview tab
+            const prevTab = tabs.find((t) => t.id === activeTab);
+            if (prevTab && isFullscreenTab(prevTab.type)) {
+              useSidebarStore.getState().restoreFromEditor();
+            }
             setActiveTab('home');
             useSidebarStore.getState().setActivePanel('sessions');
+            // Exit split mode when navigating to home
+            if (useSplitStore.getState().layout !== 'single') {
+              useSplitStore.getState().setLayout('single');
+            }
           }}
           className={`
             flex items-center justify-center transition-all duration-150 relative shrink-0
@@ -116,12 +133,32 @@ const TabBar: React.FC = () => {
             <button
               key={tab.id}
               onClick={() => {
+                const prevTab = tabs.find((t) => t.id === activeTab);
+                const goingFullscreen = isFullscreenTab(tab.type);
+                const wasFullscreen = prevTab ? isFullscreenTab(prevTab.type) : false;
+
+                // Handle sidebar collapse/restore for editor/preview tabs
+                if (goingFullscreen && !wasFullscreen) {
+                  // Entering fullscreen tab from normal tab: collapse sidebar
+                  useSidebarStore.getState().collapseForEditor();
+                } else if (!goingFullscreen && wasFullscreen) {
+                  // Leaving fullscreen tab for normal tab: restore sidebar
+                  useSidebarStore.getState().restoreFromEditor();
+                }
+                // fullscreen-to-fullscreen: sidebar stays collapsed (no action needed)
+
                 setActiveTab(tab.id);
-                // Auto-switch sidebar: SFTP for connected SSH/telnet, Sessions otherwise
-                if ((tab.type === 'ssh' || tab.type === 'telnet') && tab.isConnected && tab.connectionId) {
-                  useSidebarStore.getState().setActivePanel('sftp');
-                } else {
-                  useSidebarStore.getState().setActivePanel('sessions');
+                // In split mode, assign the clicked tab to the active pane
+                if (useSplitStore.getState().layout !== 'single') {
+                  useSplitStore.getState().activateTabInPane(tab.id);
+                }
+                // Auto-switch sidebar panel (only for non-fullscreen tabs)
+                if (!goingFullscreen) {
+                  if ((tab.type === 'ssh' || tab.type === 'telnet') && tab.isConnected && tab.connectionId) {
+                    useSidebarStore.getState().setActivePanel('sftp');
+                  } else {
+                    useSidebarStore.getState().setActivePanel('sessions');
+                  }
                 }
               }}
               onMouseDown={(e) => handleMouseDown(e, tab)}

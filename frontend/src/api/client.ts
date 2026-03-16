@@ -16,7 +16,37 @@ function buildHeaders(extra?: Record<string, string>): Record<string, string> {
   return headers;
 }
 
-async function tryRefreshToken(): Promise<boolean> {
+/** Decode JWT payload without signature verification (client-side convenience). */
+export function decodeTokenPayload(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(atob(base64));
+  } catch {
+    return null;
+  }
+}
+
+/** Check whether the stored access token is expired or will expire within `bufferSeconds`. */
+function isTokenExpiringSoon(bufferSeconds = 120): boolean {
+  const token = getToken();
+  if (!token) return true;
+  const payload = decodeTokenPayload(token);
+  if (!payload?.exp) return true;
+  return (payload.exp as number) - Date.now() / 1000 < bufferSeconds;
+}
+
+/**
+ * Ensure the access token is fresh before using it (e.g. for WebSocket URLs).
+ * Returns true if the token is valid (or was successfully refreshed), false otherwise.
+ */
+export async function ensureFreshToken(): Promise<boolean> {
+  if (!isTokenExpiringSoon()) return true;
+  return tryRefreshToken();
+}
+
+export async function tryRefreshToken(): Promise<boolean> {
   const refreshToken = localStorage.getItem('refresh_token');
   if (!refreshToken) return false;
 
@@ -125,6 +155,7 @@ export async function apiUpload<T = any>(
   path: string,
   file: File,
   params?: Record<string, string>,
+  retried = false,
 ): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {};
@@ -147,6 +178,17 @@ export async function apiUpload<T = any>(
     body: formData,
   });
 
+  if (response.status === 401 && !retried) {
+    const refreshed = await tryRefreshToken();
+    if (refreshed) {
+      return apiUpload<T>(path, file, params, true);
+    }
+    localStorage.removeItem('token');
+    localStorage.removeItem('refresh_token');
+    window.location.href = '/login';
+    throw new Error('Authentication expired');
+  }
+
   if (!response.ok) {
     let errorMessage = `Upload failed: ${response.status}`;
     try {
@@ -168,4 +210,13 @@ export function getWsUrl(path: string): string {
   const separator = path.includes('?') ? '&' : '?';
   const tokenParam = token ? `${separator}token=${encodeURIComponent(token)}` : '';
   return `${protocol}//${host}${path}${tokenParam}`;
+}
+
+export function getPreviewUrl(connectionId: string, filePath: string): string {
+  const token = getToken();
+  const params = new URLSearchParams({ path: filePath });
+  if (token) {
+    params.append('token', token);
+  }
+  return `/api/sftp/${connectionId}/preview?${params.toString()}`;
 }

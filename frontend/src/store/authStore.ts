@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { apiGet, apiPost } from '../api/client';
+import { apiGet, apiPost, decodeTokenPayload } from '../api/client';
 import { useThemeStore } from './themeStore';
 import { useTabStore } from './tabStore';
 import { destroyAllTerminals } from '../components/terminal/TerminalContainer';
@@ -62,6 +62,55 @@ function applyUserSettings(user: User): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Proactive token refresh timer
+// ---------------------------------------------------------------------------
+// Schedules a silent refresh at ~75% of the access token's lifetime so the
+// token never expires while the tab is open.  After each successful refresh
+// the timer is rescheduled automatically.
+
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleTokenRefresh(): void {
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+
+  const token = localStorage.getItem('token');
+  if (!token) return;
+
+  const payload = decodeTokenPayload(token);
+  if (!payload?.exp || !payload?.iat) return;
+
+  const now = Date.now() / 1000;
+  const iat = payload.iat as number;
+  const exp = payload.exp as number;
+  const lifetime = exp - iat;
+  // Refresh at 75 % of the token's lifetime
+  const refreshAt = iat + lifetime * 0.75;
+  const delayMs = (refreshAt - now) * 1000;
+
+  if (delayMs <= 0) {
+    // Already past 75 % — refresh on next tick to avoid sync recursion
+    setTimeout(() => useAuthStore.getState().refreshToken(), 0);
+    return;
+  }
+
+  refreshTimer = setTimeout(() => {
+    useAuthStore.getState().refreshToken();
+  }, delayMs);
+}
+
+function stopTokenRefresh(): void {
+  if (refreshTimer) {
+    clearTimeout(refreshTimer);
+    refreshTimer = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 interface AuthState {
   user: User | null;
   token: string | null;
@@ -104,6 +153,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       const user = toUser(me);
       set({ token: data.access_token, user, cryptoKey, isLoading: false });
       applyUserSettings(user);
+      scheduleTokenRefresh();
     } catch (error) {
       set({ isLoading: false });
       throw error;
@@ -136,6 +186,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       const user = toUser(me);
       set({ token: data.access_token, user, cryptoKey, isLoading: false });
       applyUserSettings(user);
+      scheduleTokenRefresh();
     } catch (error) {
       set({ isLoading: false });
       throw error;
@@ -143,6 +194,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   logout: () => {
+    stopTokenRefresh();
     localStorage.removeItem('token');
     localStorage.removeItem('refresh_token');
     clearKeyMaterial();
@@ -167,6 +219,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       storeSalt(data.encryption_salt);
 
       set({ token: data.access_token });
+      scheduleTokenRefresh();
     } catch {
       get().logout();
     }
@@ -217,6 +270,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
       set({ user, token, cryptoKey, isLoading: false });
       applyUserSettings(user);
+      scheduleTokenRefresh();
     } catch {
       // Token might be expired, try refreshing
       try {
@@ -243,6 +297,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
         set({ user, cryptoKey, isLoading: false });
         applyUserSettings(user);
+        // scheduleTokenRefresh already called by refreshToken above
       } catch {
         get().logout();
         set({ isLoading: false });

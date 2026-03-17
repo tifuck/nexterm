@@ -200,6 +200,34 @@ if [ "$SKIP_CONFIG" != "true" ]; then
     read -rp "$(echo -e "  ${CYAN}Enable user registration?${NC} (Y/n): ")" ENABLE_REG
     if [[ "$ENABLE_REG" =~ ^[Nn]$ ]]; then
         REG_ENABLED="false"
+        TOTAL_STEPS=$((TOTAL_STEPS + 1))
+
+        echo ""
+        echo -e "  ${DIM}Registration is disabled — you must create an initial user account.${NC}"
+        echo ""
+
+        read -rp "$(echo -e "  ${CYAN}Username${NC}: ")" INITIAL_USER
+        while [ -z "$INITIAL_USER" ]; do
+            echo -e "  ${RED}Username cannot be empty${NC}"
+            read -rp "$(echo -e "  ${CYAN}Username${NC}: ")" INITIAL_USER
+        done
+
+        while true; do
+            read -rsp "$(echo -e "  ${CYAN}Password${NC}: ")" INITIAL_PASS
+            echo ""
+            if [ ${#INITIAL_PASS} -lt 8 ]; then
+                echo -e "  ${RED}Password must be at least 8 characters${NC}"
+                continue
+            fi
+            read -rsp "$(echo -e "  ${CYAN}Confirm password${NC}: ")" INITIAL_PASS_CONFIRM
+            echo ""
+            if [ "$INITIAL_PASS" != "$INITIAL_PASS_CONFIRM" ]; then
+                echo -e "  ${RED}Passwords do not match${NC}"
+                continue
+            fi
+            break
+        done
+        echo ""
     else
         REG_ENABLED="true"
     fi
@@ -344,7 +372,45 @@ asyncio.run(init_db())
 " || _die "Failed to initialise database"
 ok
 
-# ── Step 6 (optional): guacd ─────────────────────────────────────────────────
+# ── Step 6 (optional): Initial user ─────────────────────────────────────────
+
+if [ "${REG_ENABLED:-true}" = "false" ] && [ -n "${INITIAL_USER:-}" ]; then
+    step "Creating initial user account..."
+
+    INSTALL_USER="$INITIAL_USER" INSTALL_PASS="$INITIAL_PASS" \
+    run_quiet python3 -c "
+import asyncio, os, sys, bcrypt; sys.path.insert(0, '.')
+from backend.database import async_session_factory, init_db
+from backend.models.user import User
+from sqlalchemy import select
+
+async def create_user():
+    await init_db()
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(User).where(User.username == os.environ['INSTALL_USER'])
+        )
+        if result.scalar_one_or_none():
+            print('User already exists')
+            return
+        pw_hash = bcrypt.hashpw(
+            os.environ['INSTALL_PASS'].encode(), bcrypt.gensalt()
+        ).decode()
+        user = User(
+            username=os.environ['INSTALL_USER'],
+            password_hash=pw_hash,
+            is_active=True,
+        )
+        session.add(user)
+        await session.commit()
+        print('User created')
+
+asyncio.run(create_user())
+" || _die "Failed to create initial user"
+    ok
+fi
+
+# ── Step 7 (optional): guacd ─────────────────────────────────────────────────
 
 if [ "${GUACD_ENABLED:-false}" = "true" ]; then
     step "Setting up guacd for RDP support..."
@@ -364,7 +430,7 @@ if [ "${GUACD_ENABLED:-false}" = "true" ]; then
     ok
 fi
 
-# ── Step 7 (optional): Systemd service ──────────────────────────────────────
+# ── Step 8 (optional): Systemd service ──────────────────────────────────────
 
 SERVICE_NAME="nexterm"
 

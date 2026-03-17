@@ -84,7 +84,6 @@ class UserResponse(BaseModel):
     id: str
     username: str
     email: Optional[str] = None
-    is_admin: bool = False
     is_active: bool = True
     created_at: Optional[datetime] = None
     last_login: Optional[datetime] = None

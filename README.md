@@ -8,7 +8,7 @@ A web-based remote access client supporting SSH, SFTP, RDP, VNC, Telnet, and FTP
 - **Web-based terminal** -- Full xterm.js terminal with GPU-accelerated rendering, search, and clipboard support
 - **SFTP file browser** -- Browse, upload, download, and edit remote files
 - **Saved sessions** -- Organize connections in folders with encrypted credential storage
-- **Multi-user** -- User registration, admin management, and API key authentication
+- **Multi-user** -- User registration and API key authentication
 - **AI assistant** -- Optional AI integration (OpenAI / Anthropic) for command help
 - **Server tools** -- Docker, firewall, service, process, and package management panels
 - **System metrics** -- Real-time CPU, memory, disk, and network monitoring via WebSocket
@@ -72,11 +72,11 @@ bash install.sh
 
 The installer will:
 1. Check prerequisites (Python 3.10+, Node.js 18+)
-2. Prompt for app name, admin credentials, and server port
+2. Prompt for app name and server port
 3. Set up a Python virtual environment and install dependencies
 4. Build the React frontend
 5. Generate a self-signed SSL certificate
-6. Initialize the database and create the admin user
+6. Initialize the database
 7. Optionally install a systemd service
 
 Once complete, start the server:
@@ -95,15 +95,10 @@ cd nexterm
 docker compose up -d
 ```
 
-Default admin credentials: `admin` / `changeme` (change via environment variables).
-
-To customize:
+To customize the port:
 
 ```bash
-NEXTERM_ADMIN_USER=myadmin \
-NEXTERM_ADMIN_PASSWORD=mysecurepassword \
-NEXTERM_PORT=9000 \
-docker compose up -d
+NEXTERM_PORT=9000 docker compose up -d
 ```
 
 To include RDP support (starts guacd):
@@ -195,8 +190,6 @@ Every setting can be overridden with a `NEXTERM_` prefixed environment variable.
 | `NEXTERM_GUACD_ENABLED` | `false` | Enable RDP/VNC support via guacd |
 | `NEXTERM_GUACD_HOST` | `localhost` | guacd hostname |
 | `NEXTERM_GUACD_PORT` | `4822` | guacd port |
-| `NEXTERM_ADMIN_USER` | -- | Auto-create admin with this username |
-| `NEXTERM_ADMIN_PASSWORD` | -- | Auto-create admin with this password |
 
 See `config.example.yaml` for the full list of configuration options.
 

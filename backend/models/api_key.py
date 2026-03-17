@@ -22,9 +22,9 @@ class ApiKey(Base):
     key_hash: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    # Permissions (JSON): {"read_sessions": true, "write_sessions": true, "connect": true, "admin": false}
+    # Permissions (JSON): {"read_sessions": true, "write_sessions": true, "connect": true}
     permissions_json: Mapped[str] = mapped_column(
-        Text, nullable=False, default='{"read_sessions": true, "write_sessions": false, "connect": false, "admin": false}'
+        Text, nullable=False, default='{"read_sessions": true, "write_sessions": false, "connect": false}'
     )
 
     # Timestamps

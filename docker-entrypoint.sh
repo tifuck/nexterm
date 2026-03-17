@@ -3,7 +3,7 @@
 # Nexterm — Docker Entrypoint
 # ============================================================================
 # Ensures config.yaml exists (copies from example if needed), generates SSL
-# certs, initialises the database, and creates the admin user from env vars.
+# certs, and initialises the database.
 # ============================================================================
 
 set -e
@@ -40,45 +40,6 @@ import sys; sys.path.insert(0, '.')
 from backend.utils.cert import generate_self_signed_cert
 generate_self_signed_cert('certs/server.crt', 'certs/server.key')
 " || echo "[entrypoint] WARNING: SSL certificate generation failed (continuing without HTTPS)"
-fi
-
-# ── Create admin user from env vars ─────────────────────────────────────────
-# NEXTERM_ADMIN_USER and NEXTERM_ADMIN_PASSWORD are checked by run.py on
-# startup, but we also handle it here so the user gets clear log output.
-
-if [ -n "$NEXTERM_ADMIN_USER" ] && [ -n "$NEXTERM_ADMIN_PASSWORD" ]; then
-    echo "[entrypoint] Checking admin user..."
-    python3 -c "
-import asyncio, os, sys, bcrypt
-sys.path.insert(0, '.')
-from backend.database import async_session_factory
-from backend.models.user import User
-from sqlalchemy import select, func
-
-async def ensure_admin():
-    async with async_session_factory() as session:
-        count = await session.scalar(
-            select(func.count()).select_from(User).where(User.is_admin == True)
-        )
-        if count and count > 0:
-            print('[entrypoint] Admin user already exists')
-            return
-        pw_hash = bcrypt.hashpw(
-            os.environ['NEXTERM_ADMIN_PASSWORD'].encode(),
-            bcrypt.gensalt()
-        ).decode()
-        user = User(
-            username=os.environ['NEXTERM_ADMIN_USER'],
-            password_hash=pw_hash,
-            is_admin=True,
-            is_active=True,
-        )
-        session.add(user)
-        await session.commit()
-        print(f'[entrypoint] Admin user \"{os.environ[\"NEXTERM_ADMIN_USER\"]}\" created')
-
-asyncio.run(ensure_admin())
-" || echo "[entrypoint] WARNING: Could not create admin user"
 fi
 
 echo "[entrypoint] Starting Nexterm..."

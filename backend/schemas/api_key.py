@@ -8,7 +8,6 @@ class ApiKeyPermissions(BaseModel):
     read_sessions: bool = False
     write_sessions: bool = False
     connect: bool = False
-    admin: bool = False
 
 
 class ApiKeyCreate(BaseModel):

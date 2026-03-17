@@ -3,8 +3,7 @@
 # Nexterm — One-Command Install Script
 # ============================================================================
 # Installs Python venv, Node dependencies, builds frontend, generates SSL
-# certs, initialises the database, creates an admin user, and optionally
-# sets up a systemd service.
+# certs, initialises the database, and optionally sets up a systemd service.
 #
 # All verbose output is written to install.log.  The user sees a clean
 # step-by-step progress summary.  On error the relevant log section is shown.
@@ -29,7 +28,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 STEP=0
-TOTAL_STEPS=7  # updated dynamically if guacd / service steps are added
+TOTAL_STEPS=6  # updated dynamically if guacd / service steps are added
 
 _log()  { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE"; }
 _die()  { echo -e "${RED}[ERROR] $*${NC}" >&2; echo "       See install.log for details."; exit 1; }
@@ -193,26 +192,6 @@ if [ "$SKIP_CONFIG" != "true" ]; then
     read -rp "$(echo -e "  ${CYAN}Application name${NC} [TERMINAL]: ")" APP_NAME
     APP_NAME="${APP_NAME:-TERMINAL}"
 
-    # Admin credentials
-    read -rp "$(echo -e "  ${CYAN}Admin username${NC} [admin]: ")" ADMIN_USER
-    ADMIN_USER="${ADMIN_USER:-admin}"
-
-    while true; do
-        read -rsp "$(echo -e "  ${CYAN}Admin password${NC}: ")" ADMIN_PASS
-        echo ""
-        if [ ${#ADMIN_PASS} -lt 8 ]; then
-            echo -e "  ${RED}Password must be at least 8 characters${NC}"
-            continue
-        fi
-        read -rsp "$(echo -e "  ${CYAN}Confirm password${NC}: ")" ADMIN_PASS_CONFIRM
-        echo ""
-        if [ "$ADMIN_PASS" != "$ADMIN_PASS_CONFIRM" ]; then
-            echo -e "  ${RED}Passwords do not match${NC}"
-            continue
-        fi
-        break
-    done
-
     # Server port
     read -rp "$(echo -e "  ${CYAN}Server port${NC} [8443]: ")" SERVER_PORT
     SERVER_PORT="${SERVER_PORT:-8443}"
@@ -365,49 +344,7 @@ asyncio.run(init_db())
 " || _die "Failed to initialise database"
 ok
 
-# ── Step 6: Admin user ──────────────────────────────────────────────────────
-
-if [ "$SKIP_CONFIG" != "true" ]; then
-    step "Creating admin user..."
-
-    INSTALL_ADMIN_USER="$ADMIN_USER" INSTALL_ADMIN_PASS="$ADMIN_PASS" \
-    run_quiet python3 -c "
-import asyncio, os, sys, bcrypt; sys.path.insert(0, '.')
-from backend.database import async_session_factory, init_db
-from backend.models.user import User
-from sqlalchemy import select
-
-async def create_admin():
-    await init_db()
-    async with async_session_factory() as session:
-        result = await session.execute(
-            select(User).where(User.username == os.environ['INSTALL_ADMIN_USER'])
-        )
-        if result.scalar_one_or_none():
-            print('Admin user already exists')
-            return
-        pw_hash = bcrypt.hashpw(
-            os.environ['INSTALL_ADMIN_PASS'].encode(), bcrypt.gensalt()
-        ).decode()
-        user = User(
-            username=os.environ['INSTALL_ADMIN_USER'],
-            password_hash=pw_hash,
-            is_admin=True,
-            is_active=True,
-        )
-        session.add(user)
-        await session.commit()
-        print('Admin user created')
-
-asyncio.run(create_admin())
-" || _die "Failed to create admin user"
-    ok
-else
-    step "Skipping admin creation (using existing config)..."
-    ok
-fi
-
-# ── Step 7 (optional): guacd ────────────────────────────────────────────────
+# ── Step 6 (optional): guacd ─────────────────────────────────────────────────
 
 if [ "${GUACD_ENABLED:-false}" = "true" ]; then
     step "Setting up guacd for RDP support..."
@@ -427,7 +364,7 @@ if [ "${GUACD_ENABLED:-false}" = "true" ]; then
     ok
 fi
 
-# ── Step 8 (optional): Systemd service ──────────────────────────────────────
+# ── Step 7 (optional): Systemd service ──────────────────────────────────────
 
 SERVICE_NAME="nexterm"
 

@@ -19,7 +19,6 @@ interface User {
   id: string;
   username: string;
   email: string | null;
-  is_admin: boolean;
   settings?: Record<string, unknown>;
 }
 
@@ -36,7 +35,6 @@ interface UserResponse {
   id: string;
   username: string;
   email: string | null;
-  is_admin: boolean;
   is_active: boolean;
   created_at: string | null;
   last_login: string | null;
@@ -49,7 +47,6 @@ function toUser(data: UserResponse): User {
     id: data.id,
     username: data.username,
     email: data.email,
-    is_admin: data.is_admin,
     settings: data.settings,
   };
 }

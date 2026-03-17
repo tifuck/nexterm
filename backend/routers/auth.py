@@ -108,7 +108,6 @@ async def login(body: LoginRequest, request: Request):
     access_token = create_access_token(
         user_id=str(user.id),
         username=user.username,
-        is_admin=user.is_admin,
     )
     refresh_token = create_refresh_token(user_id=str(user.id))
 
@@ -160,7 +159,6 @@ async def register(body: RegisterRequest, request: Request):
             email=body.email,
             password_hash=_hash_password(body.password),
             encryption_salt=secrets.token_hex(32),
-            is_admin=False,
             is_active=True,
         )
         session.add(user)
@@ -171,7 +169,6 @@ async def register(body: RegisterRequest, request: Request):
         id=str(user.id),
         username=user.username,
         email=user.email,
-        is_admin=user.is_admin,
         is_active=user.is_active,
         created_at=user.created_at,
         last_login=user.last_login,
@@ -208,7 +205,6 @@ async def refresh(body: RefreshRequest):
     access_token = create_access_token(
         user_id=str(user.id),
         username=user.username,
-        is_admin=user.is_admin,
     )
     new_refresh_token = create_refresh_token(user_id=str(user.id))
 
@@ -240,7 +236,6 @@ async def get_me(current_user: User = Depends(get_current_user)):
         id=str(current_user.id),
         username=current_user.username,
         email=current_user.email,
-        is_admin=current_user.is_admin,
         is_active=current_user.is_active,
         created_at=current_user.created_at,
         last_login=current_user.last_login,

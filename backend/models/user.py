@@ -20,7 +20,6 @@ class User(Base):
     encryption_salt: Mapped[str] = mapped_column(
         String(64), nullable=False, default=lambda: secrets.token_hex(32)
     )
-    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     # Login attempt tracking

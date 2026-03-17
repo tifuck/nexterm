@@ -58,13 +58,12 @@ def _purge_expired_tokens() -> None:
 # Token creation
 # ---------------------------------------------------------------------------
 
-def create_access_token(user_id: str, username: str, is_admin: bool) -> str:
+def create_access_token(user_id: str, username: str) -> str:
     """Create a short-lived JWT access token."""
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "username": username,
-        "is_admin": is_admin,
         "exp": now + timedelta(minutes=config.jwt_access_expire_minutes),
         "iat": now,
     }
@@ -160,15 +159,6 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="User account is disabled")
 
     return user
-
-
-async def get_current_admin(
-    current_user: User = Depends(get_current_user),
-) -> User:
-    """Dependency that ensures the current user is an admin."""
-    if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Admin privileges required")
-    return current_user
 
 
 async def get_optional_user(

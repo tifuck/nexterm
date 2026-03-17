@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Server entry point."""
-import asyncio
 import atexit
 import logging
 import os
@@ -96,44 +95,6 @@ def _remove_pid_file():
         pass
 
 
-async def _ensure_admin_user():
-    """Create the admin user from environment variables if no admin exists.
-
-    Checks NEXTERM_ADMIN_USER and NEXTERM_ADMIN_PASSWORD.  This enables
-    zero-config Docker deployments where the admin account is set via
-    ``docker-compose.yml`` environment variables.
-    """
-    admin_user = os.environ.get("NEXTERM_ADMIN_USER", "").strip()
-    admin_pass = os.environ.get("NEXTERM_ADMIN_PASSWORD", "").strip()
-
-    if not admin_user or not admin_pass:
-        return
-
-    import bcrypt
-    from sqlalchemy import select, func
-    from backend.database import async_session_factory
-    from backend.models.user import User
-
-    async with async_session_factory() as session:
-        # Only create if no admin user exists at all
-        count = await session.scalar(
-            select(func.count()).select_from(User).where(User.is_admin == True)  # noqa: E712
-        )
-        if count and count > 0:
-            return
-
-        pw_hash = bcrypt.hashpw(admin_pass.encode(), bcrypt.gensalt()).decode()
-        user = User(
-            username=admin_user,
-            password_hash=pw_hash,
-            is_admin=True,
-            is_active=True,
-        )
-        session.add(user)
-        await session.commit()
-        logger.info("Admin user '%s' created from environment variables", admin_user)
-
-
 def main():
     import uvicorn
 
@@ -168,14 +129,6 @@ def main():
         ssh_proc.terminate()
         _remove_pid_file()
         sys.exit(1)
-
-    # ------------------------------------------------------------------
-    # Auto-create admin user from env vars (Docker / CI support).
-    # ------------------------------------------------------------------
-    try:
-        asyncio.run(_ensure_admin_user())
-    except Exception as exc:
-        logger.warning("Could not auto-create admin user: %s", exc)
 
     def _cleanup():
         """Terminate the SSH manager process on exit."""

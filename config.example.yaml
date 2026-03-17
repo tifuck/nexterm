@@ -18,8 +18,6 @@
 #     NEXTERM_HTTPS_ENABLED=false
 #     NEXTERM_GUACD_ENABLED=true
 #     NEXTERM_GUACD_HOST=guacd
-#     NEXTERM_ADMIN_USER=admin          (auto-creates admin on first run)
-#     NEXTERM_ADMIN_PASSWORD=changeme   (auto-creates admin on first run)
 # ============================================================================
 
 app:

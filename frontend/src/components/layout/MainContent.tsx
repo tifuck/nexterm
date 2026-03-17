@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { Monitor, Eye } from 'lucide-react';
 import { useTabStore } from '@/store/tabStore';
 import { useSplitStore, type SplitLayout } from '@/store/splitStore';
+import { useConfigStore } from '@/store/configStore';
 import HomeTab from '../tabs/HomeTab';
 import SettingsTab from '../tabs/SettingsTab';
 import FileEditor from '../editor/FileEditor';
@@ -9,6 +10,8 @@ import FilePreview from '../editor/FilePreview';
 import TerminalContainer, { getTerminalInstance } from '../terminal/TerminalContainer';
 import { TerminalAIWrapper } from '../terminal/TerminalAIWrapper';
 import { MobileHotkeyBar } from '../terminal/MobileHotkeyBar';
+import { RdpViewer } from '../rdp/RdpViewer';
+import type { GuacConnectionConfig } from '../rdp/RdpViewer';
 import SplitChrome from './SplitContainer';
 import type { ConnectionConfig } from '../terminal/TerminalContainer';
 import type { Tab } from '@/types/session';
@@ -239,8 +242,38 @@ const MainContent: React.FC = () => {
               </div>
             )}
 
-            {tab.type === 'rdp' && <Placeholder label="RDP Coming Soon" icon={<Monitor size={40} />} />}
-            {tab.type === 'vnc' && <Placeholder label="VNC Coming Soon" icon={<Eye size={40} />} />}
+            {(tab.type === 'rdp' || tab.type === 'vnc') && (
+              (() => {
+                const guacdEnabled = useConfigStore.getState().guacdEnabled;
+                if (!guacdEnabled) {
+                  return (
+                    <Placeholder
+                      label={`${tab.type.toUpperCase()} requires guacd — enable it in config.yaml`}
+                      icon={tab.type === 'rdp' ? <Monitor size={40} /> : <Eye size={40} />}
+                    />
+                  );
+                }
+                const guacConfig: GuacConnectionConfig | undefined = tab.meta
+                  ? {
+                      protocol: tab.type as 'rdp' | 'vnc',
+                      host: tab.meta.host,
+                      port: tab.meta.port,
+                      username: tab.meta.username,
+                      password: tab.meta.password,
+                      domain: tab.meta.domain,
+                      width: tab.meta.width,
+                      height: tab.meta.height,
+                    }
+                  : undefined;
+                return (
+                  <RdpViewer
+                    tabId={tab.id}
+                    sessionId={tab.sessionId}
+                    connectionConfig={guacConfig}
+                  />
+                );
+              })()
+            )}
             {tab.type === 'editor' && <FileEditor tab={tab} />}
             {tab.type === 'preview' && <FilePreview tab={tab} />}
             {tab.type === 'settings' && <SettingsTab />}

@@ -152,6 +152,8 @@ const HomeTab: React.FC = () => {
         username,
         password: effectivePassword,
         sshKey: effectiveSshKey,
+        // RDP/VNC specific — protocol is passed via tab.type
+        ...(protocol === 'rdp' || protocol === 'vnc' ? { protocol } : {}),
       },
     });
     setHost('');
@@ -458,6 +460,9 @@ const HomeTab: React.FC = () => {
                       host: session.host,
                       port: session.port,
                       username: session.username,
+                      ...(session.session_type === 'rdp' || session.session_type === 'vnc'
+                        ? { protocol: session.session_type }
+                        : {}),
                     },
                   })
                 }

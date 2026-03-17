@@ -6,6 +6,7 @@ interface AppConfig {
   registration_enabled: boolean;
   ai_enabled: boolean;
   metrics_enabled: boolean;
+  guacd_enabled: boolean;
   version: string;
 }
 
@@ -14,6 +15,7 @@ interface ConfigState {
   registrationEnabled: boolean;
   aiEnabled: boolean;
   metricsEnabled: boolean;
+  guacdEnabled: boolean;
   version: string;
   isLoaded: boolean;
   fetchConfig: () => Promise<void>;
@@ -24,6 +26,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
   registrationEnabled: true,
   aiEnabled: true,
   metricsEnabled: true,
+  guacdEnabled: false,
   version: '',
   isLoaded: false,
 
@@ -35,6 +38,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
         registrationEnabled: data.registration_enabled,
         aiEnabled: data.ai_enabled,
         metricsEnabled: data.metrics_enabled,
+        guacdEnabled: data.guacd_enabled,
         version: data.version,
         isLoaded: true,
       });

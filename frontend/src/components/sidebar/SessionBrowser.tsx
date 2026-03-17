@@ -720,6 +720,9 @@ export const SessionBrowser: React.FC = () => {
           host: session.host,
           port: session.port,
           username: session.username ?? '',
+          ...(session.session_type === 'rdp' || session.session_type === 'vnc'
+            ? { protocol: session.session_type }
+            : {}),
         },
       });
 

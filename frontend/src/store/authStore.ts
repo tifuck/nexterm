@@ -9,7 +9,6 @@ import {
   importKey,
   storeKeyInSession,
   getKeyFromSession,
-  storeKeyInCookie,
   getKeyFromCookie,
   storeSalt,
   getSalt,
@@ -141,12 +140,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       const cryptoKey = await deriveKey(password, data.encryption_salt);
       const exportedKey = await exportKey(cryptoKey);
 
-      // Persist key material
+      // Persist key material in sessionStorage only (not cookies).
+      // Storing raw key material in cookies is an XSS risk — the
+      // "Remember Me" checkbox now only extends the refresh-token
+      // lifetime.  The E2EE key is re-derived on the next full login.
       storeSalt(data.encryption_salt);
       storeKeyInSession(exportedKey);
-      if (rememberMe) {
-        storeKeyInCookie(exportedKey, 30);
-      }
 
       // Fetch user profile before clearing isLoading — prevents redirect race
       const me = await apiGet<UserResponse>('/api/auth/me');
@@ -195,6 +194,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   logout: () => {
     stopTokenRefresh();
+    // Invalidate the token server-side (best-effort, don't block on failure)
+    apiPost('/api/auth/logout').catch(() => {});
     localStorage.removeItem('token');
     localStorage.removeItem('refresh_token');
     clearKeyMaterial();

@@ -35,7 +35,7 @@ import {
   CheckCircle,
 } from 'lucide-react';
 import { ToolModal } from './ToolModal';
-import { apiGet, apiPost, getWsUrl, ensureFreshToken } from '@/api/client';
+import { apiGet, apiPost, getWsUrl, ensureFreshToken, sendWsAuth } from '@/api/client';
 import { useToastStore } from '@/store/toastStore';
 
 // ---------------------------------------------------------------------------
@@ -247,6 +247,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
     wsRef.current = ws;
 
     ws.onopen = () => {
+      sendWsAuth(ws);
       ws.send(JSON.stringify({
         type: 'wireguard_install',
         connection_id: connectionId,

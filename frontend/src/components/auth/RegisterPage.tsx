@@ -30,6 +30,21 @@ const RegisterPage: React.FC = () => {
       return;
     }
 
+    if (!/[A-Z]/.test(password)) {
+      setError('Password must contain at least one uppercase letter');
+      return;
+    }
+
+    if (!/[a-z]/.test(password)) {
+      setError('Password must contain at least one lowercase letter');
+      return;
+    }
+
+    if (!/\d/.test(password)) {
+      setError('Password must contain at least one digit');
+      return;
+    }
+
     try {
       await register(username, email || '', password, confirmPassword);
       // Navigation happens automatically via App.tsx auth guard
@@ -112,7 +127,7 @@ const RegisterPage: React.FC = () => {
                 type={showPassword ? 'text' : 'password'}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder="At least 8 characters"
+                placeholder="Min 8 chars, upper, lower, digit"
                 autoComplete="new-password"
                 className="w-full px-3 py-2 pr-9 rounded-lg bg-[var(--bg-tertiary)] border border-[var(--border)] text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none focus:border-[var(--accent)] transition-colors"
               />

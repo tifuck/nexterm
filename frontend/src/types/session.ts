@@ -13,6 +13,7 @@ export interface Session {
   color?: string;
   icon?: string;
   sort_order: number;
+  protocol_settings?: string;
   created_at: string;
   updated_at: string;
   last_connected?: string;

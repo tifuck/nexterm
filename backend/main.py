@@ -35,6 +35,7 @@ from backend.websocket.ssh_ws import ssh_websocket_handler
 from backend.websocket.metrics_ws import metrics_websocket_handler
 from backend.websocket.sftp_ws import sftp_progress_handler
 from backend.websocket.tools_ws import tools_websocket_handler
+from backend.websocket.guacamole_ws import guacamole_websocket_handler
 
 # Configure logging
 logging.basicConfig(
@@ -72,6 +73,12 @@ async def lifespan(app: FastAPI):
     # The SSH process is started by run.py before uvicorn launches.
     await ssh_proxy.connect_to_process()
     logger.info("Connected to SSH manager process")
+
+    # Log guacd (RDP/VNC) availability
+    if config.guacd_enabled:
+        logger.info("guacd enabled at %s:%d (RDP/VNC support active)", config.guacd_host, config.guacd_port)
+    else:
+        logger.info("guacd disabled — RDP/VNC connections will be unavailable")
     
     yield
     
@@ -127,6 +134,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "Permissions-Policy",
             "camera=(), microphone=(), geolocation=()",
         )
+        # Restrict WebSocket protocol to wss: when HTTPS is enabled.
+        ws_connect = "ws: wss:" if not config.https_enabled else "wss:"
         response.headers.setdefault(
             "Content-Security-Policy",
             (
@@ -135,7 +144,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
                 "style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' data: blob:; "
                 "font-src 'self' data:; "
-                "connect-src 'self' ws: wss:; "
+                f"connect-src 'self' {ws_connect}; "
                 "frame-ancestors 'none'"
             ),
         )
@@ -168,6 +177,7 @@ app.websocket("/ws/ssh")(ssh_websocket_handler)
 app.websocket("/ws/metrics")(metrics_websocket_handler)
 app.websocket("/ws/sftp-progress")(sftp_progress_handler)
 app.websocket("/ws/tools")(tools_websocket_handler)
+app.websocket("/ws/guacamole")(guacamole_websocket_handler)
 
 
 # API config endpoint (public, used by frontend for app name and settings)
@@ -179,6 +189,7 @@ async def get_public_config():
         "registration_enabled": config.registration_enabled,
         "ai_enabled": config.ai_enabled,
         "metrics_enabled": config.metrics_enabled,
+        "guacd_enabled": config.guacd_enabled,
         "version": "0.1.0",
     }
 

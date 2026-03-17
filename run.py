@@ -188,28 +188,18 @@ def main():
 
     atexit.register(_cleanup)
 
-    # Also handle SIGTERM, SIGINT, and SIGHUP so the SSH process is
-    # cleaned up even when uvicorn is killed directly or the controlling
-    # terminal disconnects.
-    original_sigterm = signal.getsignal(signal.SIGTERM)
-    original_sigint = signal.getsignal(signal.SIGINT)
-
-    def _signal_handler(signum, frame):
-        _cleanup()
-        # Re-raise to let uvicorn handle its own shutdown.
-        if signum == signal.SIGTERM and callable(original_sigterm):
-            original_sigterm(signum, frame)
-        elif signum == signal.SIGINT and callable(original_sigint):
-            original_sigint(signum, frame)
-        else:
-            sys.exit(0)
-
-    signal.signal(signal.SIGTERM, _signal_handler)
-    signal.signal(signal.SIGINT, _signal_handler)
-    # SIGHUP — sent when the controlling terminal closes (e.g. SSH
-    # session to the host running nexterm is disconnected).
+    # Handle SIGHUP so the SSH process is cleaned up when the controlling
+    # terminal disconnects.  For SIGTERM/SIGINT we intentionally do NOT
+    # kill the SSH manager in the signal handler — uvicorn needs to shut
+    # down its workers first (closing WebSocket connections and running
+    # lifespan shutdown) so that cleanup code can still communicate with
+    # the SSH manager.  After uvicorn.run() returns, atexit fires
+    # _cleanup() which terminates the SSH manager process.
     if hasattr(signal, "SIGHUP"):
-        signal.signal(signal.SIGHUP, _signal_handler)
+        def _sighup_handler(signum, frame):
+            _cleanup()
+            sys.exit(0)
+        signal.signal(signal.SIGHUP, _sighup_handler)
 
     # ------------------------------------------------------------------
     # Launch uvicorn
@@ -242,6 +232,7 @@ def main():
         reload=config.debug,
         workers=1 if config.debug else 4,
         log_level="debug" if config.debug else "info",
+        timeout_graceful_shutdown=5,
         **ssl_kwargs,
     )
 

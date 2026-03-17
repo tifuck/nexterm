@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { Tab } from '../types/session';
 import { destroyTerminal } from '../components/terminal/TerminalContainer';
+import { destroyRdpViewer } from '../components/rdp/RdpViewer';
 import { useSplitStore } from './splitStore';
 import { useSidebarStore } from './sidebarStore';
 
@@ -45,10 +46,12 @@ export const useTabStore = create<TabState>()(
       newActiveTab = nextTab?.id ?? 'home';
     }
 
-    // Clean up terminal instance from cache
+    // Clean up terminal/viewer instance from cache
     const tab = tabs[tabIndex];
     if (tab.type === 'ssh' || tab.type === 'telnet') {
       destroyTerminal(tabId);
+    } else if (tab.type === 'rdp' || tab.type === 'vnc') {
+      destroyRdpViewer(tabId);
     }
 
     // Remove from any split panes

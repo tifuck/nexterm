@@ -1,4 +1,5 @@
 from datetime import datetime
+import re
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -6,7 +7,25 @@ from pydantic import BaseModel, Field, field_validator
 
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=255)
-    password: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1, max_length=1024)
+
+
+def _validate_password_strength(password: str) -> str:
+    """Enforce password complexity requirements.
+
+    Rules:
+      - Minimum 8 characters (enforced by Pydantic min_length).
+      - At least one uppercase letter.
+      - At least one lowercase letter.
+      - At least one digit.
+    """
+    if not re.search(r"[A-Z]", password):
+        raise ValueError("Password must contain at least one uppercase letter")
+    if not re.search(r"[a-z]", password):
+        raise ValueError("Password must contain at least one lowercase letter")
+    if not re.search(r"\d", password):
+        raise ValueError("Password must contain at least one digit")
+    return password
 
 
 class RegisterRequest(BaseModel):
@@ -14,6 +33,11 @@ class RegisterRequest(BaseModel):
     email: Optional[str] = Field(None, max_length=255)
     password: str = Field(..., min_length=8, max_length=128)
     password_confirm: str = Field(..., min_length=8, max_length=128)
+
+    @field_validator("password")
+    @classmethod
+    def password_strength(cls, v: str) -> str:
+        return _validate_password_strength(v)
 
     @field_validator("password_confirm")
     @classmethod
@@ -35,9 +59,14 @@ class RefreshRequest(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
-    old_password: str = Field(..., min_length=1)
+    old_password: str = Field(..., min_length=1, max_length=1024)
     new_password: str = Field(..., min_length=8, max_length=128)
     new_password_confirm: str = Field(..., min_length=8, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def new_password_strength(cls, v: str) -> str:
+        return _validate_password_strength(v)
 
     @field_validator("new_password_confirm")
     @classmethod

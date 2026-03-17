@@ -88,7 +88,17 @@ function getDefaultState(protocol: Protocol): FormState {
   };
 }
 
+function parseProtocolSettings(session: Session): Record<string, string> {
+  if (!session.protocol_settings) return {};
+  try {
+    return JSON.parse(session.protocol_settings);
+  } catch {
+    return {};
+  }
+}
+
 function sessionToFormState(session: Session): FormState {
+  const proto = parseProtocolSettings(session);
   return {
     name: session.name,
     host: session.host,
@@ -100,9 +110,9 @@ function sessionToFormState(session: Session): FormState {
     authType: session.ssh_key ? 'sshKey' : 'password',
     folderId: session.folder_id ?? '',
     color: session.color ?? null,
-    domain: ((session as unknown as Record<string, unknown>).domain as string) ?? '',
-    resolution: ((session as unknown as Record<string, unknown>).resolution as string) ?? '1920x1080',
-    ftpSecurity: ((session as unknown as Record<string, unknown>).ftpSecurity as string) ?? 'FTP',
+    domain: proto.domain ?? '',
+    resolution: proto.resolution ?? '1920x1080',
+    ftpSecurity: proto.ftpSecurity ?? 'FTP',
   };
 }
 
@@ -173,6 +183,15 @@ export const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
         encryptIfPresent(rawSshKey, cryptoKey),
       ]);
 
+      // Build protocol-specific settings as JSON
+      const protoSettings: Record<string, string> = {};
+      if (form.protocol === 'rdp') {
+        if (form.domain) protoSettings.domain = form.domain;
+        if (form.resolution) protoSettings.resolution = form.resolution;
+      } else if (form.protocol === 'ftp') {
+        if (form.ftpSecurity) protoSettings.ftpSecurity = form.ftpSecurity;
+      }
+
       const sessionData = {
         name: form.name.trim(),
         host: form.host.trim(),
@@ -183,9 +202,9 @@ export const NewSessionDialog: React.FC<NewSessionDialogProps> = ({
         encrypted_ssh_key,
         folder_id: form.folderId || undefined,
         color: form.color ?? undefined,
-        domain: form.domain || undefined,
-        resolution: form.resolution || undefined,
-        ftpSecurity: form.ftpSecurity || undefined,
+        protocol_settings: Object.keys(protoSettings).length > 0
+          ? JSON.stringify(protoSettings)
+          : undefined,
       };
 
       if (editSession) {

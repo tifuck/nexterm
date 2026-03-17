@@ -18,11 +18,12 @@ const PaneDivider: React.FC<PaneDividerProps> = ({ direction, onResize }) => {
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
-      const startPos = isVertical ? e.clientY : e.clientX;
+      let lastPos = isVertical ? e.clientY : e.clientX;
 
       const onMouseMove = (ev: MouseEvent) => {
         const currentPos = isVertical ? ev.clientY : ev.clientX;
-        onResize(currentPos - startPos);
+        onResize(currentPos - lastPos);
+        lastPos = currentPos;
       };
 
       const onMouseUp = () => {

@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { getWsUrl, ensureFreshToken } from '@/api/client';
+import { getWsUrl, ensureFreshToken, sendWsAuth } from '@/api/client';
 import { useTabStore } from '@/store/tabStore';
 import { useMetricsStore } from '@/store/metricsStore';
 
@@ -69,7 +69,7 @@ export function useMetricsWs(): void {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        // Token is already in the URL query param via getWsUrl, but send subscribe
+        sendWsAuth(ws);
         ws.send(JSON.stringify({ type: 'subscribe', connection_id: connectionId }));
         subscribedIdRef.current = connectionId;
         setConnectionId(connectionId);

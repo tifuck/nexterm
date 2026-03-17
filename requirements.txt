@@ -38,6 +38,9 @@ httpx==0.28.1
 # WebSocket
 websockets==14.1
 
+# Guacamole (RDP/VNC via guacd)
+pyguacamole==0.11
+
 # Utilities
 python-dateutil==2.9.0
 aiofiles==24.1.0

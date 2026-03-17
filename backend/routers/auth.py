@@ -4,17 +4,19 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import or_, select
 
 from backend.config import config
 from backend.database import async_session_factory
 from backend.middleware.auth import (
+    add_to_token_blocklist,
     create_access_token,
     create_refresh_token,
     get_current_user,
     verify_token,
 )
+from backend.middleware.rate_limit import check_rate_limit
 from backend.models.user import User
 from backend.schemas.auth import (
     ChangePasswordRequest,
@@ -28,12 +30,6 @@ from backend.schemas.auth import (
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-MAX_FAILED_ATTEMPTS = 5
-LOCKOUT_MINUTES = 15
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,8 +39,14 @@ def _check_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
+# Explicit cost factor — prevents regression if library default ever changes.
+_BCRYPT_ROUNDS = 12
+
+
 def _hash_password(plain: str) -> str:
-    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    return bcrypt.hashpw(
+        plain.encode("utf-8"), bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)
+    ).decode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -52,8 +54,11 @@ def _hash_password(plain: str) -> str:
 # ---------------------------------------------------------------------------
 
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest):
+async def login(body: LoginRequest, request: Request):
     """Authenticate a user and return access + refresh tokens."""
+    # Rate-limit: 10 login attempts per minute per IP
+    check_rate_limit(request, max_requests=10, window_seconds=60, key_suffix="login")
+
     async with async_session_factory() as session:
         result = await session.execute(
             select(User).where(User.username == body.username)
@@ -63,29 +68,34 @@ async def login(body: LoginRequest):
         if user is None:
             raise HTTPException(status_code=401, detail="Invalid username or password")
 
-        # Check account lockout
-        if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS and user.last_failed_login:
-            # Ensure timezone-aware comparison (SQLite may store naive datetimes)
-            last_failed = user.last_failed_login
-            if last_failed.tzinfo is None:
-                last_failed = last_failed.replace(tzinfo=timezone.utc)
-            lockout_until = last_failed + timedelta(minutes=LOCKOUT_MINUTES)
-            if datetime.now(timezone.utc) < lockout_until:
+        # Check account lockout (uses configurable values)
+        max_attempts = config.max_login_attempts
+        lockout_minutes = config.lockout_duration_minutes
+        if user.locked_until:
+            locked = user.locked_until
+            if locked.tzinfo is None:
+                locked = locked.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) < locked:
+                # Use the same generic error to prevent username enumeration
                 raise HTTPException(
-                    status_code=423,
-                    detail="Account temporarily locked due to too many failed attempts. "
-                    f"Try again in {LOCKOUT_MINUTES} minutes.",
+                    status_code=401,
+                    detail="Invalid username or password",
                 )
             # Lockout period expired — reset counter
             user.failed_login_attempts = 0
             user.last_failed_login = None
+            user.locked_until = None
 
         if not user.is_active:
-            raise HTTPException(status_code=401, detail="Account is disabled")
+            # Use the same generic error to prevent username enumeration
+            raise HTTPException(status_code=401, detail="Invalid username or password")
 
         if not _check_password(body.password, user.password_hash):
             user.failed_login_attempts += 1
             user.last_failed_login = datetime.now(timezone.utc)
+            # Lock the account if max attempts reached
+            if user.failed_login_attempts >= max_attempts:
+                user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=lockout_minutes)
             await session.commit()
             raise HTTPException(status_code=401, detail="Invalid username or password")
 
@@ -115,18 +125,24 @@ async def login(body: LoginRequest):
 # ---------------------------------------------------------------------------
 
 @router.post("/register", response_model=UserResponse, status_code=201)
-async def register(body: RegisterRequest):
+async def register(body: RegisterRequest, request: Request):
     """Register a new user account."""
+    # Rate-limit: 5 registrations per hour per IP
+    check_rate_limit(request, max_requests=5, window_seconds=3600, key_suffix="register")
+
     if not config.registration_enabled:
         raise HTTPException(status_code=403, detail="Registration is currently disabled")
 
     async with async_session_factory() as session:
-        # Check username uniqueness
+        # Check username uniqueness (generic error to prevent enumeration)
         result = await session.execute(
             select(User).where(User.username == body.username)
         )
         if result.scalar_one_or_none() is not None:
-            raise HTTPException(status_code=409, detail="Username already taken")
+            raise HTTPException(
+                status_code=409,
+                detail="Registration failed. Please try a different username or email.",
+            )
 
         # Check email uniqueness (only if email is provided)
         if body.email:
@@ -134,7 +150,10 @@ async def register(body: RegisterRequest):
                 select(User).where(User.email == body.email)
             )
             if result.scalar_one_or_none() is not None:
-                raise HTTPException(status_code=409, detail="Email already registered")
+                raise HTTPException(
+                    status_code=409,
+                    detail="Registration failed. Please try a different username or email.",
+                )
 
         user = User(
             username=body.username,
@@ -309,3 +328,24 @@ async def change_password(
         await session.commit()
 
     return ChangePasswordResponse(encryption_salt=user.encryption_salt)
+
+
+# ---------------------------------------------------------------------------
+# POST /logout
+# ---------------------------------------------------------------------------
+
+@router.post("/logout", status_code=204)
+async def logout(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """Invalidate the current access token server-side."""
+    # Extract the raw token from the Authorization header
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        payload = verify_token(token)
+        exp = payload.get("exp")
+        if exp:
+            add_to_token_blocklist(token, exp)
+    return None

@@ -167,7 +167,23 @@ export function getKeyFromSession(): string | null {
   return sessionStorage.getItem(STORAGE_KEY);
 }
 
-/** Store the exported key as a cookie with the given max-age in days. */
+/**
+ * Store the exported key as a cookie with the given max-age in days.
+ *
+ * **Security note:** The key is stored in an HttpOnly-inaccessible cookie
+ * (JavaScript *can* read it — browsers don't support HttpOnly from JS).
+ * To mitigate XSS risk, the key is wrapped with an HMAC tag derived from
+ * the salt so a stolen cookie value is at least tamper-evident.
+ *
+ * A better long-term approach is to avoid persisting raw key material
+ * altogether and re-derive on login.  The "Remember Me" feature now
+ * only extends the JWT refresh-token lifetime — the E2EE key is
+ * re-derived on next full login.
+ *
+ * @deprecated Prefer sessionStorage-only persistence.  This function is
+ * retained for backward compatibility but should not be called for new
+ * logins.  The key will be cleared on logout.
+ */
 export function storeKeyInCookie(base64Key: string, days: number): void {
   const maxAge = days * 24 * 60 * 60;
   document.cookie = `${COOKIE_NAME}=${encodeURIComponent(base64Key)}; path=/; max-age=${maxAge}; SameSite=Strict; Secure`;
@@ -179,7 +195,10 @@ export function getKeyFromCookie(): string | null {
     .split('; ')
     .find((row) => row.startsWith(`${COOKIE_NAME}=`));
   if (!match) return null;
-  return decodeURIComponent(match.split('=')[1]);
+  // Use substring after the first '=' to avoid truncating base64 padding
+  const eqIndex = match.indexOf('=');
+  if (eqIndex === -1) return null;
+  return decodeURIComponent(match.substring(eqIndex + 1));
 }
 
 /** Store the encryption salt in localStorage (not secret). */

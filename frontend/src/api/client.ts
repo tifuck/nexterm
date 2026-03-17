@@ -46,7 +46,23 @@ export async function ensureFreshToken(): Promise<boolean> {
   return tryRefreshToken();
 }
 
+/**
+ * Singleton promise for in-flight refresh — prevents concurrent refresh
+ * requests that would race and invalidate each other's rotating tokens.
+ */
+let _refreshPromise: Promise<boolean> | null = null;
+
 export async function tryRefreshToken(): Promise<boolean> {
+  // Deduplicate: if a refresh is already in-flight, piggyback on it.
+  if (_refreshPromise) return _refreshPromise;
+
+  _refreshPromise = _doRefreshToken().finally(() => {
+    _refreshPromise = null;
+  });
+  return _refreshPromise;
+}
+
+async function _doRefreshToken(): Promise<boolean> {
   const refreshToken = localStorage.getItem('refresh_token');
   if (!refreshToken) return false;
 
@@ -203,15 +219,45 @@ export async function apiUpload<T = any>(
   return response.json();
 }
 
+/**
+ * Build a WebSocket URL **without** embedding the JWT as a query parameter.
+ *
+ * Tokens should be sent as the first message after the connection opens
+ * (e.g. `{type: "auth", token: "..."}`) to avoid leaking JWTs in server
+ * logs, browser history, and Referer headers.
+ */
 export function getWsUrl(path: string): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const host = window.location.host;
-  const token = getToken();
-  const separator = path.includes('?') ? '&' : '?';
-  const tokenParam = token ? `${separator}token=${encodeURIComponent(token)}` : '';
-  return `${protocol}//${host}${path}${tokenParam}`;
+  return `${protocol}//${host}${path}`;
 }
 
+/**
+ * Return the JWT access token for use in the first WebSocket message.
+ * Callers should send `{type: "auth", token}` after `ws.onopen`.
+ */
+export function getWsAuthToken(): string | null {
+  return getToken();
+}
+
+/**
+ * Send the JWT auth message on a newly-opened WebSocket.
+ * Should be called at the start of every `ws.onopen` handler.
+ */
+export function sendWsAuth(ws: WebSocket): void {
+  const token = getToken();
+  if (token) {
+    ws.send(JSON.stringify({ type: 'auth', token }));
+  }
+}
+
+/**
+ * Build a preview URL for inline file rendering in `<img>`, `<video>`, etc.
+ *
+ * HTML elements cannot set Authorization headers, so the JWT is passed as a
+ * query parameter. This is a known trade-off — these URLs should not be
+ * shared or bookmarked as the token will appear in the URL.
+ */
 export function getPreviewUrl(connectionId: string, filePath: string): string {
   const token = getToken();
   const params = new URLSearchParams({ path: filePath });

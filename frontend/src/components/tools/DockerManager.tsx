@@ -36,7 +36,7 @@ import {
   CircleDot,
 } from 'lucide-react';
 import { ToolModal } from './ToolModal';
-import { apiGet, apiPost, apiDelete, getWsUrl, ensureFreshToken } from '@/api/client';
+import { apiGet, apiPost, apiDelete, getWsUrl, ensureFreshToken, sendWsAuth } from '@/api/client';
 import { useToastStore } from '@/store/toastStore';
 
 // ---------------------------------------------------------------------------
@@ -337,6 +337,7 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
     wsRef.current = ws;
 
     ws.onopen = () => {
+      sendWsAuth(ws);
       ws.send(JSON.stringify({
         type: 'docker_install',
         connection_id: connectionId,
@@ -442,6 +443,7 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
     logsWsRef.current = ws;
 
     ws.onopen = () => {
+      sendWsAuth(ws);
       ws.send(JSON.stringify({
         type: 'docker_logs_stream',
         connection_id: connectionId,
@@ -542,6 +544,7 @@ export const DockerManager: React.FC<Props> = ({ connectionId }) => {
     pullWsRef.current = ws;
 
     ws.onopen = () => {
+      sendWsAuth(ws);
       ws.send(JSON.stringify({
         type: 'docker_pull_image',
         connection_id: connectionId,

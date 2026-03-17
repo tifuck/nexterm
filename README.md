@@ -14,7 +14,51 @@ A web-based remote access client supporting SSH, SFTP, RDP, VNC, Telnet, and FTP
 - **System metrics** -- Real-time CPU, memory, disk, and network monitoring via WebSocket
 - **Themes** -- Multiple terminal color schemes
 - **HTTPS by default** -- Auto-generated self-signed certificates
-- **Lightweight** -- SQLite database, no external services required
+- **Remote desktop** -- RDP and VNC via Apache Guacamole (guacd) with canvas rendering, mouse, and keyboard input
+- **Lightweight** -- SQLite database, no external services required (guacd optional for RDP/VNC)
+
+## RDP & VNC Support
+
+RDP and VNC connections are handled via [Apache Guacamole](https://guacamole.apache.org/) (`guacd`). This is an optional external dependency -- SSH, Telnet, FTP, and SFTP work without it.
+
+### Enabling guacd
+
+**Docker (recommended):**
+
+```bash
+docker run -d --name guacd --restart unless-stopped -p 4822:4822 guacamole/guacd
+```
+
+Or use the Docker Compose `rdp` profile:
+
+```bash
+docker compose --profile rdp up -d
+```
+
+**Config (`config.yaml`):**
+
+```yaml
+guacd:
+  enabled: true
+  host: "localhost"   # or "guacd" if using Docker networking
+  port: 4822
+```
+
+Or via environment variables:
+
+```bash
+NEXTERM_GUACD_ENABLED=true NEXTERM_GUACD_HOST=localhost ./venv/bin/python run.py
+```
+
+When guacd is disabled, opening an RDP or VNC tab will show a message prompting you to enable it. All other protocols remain fully functional.
+
+### How it works
+
+1. The browser opens a WebSocket to `/ws/guacamole`
+2. The backend authenticates via JWT and resolves connection parameters (host, credentials, resolution)
+3. The backend connects to guacd over TCP and performs the Guacamole protocol handshake
+4. A bidirectional relay starts -- the backend transparently proxies Guacamole instructions between the browser and guacd
+5. The frontend uses `guacamole-common-js` (`Guacamole.Client`, `Guacamole.Display`, `Guacamole.Mouse`, `Guacamole.Keyboard`) to render the remote desktop in a `<canvas>` element
 
 ## Quick Start
 
@@ -82,7 +126,7 @@ Nexterm requires a Unix environment. On Windows, use WSL2:
 |------------|---------|-------|
 | Python | 3.10+ | With `pip` and `venv` modules |
 | Node.js | 18+ | With `npm` |
-| Docker | (optional) | For Docker deployment or RDP support (guacd) |
+| Docker | (optional) | For Docker deployment or RDP/VNC support (guacd) |
 
 On Debian/Ubuntu:
 ```bash
@@ -148,8 +192,9 @@ Every setting can be overridden with a `NEXTERM_` prefixed environment variable.
 | `NEXTERM_DEBUG` | `false` | Enable debug mode |
 | `NEXTERM_REGISTRATION_ENABLED` | `true` | Allow user self-registration |
 | `NEXTERM_HTTPS_ENABLED` | `true` | Enable HTTPS |
-| `NEXTERM_GUACD_ENABLED` | `false` | Enable RDP support via guacd |
+| `NEXTERM_GUACD_ENABLED` | `false` | Enable RDP/VNC support via guacd |
 | `NEXTERM_GUACD_HOST` | `localhost` | guacd hostname |
+| `NEXTERM_GUACD_PORT` | `4822` | guacd port |
 | `NEXTERM_ADMIN_USER` | -- | Auto-create admin with this username |
 | `NEXTERM_ADMIN_PASSWORD` | -- | Auto-create admin with this password |
 
@@ -177,29 +222,31 @@ npm run dev    # Dev server on http://localhost:3000 (proxies to backend)
                     ┌─────────────────────────┐
                     │       Browser (SPA)      │
                     │  React + xterm.js + WS   │
+                    │  guacamole-common-js      │
                     └──────────┬──────────────┘
                                │ HTTPS / WSS
                     ┌──────────▼──────────────┐
                     │    FastAPI (uvicorn)     │
                     │   REST API + WebSocket   │
                     │   Static file serving    │
-                    └──────────┬──────────────┘
-                               │ Unix socket IPC
-                    ┌──────────▼──────────────┐
-                    │   SSH Manager Process    │
-                    │  asyncssh connections    │
-                    │  SFTP / shell sessions   │
-                    └─────────────────────────┘
-                               │
-                    ┌──────────▼──────────────┐
-                    │   SQLite (WAL mode)      │
-                    │   Fernet encryption      │
-                    └─────────────────────────┘
+                    └──┬───────────────────┬──┘
+                       │ Unix socket IPC   │ TCP :4822
+            ┌──────────▼────────┐  ┌───────▼──────────┐
+            │ SSH Manager       │  │ guacd (optional)  │
+            │ asyncssh          │  │ RDP / VNC proxy   │
+            │ SFTP / shell      │  │ Apache Guacamole  │
+            └───────────────────┘  └──────────────────┘
+                       │
+            ┌──────────▼────────┐
+            │ SQLite (WAL mode) │
+            │ Fernet encryption │
+            └───────────────────┘
 ```
 
 The server uses a multi-process architecture:
 - **uvicorn workers** handle HTTP requests, REST APIs, and WebSocket connections
 - A **dedicated SSH manager process** owns all SSH/SFTP connections and communicates with workers over a Unix domain socket using length-prefixed JSON IPC
+- **guacd** (Apache Guacamole daemon, optional) handles RDP and VNC connections. The backend proxies the Guacamole protocol between the browser and guacd via WebSocket (`/ws/guacamole`)
 - **SQLite** with WAL mode provides concurrent database access
 - Stored credentials are encrypted with **Fernet** symmetric encryption derived from user passwords via PBKDF2
 

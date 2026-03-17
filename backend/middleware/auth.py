@@ -1,5 +1,7 @@
 """JWT authentication middleware and dependencies."""
 
+import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import jwt
@@ -11,10 +13,45 @@ from backend.config import config
 from backend.database import async_session_factory
 from backend.models.user import User
 
+logger = logging.getLogger(__name__)
+
 # Optional bearer — allows routes to work without auth header when needed
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 ALGORITHM = "HS256"
+
+# ---------------------------------------------------------------------------
+# In-memory token blocklist (for server-side logout / revocation)
+# ---------------------------------------------------------------------------
+# Maps token string -> expiry timestamp (UTC epoch).  Tokens are purged on
+# each insertion once they've naturally expired, keeping memory bounded.
+
+_token_blocklist: dict[str, float] = {}
+
+
+def add_to_token_blocklist(token: str, exp: int | float) -> None:
+    """Add a token to the blocklist so it is rejected by verify_token.
+
+    Args:
+        token: The raw JWT string.
+        exp: The ``exp`` claim (UTC epoch seconds).
+    """
+    _purge_expired_tokens()
+    _token_blocklist[token] = float(exp)
+    logger.debug("Token added to blocklist (blocklist size: %d)", len(_token_blocklist))
+
+
+def is_token_blocklisted(token: str) -> bool:
+    """Check whether a token has been revoked."""
+    return token in _token_blocklist
+
+
+def _purge_expired_tokens() -> None:
+    """Remove tokens that have naturally expired (housekeeping)."""
+    now = time.time()
+    expired = [t for t, exp in _token_blocklist.items() if exp < now]
+    for t in expired:
+        del _token_blocklist[t]
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +95,10 @@ def verify_token(token: str, *, allow_refresh: bool = False) -> dict:
 
     Raises HTTPException 401 on invalid or expired tokens.
     """
+    # Check server-side blocklist (logout / revocation)
+    if is_token_blocklisted(token):
+        raise HTTPException(status_code=401, detail="Token has been revoked")
+
     try:
         payload: dict = jwt.decode(token, config.secret_key, algorithms=[ALGORITHM])
 
@@ -83,15 +124,13 @@ def _extract_token(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None,
 ) -> str | None:
-    """Try to extract a bearer token from the Authorization header or cookie."""
+    """Extract a bearer token from the Authorization header.
+
+    Cookie-based token extraction has been removed to prevent CSRF attacks.
+    Tokens must be sent via the Authorization header.
+    """
     if credentials is not None:
         return credentials.credentials
-
-    # Fallback: look for an access_token cookie
-    token = request.cookies.get("access_token")
-    if token:
-        return token
-
     return None
 
 

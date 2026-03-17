@@ -19,7 +19,7 @@ import {
   Tooltip,
 } from 'recharts';
 import { ToolModal } from './ToolModal';
-import { apiGet, getWsUrl, ensureFreshToken } from '@/api/client';
+import { apiGet, getWsUrl, ensureFreshToken, sendWsAuth } from '@/api/client';
 
 interface DashboardMetrics {
   cpu_percent: number;
@@ -145,6 +145,7 @@ export const SystemDashboard: React.FC<Props> = ({ connectionId }) => {
       ws.onopen = () => {
         retryCount = 0;
         setError('');
+        sendWsAuth(ws);
         ws.send(JSON.stringify({ type: 'subscribe_dashboard', connection_id: connectionId }));
       };
 

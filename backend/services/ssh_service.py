@@ -125,6 +125,31 @@ class SSHConnectionManager:
     # Connection
     # ------------------------------------------------------------------
 
+    class _KeyCaptureClient(asyncssh.SSHClient):
+        """Custom SSHClient that captures the host key during key exchange.
+
+        The validate_host_public_key callback is called after the server sends
+        its host key but before any authentication credentials are transmitted.
+        """
+
+        def __init__(self, known_keys: list[dict] | None = None):
+            self.captured_key: tuple[str, str] | None = None
+            self.known_keys = known_keys or []
+
+        def validate_host_public_key(
+            self, host: str, addr: str, port: int, key: asyncssh.SSHKey
+        ) -> bool:
+            """Capture the host key type and fingerprint.
+
+            Returns True to accept all keys for the probe connection.
+            The caller will verify against known_host_keys after the key is captured.
+            """
+            raw_alg = key.algorithm
+            key_type = raw_alg.decode("ascii") if isinstance(raw_alg, bytes) else str(raw_alg)
+            fingerprint = key.get_fingerprint("sha256")
+            self.captured_key = (key_type, fingerprint)
+            return True
+
     async def _verify_host_key(
         self,
         host: str,
@@ -143,49 +168,49 @@ class SSHConnectionManager:
             HostKeyVerificationRequired: If the key is unknown or changed.
             asyncssh.Error / OSError: On connection failure.
         """
-        # Connect with no auth methods so only the key exchange happens.
-        # The server will reject us after key exchange (PermissionDenied),
-        # but we already have the host key at that point.
+        # Create a custom client that will capture the host key in
+        # validate_host_public_key, which is called during key exchange
+        # before any authentication credentials are sent.
+        client = self._KeyCaptureClient(known_host_keys)
+
         probe_kwargs: dict = {
             "host": host,
             "port": port,
-            "username": "",  # dummy — never authenticated
-            "known_hosts": None,
-            "client_keys": [],       # disable key-based auth
-            "password": None,        # disable password auth
-            "agent_path": None,      # disable agent auth
+            "username": "",
+            "known_hosts": (),
+            "client_factory": lambda: client,
+            "client_keys": [],
+            "password": None,
+            "agent_path": None,
             "agent_forwarding": False,
-            "preferred_auth": "none",  # only try "none" auth method
+            "preferred_auth": "none",
         }
 
         try:
-            conn = await asyncssh.connect(**probe_kwargs)
+            await asyncssh.connect(**probe_kwargs)
         except asyncssh.PermissionDenied:
-            # Expected: "none" auth was rejected.  asyncssh still sets the
-            # server host key before raising, but we need the connection
-            # object.  Fall back to the SSHClientConnection approach.
-            raise
-        except (asyncssh.Error, OSError):
+            pass
+        except (asyncssh.Error, OSError) as e:
+            logger.error(
+                "SSH probe connection failed for host %s:%d - %s",
+                host, port, e,
+            )
             raise
 
-        # If we somehow connected (e.g. the server allows auth "none"),
-        # extract the key and close.
-        key_type, fingerprint = self._extract_host_key_info(conn)
-        conn.close()
+        if client.captured_key is None:
+            raise RuntimeError("Failed to obtain host key from server")
+
+        key_type, fingerprint = client.captured_key
 
         known = known_host_keys or []
         matching_key = None
-        changed = False
         for entry in known:
             if entry["key_type"] == key_type and entry["fingerprint"] == fingerprint:
                 matching_key = entry
                 break
 
-        if matching_key is None and known:
-            changed = True
-
         if matching_key is None:
-            status = "changed" if changed else "new"
+            status = "changed" if known else "new"
             raise HostKeyVerificationRequired(key_type, fingerprint, status)
 
         return key_type, fingerprint
@@ -247,123 +272,7 @@ class SSHConnectionManager:
         # We open a disposable connection that only performs key exchange
         # (preferred_auth="none") so the server's host key can be checked
         # before any password or private key is transmitted.
-        try:
-            await self._verify_host_key(host, port, known_host_keys)
-        except asyncssh.PermissionDenied:
-            # "none" auth was rejected as expected.  asyncssh raises
-            # PermissionDenied but does not expose the connection object.
-            # Fall back to the legacy approach that uses a custom
-            # known_hosts callback to validate DURING the handshake.
-            # This still happens before password auth because asyncssh
-            # validates the host key before sending credentials when a
-            # known_hosts callback is provided.
-            pass
-
-        # Build a known_hosts validator that only accepts the fingerprints
-        # the user has previously approved.  asyncssh calls this DURING
-        # key exchange — before any authentication credentials are sent.
-        known = known_host_keys or []
-
-        def _known_hosts_validator(_host, _addr, _port):
-            """Return an SSHAuthorizedKeys object that trusts only the
-            user's previously accepted keys."""
-            # If the user has no known keys, we need to probe to get the
-            # fingerprint and ask them.  Raise here to trigger the prompt.
-            if not known:
-                return None  # accept any — we will verify after
-
-            class _TrustedKeys:
-                """Minimal known_hosts interface for asyncssh."""
-
-                def validate(self, host_key, trusted_host_keys=None):
-                    """Return True if the key matches a known fingerprint."""
-                    raw_alg = host_key.algorithm
-                    kt = raw_alg.decode("ascii") if isinstance(raw_alg, bytes) else str(raw_alg)
-                    fp = host_key.get_fingerprint("sha256")
-                    for entry in known:
-                        if entry["key_type"] == kt and entry["fingerprint"] == fp:
-                            return True
-                    return False
-
-            return _TrustedKeys()
-
-        # For the common case where we have no known keys yet we still
-        # need to capture the fingerprint to prompt the user.
-        if not known:
-            # Probe with no auth to get the key before sending credentials
-            probe_kwargs: dict = {
-                "host": host,
-                "port": port,
-                "username": username,
-                "known_hosts": None,
-                "client_keys": [],
-                "password": None,
-                "agent_path": None,
-                "agent_forwarding": False,
-                "preferred_auth": "none",
-            }
-            try:
-                probe_conn = await asyncssh.connect(**probe_kwargs)
-                # "none" auth succeeded (unusual but possible)
-                key_type, fingerprint = self._extract_host_key_info(probe_conn)
-                probe_conn.close()
-                raise HostKeyVerificationRequired(key_type, fingerprint, "new")
-            except asyncssh.PermissionDenied as e:
-                # Expected — need to extract key from the failed connection.
-                # asyncssh does not expose the conn on PermissionDenied, so
-                # we use a callback-based approach instead.
-                pass
-            except HostKeyVerificationRequired:
-                raise
-            except (asyncssh.Error, OSError) as e:
-                logger.error(
-                    "SSH probe connection failed for user %s to %s:%d - %s",
-                    user_id, host, port, e,
-                )
-                raise
-
-            # Use a callback to capture the key during the real connection
-            captured_key_info: list[tuple[str, str]] = []
-
-            class _KeyCapture:
-                """Captures the host key during key exchange."""
-
-                def validate(self, host_key, trusted_host_keys=None):
-                    raw_alg = host_key.algorithm
-                    kt = raw_alg.decode("ascii") if isinstance(raw_alg, bytes) else str(raw_alg)
-                    fp = host_key.get_fingerprint("sha256")
-                    captured_key_info.append((kt, fp))
-                    # Reject so the connection closes before auth
-                    return False
-
-            def _capture_hosts(_host, _addr, _port):
-                return _KeyCapture()
-
-            try:
-                await asyncssh.connect(
-                    host=host,
-                    port=port,
-                    username=username,
-                    known_hosts=_capture_hosts,
-                    keepalive_interval=0,
-                )
-            except asyncssh.HostKeyNotVerifiable:
-                pass
-            except (asyncssh.Error, OSError) as e:
-                if captured_key_info:
-                    pass  # We got the key, that's all we need
-                else:
-                    logger.error(
-                        "SSH connection failed for user %s to %s:%d - %s",
-                        user_id, host, port, e,
-                    )
-                    raise
-
-            if captured_key_info:
-                kt, fp = captured_key_info[0]
-                raise HostKeyVerificationRequired(kt, fp, "new")
-            else:
-                raise RuntimeError("Failed to obtain host key from server")
+        await self._verify_host_key(host, port, known_host_keys)
 
         # ---------------------------------------------------------------
         # Phase 2: Authenticated connection (host key already verified)

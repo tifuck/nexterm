@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 async def tools_websocket_handler(
     websocket: WebSocket,
-    token: str = Query(default=None),
+    token: str = Query(default=None, deprecated=True),
 ):
     """Handle server tools WebSocket connections.
 
@@ -50,6 +50,26 @@ async def tools_websocket_handler(
                 user_id = payload.get("sub")
             except Exception:
                 await websocket.send_json({"type": "error", "message": "Invalid token"})
+                await websocket.close(code=4001)
+                return
+
+        # Enforce auth timeout if not authenticated via query param
+        if not user_id:
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+                msg = json.loads(raw)
+                if msg.get("type") == "auth":
+                    payload = verify_token(msg.get("token", ""))
+                    user_id = payload.get("sub")
+                    await websocket.send_json({"type": "authenticated"})
+                else:
+                    await websocket.send_json({"type": "error", "message": "Authentication required"})
+                    await websocket.close(code=4001)
+                    return
+            except asyncio.TimeoutError:
+                await websocket.close(code=4001)
+                return
+            except Exception:
                 await websocket.close(code=4001)
                 return
 

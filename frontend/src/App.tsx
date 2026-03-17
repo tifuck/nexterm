@@ -3,6 +3,7 @@ import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from './store/authStore';
 import { useThemeStore } from './store/themeStore';
 import { useConfigStore } from './store/configStore';
+import { useAIStore } from './store/aiStore';
 import LoginPage from './components/auth/LoginPage';
 import RegisterPage from './components/auth/RegisterPage';
 import AppLayout from './components/layout/AppLayout';
@@ -12,12 +13,21 @@ const App: React.FC = () => {
   const { user, isLoading, checkAuth } = useAuthStore();
   const initTheme = useThemeStore((s) => s.initTheme);
   const fetchConfig = useConfigStore((s) => s.fetchConfig);
+  const aiEnabled = useConfigStore((s) => s.aiEnabled);
+  const fetchAI = useAIStore((s) => s.fetchAll);
   const location = useLocation();
 
   // Fetch app config (app name, feature flags) on mount
   useEffect(() => {
     fetchConfig();
   }, [fetchConfig]);
+
+  // Fetch AI settings/features once authenticated and AI is globally enabled
+  useEffect(() => {
+    if (user && aiEnabled) {
+      fetchAI();
+    }
+  }, [user, aiEnabled, fetchAI]);
 
   // Apply saved theme on mount
   useEffect(() => {

@@ -487,6 +487,7 @@ class PackageActionRequest(BaseModel):
     """Request to install or remove a package."""
     action: str = Field(..., pattern=r"^(install|remove|purge)$")
     package_name: str = Field(..., min_length=1, max_length=200)
+    custom_command: str | None = Field(default=None, max_length=500)
 
 
 class PackageCheckRequest(BaseModel):
@@ -497,6 +498,17 @@ class PackageCheckRequest(BaseModel):
 class PackageCheckResponse(BaseModel):
     """Response for batch installed check."""
     installed: dict[str, bool] = {}
+
+
+class CustomCheckItem(BaseModel):
+    """A single custom check: name + shell command."""
+    name: str = Field(..., min_length=1, max_length=200)
+    check_cmd: str = Field(..., min_length=1, max_length=500)
+
+
+class CustomCheckRequest(BaseModel):
+    """Request to check if custom-installed tools are present."""
+    checks: list[CustomCheckItem] = Field(..., min_length=1, max_length=20)
 
 
 # ---------------------------------------------------------------------------

@@ -143,7 +143,7 @@ const TopBar: React.FC<TopBarProps> = ({ sidebarWidth }) => {
             <button
               onClick={toggleTools}
               disabled={!isConnected}
-              className={`hidden sm:flex items-center justify-center p-1.5 rounded transition-colors ${
+              className={`flex items-center justify-center p-1.5 rounded transition-colors ${
                 !isConnected
                   ? 'text-[var(--text-muted)] opacity-40 cursor-not-allowed'
                   : isPanelOpen

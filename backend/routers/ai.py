@@ -2,15 +2,32 @@
 import ipaddress
 import json
 import logging
+from typing import Optional
 from urllib.parse import urlparse
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from sqlalchemy import select
+
 from backend.middleware.auth import get_current_user
 from backend.models.user import User
 from backend.config import config
+from backend.database import async_session_factory
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Known AI features and defaults
+# ---------------------------------------------------------------------------
+
+AI_FEATURE_NAMES = {
+    "command_generation",
+    "error_diagnosis",
+    "command_explanation",
+    "log_analysis",
+}
+
+_DEFAULT_FEATURES = {name: True for name in AI_FEATURE_NAMES}
 
 # ---------------------------------------------------------------------------
 # SSRF protection for user-supplied Ollama URLs
@@ -95,6 +112,11 @@ class AISettingsUpdate(BaseModel):
     api_key: Optional[str] = None  # Not needed for Ollama
     model: Optional[str] = None
     base_url: Optional[str] = None  # For Ollama or custom endpoints
+
+
+class AIFeaturesUpdate(BaseModel):
+    enabled: bool = True
+    features: dict[str, bool] = {}
 
 
 async def get_ai_client(user: User):
@@ -197,6 +219,61 @@ async def call_ai(settings: dict, system_prompt: str, user_prompt: str) -> str:
         raise HTTPException(status_code=400, detail=f"Unknown AI provider: {provider}")
 
 
+# ---------------------------------------------------------------------------
+# Per-user feature toggles
+# ---------------------------------------------------------------------------
+
+
+def _get_user_features(user: User) -> dict:
+    """Parse user's ai_features_json with defaults.
+
+    Returns:
+        Dict with ``enabled`` (bool) and ``features`` (dict[str, bool]).
+    """
+    result = {"enabled": True, "features": dict(_DEFAULT_FEATURES)}
+    if user.ai_features_json:
+        try:
+            stored = json.loads(user.ai_features_json)
+            result["enabled"] = stored.get("enabled", True)
+            stored_features = stored.get("features", {})
+            for name in AI_FEATURE_NAMES:
+                result["features"][name] = stored_features.get(name, True)
+        except json.JSONDecodeError:
+            pass
+    return result
+
+
+async def check_ai_feature(user: User, feature_name: str) -> None:
+    """Raise 403 if a specific AI feature is disabled.
+
+    Checks three levels:
+    1. Global server config (``config.ai_enabled``)
+    2. User master toggle (``ai_features_json.enabled``)
+    3. Individual feature toggle (``ai_features_json.features.<name>``)
+    """
+    if not config.ai_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="AI features are disabled by the administrator",
+        )
+
+    feat = _get_user_features(user)
+    if not feat["enabled"]:
+        raise HTTPException(
+            status_code=403,
+            detail="AI is disabled in your settings",
+        )
+    if not feat["features"].get(feature_name, True):
+        raise HTTPException(
+            status_code=403,
+            detail=f"The '{feature_name}' AI feature is disabled in your settings",
+        )
+
+
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
+
 COMMAND_SYSTEM_PROMPT = """You are a Linux/Unix command-line assistant. Given a natural language description, generate the appropriate shell command(s).
 
 Rules:
@@ -228,6 +305,7 @@ async def generate_command(
     current_user: User = Depends(get_current_user),
 ):
     """Generate a shell command from natural language."""
+    await check_ai_feature(current_user, "command_generation")
     settings = await get_ai_client(current_user)
     
     prompt = request.prompt
@@ -246,6 +324,7 @@ async def diagnose_error(
     current_user: User = Depends(get_current_user),
 ):
     """Diagnose an error from terminal output."""
+    await check_ai_feature(current_user, "error_diagnosis")
     settings = await get_ai_client(current_user)
     
     prompt = f"Error output:\n```\n{request.error_output}\n```"
@@ -264,21 +343,24 @@ async def explain_command(
     current_user: User = Depends(get_current_user),
 ):
     """Explain what a command does."""
+    await check_ai_feature(current_user, "command_explanation")
     settings = await get_ai_client(current_user)
     result = await call_ai(settings, EXPLAIN_SYSTEM_PROMPT, request.command)
     return {"explanation": result.strip()}
 
 
+# ---------------------------------------------------------------------------
+# Settings endpoints
+# ---------------------------------------------------------------------------
+
+
 @router.put("/settings")
 async def update_ai_settings(
-    settings: AISettingsUpdate,
+    body: AISettingsUpdate,
     current_user: User = Depends(get_current_user),
-    db=Depends(lambda: None),  # placeholder
 ):
     """Update user's AI provider settings."""
-    from backend.database import async_session_factory
     from backend.services.encryption import encrypt_sensitive
-    from sqlalchemy import select
 
     async with async_session_factory() as session:
         result = await session.execute(
@@ -287,12 +369,12 @@ async def update_ai_settings(
         user = result.scalar_one_or_none()
         if user:
             # Encrypt the API key at rest instead of storing plaintext
-            encrypted_key = encrypt_sensitive(settings.api_key) if settings.api_key else ""
+            encrypted_key = encrypt_sensitive(body.api_key) if body.api_key else ""
             user.ai_settings_json = json.dumps({
-                "provider": settings.provider,
+                "provider": body.provider,
                 "api_key_encrypted": encrypted_key,
-                "model": settings.model or "",
-                "base_url": settings.base_url or "",
+                "model": body.model or "",
+                "base_url": body.base_url or "",
             })
             await session.commit()
 
@@ -304,16 +386,16 @@ async def get_ai_settings(
     current_user: User = Depends(get_current_user),
 ):
     """Get user's AI settings (without API key)."""
-    ai_settings = {}
+    from backend.services.encryption import decrypt_sensitive
+
+    ai_settings: dict = {}
     if current_user.ai_settings_json:
         try:
             ai_settings = json.loads(current_user.ai_settings_json)
         except json.JSONDecodeError:
             pass
-    
-    # Determine if an API key exists (encrypted or legacy plaintext)
-    from backend.services.encryption import decrypt_sensitive
 
+    # Determine if an API key exists (encrypted or legacy plaintext)
     has_key = False
     masked_key = ""
     if ai_settings.get("api_key_encrypted"):
@@ -334,3 +416,49 @@ async def get_ai_settings(
     ai_settings.pop("api_key", None)
     ai_settings.pop("api_key_encrypted", None)
     return ai_settings
+
+
+# ---------------------------------------------------------------------------
+# Feature toggle endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/features")
+async def get_ai_features(
+    current_user: User = Depends(get_current_user),
+):
+    """Get user's per-feature AI toggles."""
+    return _get_user_features(current_user)
+
+
+@router.put("/features")
+async def update_ai_features(
+    body: AIFeaturesUpdate,
+    current_user: User = Depends(get_current_user),
+):
+    """Update user's per-feature AI toggles."""
+    # Validate feature names
+    unknown = set(body.features.keys()) - AI_FEATURE_NAMES
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown AI feature(s): {', '.join(sorted(unknown))}",
+        )
+
+    # Merge with defaults so we always store a complete set
+    merged = dict(_DEFAULT_FEATURES)
+    merged.update(body.features)
+
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(User).where(User.id == current_user.id)
+        )
+        user = result.scalar_one_or_none()
+        if user:
+            user.ai_features_json = json.dumps({
+                "enabled": body.enabled,
+                "features": merged,
+            })
+            await session.commit()
+
+    return {"enabled": body.enabled, "features": merged}

@@ -1,16 +1,31 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
-import { Search, ZoomIn, ZoomOut, RotateCcw, Maximize2, Minimize2, X, MoreVertical } from 'lucide-react';
+import { Search, ZoomIn, ZoomOut, RotateCcw, Maximize2, Minimize2, X, MoreVertical, Sparkles, Stethoscope, HelpCircle } from 'lucide-react';
 import { getTerminalSearchAddon, getTerminalInstance, getTerminalFitAddon } from './TerminalContainer';
 
 interface TerminalToolbarProps {
   tabId: string;
+  aiCommandEnabled?: boolean;
+  aiDiagnoseEnabled?: boolean;
+  aiExplainEnabled?: boolean;
+  onAICommand?: () => void;
+  onAIDiagnose?: () => void;
+  onAIExplain?: () => void;
 }
 
 const DEFAULT_FONT_SIZE = 14;
 const MIN_FONT_SIZE = 8;
 const MAX_FONT_SIZE = 32;
 
-export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({ tabId }) => {
+export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({
+  tabId,
+  aiCommandEnabled,
+  aiDiagnoseEnabled,
+  aiExplainEnabled,
+  onAICommand,
+  onAIDiagnose,
+  onAIExplain,
+}) => {
+  const hasAI = aiCommandEnabled || aiDiagnoseEnabled || aiExplainEnabled;
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -190,6 +205,20 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({ tabId }) => {
             title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
             onClick={handleToggleFullscreen}
           />
+          {hasAI && (
+            <>
+              <div className="w-px h-4 mx-0.5" style={{ backgroundColor: 'rgba(255,255,255,0.1)' }} />
+              {aiCommandEnabled && onAICommand && (
+                <ToolbarButton icon={<Sparkles size={14} />} title="AI Command (Ctrl+K)" onClick={onAICommand} />
+              )}
+              {aiDiagnoseEnabled && onAIDiagnose && (
+                <ToolbarButton icon={<Stethoscope size={14} />} title="Diagnose Error (Ctrl+Shift+D)" onClick={onAIDiagnose} />
+              )}
+              {aiExplainEnabled && onAIExplain && (
+                <ToolbarButton icon={<HelpCircle size={14} />} title="Explain Command (Ctrl+Shift+E)" onClick={onAIExplain} />
+              )}
+            </>
+          )}
         </div>
 
         {/* Search bar */}

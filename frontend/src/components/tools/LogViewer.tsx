@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { ToolModal } from './ToolModal';
 import { apiGet, apiPost, getWsUrl, ensureFreshToken } from '@/api/client';
+import { useAIStore } from '@/store/aiStore';
 
 interface LogEntry {
   timestamp: string;
@@ -28,6 +29,7 @@ interface Props {
 }
 
 export const LogViewer: React.FC<Props> = ({ connectionId }) => {
+  const logAnalysisEnabled = useAIStore((s) => s.isFeatureEnabled('log_analysis'));
   const [entries, setEntries] = useState<LogEntry[]>([]);
   const [availableUnits, setAvailableUnits] = useState<string[]>([]);
   const [selectedUnit, setSelectedUnit] = useState('');
@@ -256,14 +258,16 @@ export const LogViewer: React.FC<Props> = ({ connectionId }) => {
           {tailing ? 'Stop' : 'Tail'}
         </button>
 
-        <button
-          onClick={handleAnalyze}
-          disabled={analyzing}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)]/10 border border-[var(--accent)]/30 text-xs text-[var(--accent)] hover:bg-[var(--accent)]/20 transition-colors disabled:opacity-50"
-        >
-          {analyzing ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
-          AI Analyze
-        </button>
+        {logAnalysisEnabled && (
+          <button
+            onClick={handleAnalyze}
+            disabled={analyzing}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)]/10 border border-[var(--accent)]/30 text-xs text-[var(--accent)] hover:bg-[var(--accent)]/20 transition-colors disabled:opacity-50"
+          >
+            {analyzing ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+            AI Analyze
+          </button>
+        )}
 
         {/* Counters */}
         <div className="flex items-center gap-2 ml-auto text-[10px]">

@@ -1,8 +1,12 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Palette, Terminal, Info, Minus, Plus, ChevronDown, Check, SlidersHorizontal, RotateCcw } from 'lucide-react';
+import { Palette, Terminal, Info, Minus, Plus, ChevronDown, Check, SlidersHorizontal, RotateCcw, Sparkles, Eye, EyeOff, Loader2 } from 'lucide-react';
 import { useThemeStore, type CursorStyle } from '@/store/themeStore';
+import { useConfigStore } from '@/store/configStore';
+import { useAIStore } from '@/store/aiStore';
 import { TERMINAL_THEME_NAMES, TERMINAL_THEMES } from '@/themes/terminal-themes';
 import { APP_THEMES, APP_THEME_GROUPS, type AppThemeName, type CustomColors } from '@/themes/index';
+import { Toggle } from '@/components/ui/Toggle';
+import { AI_FEATURE_LABELS, type AIFeatureName } from '@/types/ai';
 
 /* ---------- Section wrapper ---------- */
 const Section: React.FC<{
@@ -232,6 +236,193 @@ const themeDisplayNames: Record<string, string> = {
   tokyoNight: 'Tokyo Night',
 };
 
+/* ---------- AI Settings Section ---------- */
+const AISettingsSection: React.FC = () => {
+  const aiEnabled = useConfigStore((s) => s.aiEnabled);
+  const { settings, features, isLoading, fetchAll, updateSettings, setMasterEnabled, setFeatureEnabled } = useAIStore();
+
+  const [provider, setProvider] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [model, setModel] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [showKey, setShowKey] = useState(false);
+  const [editingKey, setEditingKey] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    if (aiEnabled) {
+      fetchAll().then(() => setLoaded(true));
+    }
+  }, [aiEnabled, fetchAll]);
+
+  // Sync local state from store once loaded
+  useEffect(() => {
+    if (loaded) {
+      setProvider(settings.provider || '');
+      setModel(settings.model || '');
+      setBaseUrl(settings.base_url || '');
+      setApiKey('');
+      setEditingKey(false);
+    }
+  }, [loaded, settings]);
+
+  const handleSaveSettings = useCallback(async () => {
+    setSaving(true);
+    try {
+      await updateSettings({
+        provider,
+        api_key: editingKey ? apiKey : undefined,
+        model: model || undefined,
+        base_url: baseUrl || undefined,
+      });
+      setEditingKey(false);
+      setApiKey('');
+    } finally {
+      setSaving(false);
+    }
+  }, [provider, apiKey, model, baseUrl, editingKey, updateSettings]);
+
+  if (!aiEnabled) {
+    return (
+      <Section title="AI Assistant" icon={<Sparkles size={16} className="text-[var(--text-muted)]" />}>
+        <p className="text-xs text-[var(--text-muted)]">
+          AI features have been disabled by the administrator.
+        </p>
+      </Section>
+    );
+  }
+
+  if (isLoading && !loaded) {
+    return (
+      <Section title="AI Assistant" icon={<Sparkles size={16} className="text-[var(--accent)]" />}>
+        <div className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
+          <Loader2 size={14} className="animate-spin" />
+          Loading AI settings...
+        </div>
+      </Section>
+    );
+  }
+
+  const needsApiKey = provider === 'openai' || provider === 'anthropic';
+  const showBaseUrl = provider === 'ollama';
+  const masterEnabled = features.enabled;
+
+  return (
+    <Section title="AI Assistant" icon={<Sparkles size={16} className="text-[var(--accent)]" />}>
+      <Row label="Enable AI Features" description="Master switch for all AI features">
+        <Toggle checked={masterEnabled} onChange={setMasterEnabled} />
+      </Row>
+
+      {masterEnabled && (
+        <>
+          {/* Provider config */}
+          <div className="mt-3 pt-3 border-t border-[var(--border)] space-y-4">
+            <Row label="Provider" description="AI service provider">
+              <select
+                value={provider}
+                onChange={(e) => { setProvider(e.target.value); setEditingKey(false); setApiKey(''); }}
+                className="px-3 py-1.5 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent)] transition-colors cursor-pointer"
+              >
+                <option value="">Select provider...</option>
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="ollama">Ollama (local)</option>
+              </select>
+            </Row>
+
+            {needsApiKey && (
+              <Row label="API Key" description="Required for OpenAI / Anthropic">
+                <div className="flex items-center gap-2">
+                  {editingKey ? (
+                    <div className="flex items-center gap-1.5">
+                      <div className="relative">
+                        <input
+                          type={showKey ? 'text' : 'password'}
+                          value={apiKey}
+                          onChange={(e) => setApiKey(e.target.value)}
+                          placeholder="sk-..."
+                          className="w-48 pl-2.5 pr-8 py-1.5 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent)] font-mono"
+                        />
+                        <button
+                          onClick={() => setShowKey(!showKey)}
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+                        >
+                          {showKey ? <EyeOff size={12} /> : <Eye size={12} />}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <span className="text-xs text-[var(--text-muted)] font-mono">
+                      {settings.has_api_key ? settings.api_key_masked : 'Not set'}
+                    </span>
+                  )}
+                  <button
+                    onClick={() => { setEditingKey(!editingKey); setApiKey(''); setShowKey(false); }}
+                    className="px-2 py-1 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent)] transition-colors"
+                  >
+                    {editingKey ? 'Cancel' : 'Change'}
+                  </button>
+                </div>
+              </Row>
+            )}
+
+            <Row label="Model" description="Model name (leave blank for default)">
+              <input
+                type="text"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                placeholder={provider === 'anthropic' ? 'claude-sonnet-4-20250514' : provider === 'ollama' ? 'llama3.2' : 'gpt-4o-mini'}
+                className="w-48 px-2.5 py-1.5 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent)] font-mono placeholder:text-[var(--text-muted)]"
+              />
+            </Row>
+
+            {showBaseUrl && (
+              <Row label="Base URL" description="Ollama server address">
+                <input
+                  type="text"
+                  value={baseUrl}
+                  onChange={(e) => setBaseUrl(e.target.value)}
+                  placeholder="http://localhost:11434"
+                  className="w-48 px-2.5 py-1.5 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent)] font-mono placeholder:text-[var(--text-muted)]"
+                />
+              </Row>
+            )}
+
+            {/* Save button */}
+            <div className="flex justify-end">
+              <button
+                onClick={handleSaveSettings}
+                disabled={saving || !provider}
+                className="px-4 py-1.5 rounded bg-[var(--accent)] text-white text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-40"
+              >
+                {saving ? 'Saving...' : 'Save Provider Settings'}
+              </button>
+            </div>
+          </div>
+
+          {/* Feature toggles */}
+          <div className="mt-3 pt-3 border-t border-[var(--border)] space-y-4">
+            <p className="text-xs font-semibold text-[var(--text-secondary)] uppercase tracking-wider">Features</p>
+            {(Object.keys(AI_FEATURE_LABELS) as AIFeatureName[]).map((name) => (
+              <Row
+                key={name}
+                label={AI_FEATURE_LABELS[name].label}
+                description={AI_FEATURE_LABELS[name].description}
+              >
+                <Toggle
+                  checked={features.features[name]}
+                  onChange={(v) => setFeatureEnabled(name, v)}
+                />
+              </Row>
+            ))}
+          </div>
+        </>
+      )}
+    </Section>
+  );
+};
+
 /* ---------- Main ---------- */
 const SettingsTab: React.FC = () => {
   const {
@@ -411,6 +602,9 @@ const SettingsTab: React.FC = () => {
             <span className="text-sm text-[var(--text-muted)]">10,000</span>
           </Row>
         </Section>
+
+        {/* AI Assistant */}
+        <AISettingsSection />
 
         {/* About */}
         <Section title="About" icon={<Info size={16} className="text-[var(--accent)]" />}>

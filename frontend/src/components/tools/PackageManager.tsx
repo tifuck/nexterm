@@ -20,6 +20,7 @@ import {
   Wrench,
   Server,
   Network,
+  Bot,
 } from 'lucide-react';
 import { ToolModal } from './ToolModal';
 import { apiGet, apiPost } from '@/api/client';
@@ -75,12 +76,17 @@ type ManagerId = 'apt' | 'dnf' | 'yum' | 'pacman' | 'apk' | 'zypper';
 interface PopularPackage {
   name: string;
   description: string;
-  category: 'languages' | 'devtools' | 'servers' | 'databases' | 'security' | 'networking' | 'utilities' | 'editors';
+  category: 'ai' | 'languages' | 'devtools' | 'servers' | 'databases' | 'security' | 'networking' | 'utilities' | 'editors';
   /** Package names per manager. If a manager key is missing, the package is hidden for that OS. */
   packages: Partial<Record<ManagerId, string>>;
+  /** Shell command to run for installation instead of the package manager (e.g. curl-pipe-bash). */
+  customInstallCmd?: string;
+  /** Shell command to check if installed (exit 0 = installed). */
+  customCheckCmd?: string;
 }
 
 const CATEGORY_META: Record<string, { label: string; icon: React.ReactNode; color: string }> = {
+  ai: { label: 'AI Tools', icon: <Bot size={11} />, color: '#c084fc' },
   languages: { label: 'Languages', icon: <Code size={11} />, color: 'var(--accent)' },
   devtools: { label: 'Dev Tools', icon: <Wrench size={11} />, color: 'var(--warning)' },
   servers: { label: 'Web Servers', icon: <Globe size={11} />, color: 'var(--success)' },
@@ -92,6 +98,22 @@ const CATEGORY_META: Record<string, { label: string; icon: React.ReactNode; colo
 };
 
 const POPULAR_PACKAGES: PopularPackage[] = [
+  {
+    name: 'Claude Code',
+    description: 'Anthropic\'s AI coding agent for the terminal',
+    category: 'ai',
+    packages: {},
+    customInstallCmd: 'curl -fsSL https://claude.ai/install.sh | bash',
+    customCheckCmd: 'which claude',
+  },
+  {
+    name: 'OpenCode',
+    description: 'Open source AI coding agent by Anomaly',
+    category: 'ai',
+    packages: {},
+    customInstallCmd: 'curl -fsSL https://opencode.ai/install | bash',
+    customCheckCmd: 'which opencode',
+  },
   {
     name: 'Python 3 + venv + pip',
     description: 'Python runtime, virtual environments & package manager',
@@ -344,29 +366,49 @@ export const PackageManager: React.FC<Props> = ({ connectionId }) => {
   const getVisiblePackages = useCallback(() => {
     if (!pkgInfo) return [];
     const mgr = pkgInfo.manager as ManagerId;
-    return POPULAR_PACKAGES.filter((p) => p.packages[mgr]);
+    return POPULAR_PACKAGES.filter((p) => p.customInstallCmd || p.packages[mgr]);
   }, [pkgInfo]);
 
   const checkInstalledPackages = useCallback(async () => {
     if (!pkgInfo || pkgInfo.manager === 'unknown') return;
     const mgr = pkgInfo.manager as ManagerId;
-    const visible = POPULAR_PACKAGES.filter((p) => p.packages[mgr]);
-    // Flatten all individual package names
+    const visible = POPULAR_PACKAGES.filter((p) => p.customInstallCmd || p.packages[mgr]);
+    // Flatten all individual package names (system packages)
     const allPkgs = new Set<string>();
+    // Collect custom check commands
+    const customChecks: { name: string; check_cmd: string }[] = [];
     visible.forEach((p) => {
-      const names = p.packages[mgr];
-      if (names) {
-        names.split(' ').forEach((n) => allPkgs.add(n));
+      if (p.customCheckCmd) {
+        customChecks.push({ name: p.name, check_cmd: p.customCheckCmd });
+      } else {
+        const names = p.packages[mgr];
+        if (names) {
+          names.split(' ').forEach((n) => allPkgs.add(n));
+        }
       }
     });
-    if (allPkgs.size === 0) return;
 
     setQuickCheckLoading(true);
     try {
-      const data = await apiPost(`/api/tools/${connectionId}/packages/check-installed`, {
-        packages: Array.from(allPkgs),
-      });
-      setInstalledMap(data.installed || {});
+      const results: Record<string, boolean> = {};
+
+      // Check system packages
+      if (allPkgs.size > 0) {
+        const data = await apiPost(`/api/tools/${connectionId}/packages/check-installed`, {
+          packages: Array.from(allPkgs),
+        });
+        Object.assign(results, data.installed || {});
+      }
+
+      // Check custom-install packages
+      if (customChecks.length > 0) {
+        const data = await apiPost(`/api/tools/${connectionId}/packages/check-custom`, {
+          checks: customChecks,
+        });
+        Object.assign(results, data.installed || {});
+      }
+
+      setInstalledMap(results);
       setQuickCheckDone(true);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to check installed packages';
@@ -378,6 +420,10 @@ export const PackageManager: React.FC<Props> = ({ connectionId }) => {
 
   /** Check whether ALL sub-packages of a bundle are installed */
   const isBundleInstalled = useCallback((pkg: PopularPackage): boolean => {
+    // Custom-install packages are keyed by display name
+    if (pkg.customCheckCmd) {
+      return installedMap[pkg.name] === true;
+    }
     if (!pkgInfo) return false;
     const mgr = pkgInfo.manager as ManagerId;
     const names = pkg.packages[mgr];
@@ -387,6 +433,29 @@ export const PackageManager: React.FC<Props> = ({ connectionId }) => {
 
   const quickInstall = async (pkg: PopularPackage) => {
     if (!pkgInfo) return;
+
+    // Custom-install packages use a shell command instead of the package manager
+    if (pkg.customInstallCmd) {
+      if (!confirm(`Install ${pkg.name}?\n\nCommand: ${pkg.customInstallCmd}`)) return;
+
+      setQuickInstallLoading(pkg.name);
+      try {
+        await apiPost(`/api/tools/${connectionId}/packages/action`, {
+          action: 'install',
+          package_name: pkg.name,
+          custom_command: pkg.customInstallCmd,
+        });
+        addToast(`${pkg.name} installed successfully`, 'success');
+        setInstalledMap((prev) => ({ ...prev, [pkg.name]: true }));
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : `Failed to install ${pkg.name}`;
+        addToast(message, 'error');
+      } finally {
+        setQuickInstallLoading(null);
+      }
+      return;
+    }
+
     const mgr = pkgInfo.manager as ManagerId;
     const pkgNames = pkg.packages[mgr];
     if (!pkgNames) return;
@@ -831,7 +900,7 @@ const QuickInstallTab: React.FC<{
     grouped[pkg.category].push(pkg);
   });
 
-  const categoryOrder = ['languages', 'devtools', 'servers', 'databases', 'security', 'networking', 'utilities', 'editors'];
+  const categoryOrder = ['ai', 'languages', 'devtools', 'servers', 'databases', 'security', 'networking', 'utilities', 'editors'];
   const sortedCategories = categoryOrder.filter((c) => grouped[c]);
 
   return (

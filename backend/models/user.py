@@ -34,6 +34,9 @@ class User(Base):
     # AI provider settings (JSON, encrypted API keys)
     ai_settings_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Per-user AI feature toggles (JSON)
+    ai_features_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

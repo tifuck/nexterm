@@ -54,6 +54,7 @@ from backend.schemas.tools import (
     PackageActionRequest,
     PackageCheckRequest,
     PackageCheckResponse,
+    CustomCheckRequest,
     DockerInstallCheck,
     DockerInfo,
     DockerContainer,
@@ -797,8 +798,9 @@ async def analyze_logs(
 
     # Try AI analysis
     try:
-        from backend.routers.ai import get_ai_client, call_ai
+        from backend.routers.ai import get_ai_client, call_ai, check_ai_feature
 
+        await check_ai_feature(current_user, "log_analysis")
         settings = await get_ai_client(current_user)
 
         system_prompt = """You are a Linux system administrator analyzing server logs. Provide:
@@ -2580,6 +2582,33 @@ async def package_action(
     """Install, remove, or purge a package."""
     await _verify_connection(connection_id, current_user)
 
+    # ---- Custom command path (for tools installed via curl/npm scripts) ----
+    if request.custom_command:
+        if request.action != "install":
+            raise HTTPException(status_code=400, detail="Custom commands only support install action")
+        # Whitelist: only allow commands starting with known safe prefixes
+        allowed_prefixes = ("curl -fsSL ", "npm install ", "npx ")
+        if not any(request.custom_command.startswith(p) for p in allowed_prefixes):
+            raise HTTPException(status_code=400, detail="Custom command not allowed")
+        cmd = f"{request.custom_command} 2>&1; echo EXIT:$?"
+        result = await ssh_proxy.run_command(connection_id, cmd, timeout=180)
+        stdout = result.get("stdout", "")
+        stderr = result.get("stderr", "")
+
+        exit_code = "1"
+        for line in stdout.split("\n"):
+            if line.startswith("EXIT:"):
+                exit_code = line.replace("EXIT:", "").strip()
+
+        if exit_code != "0":
+            error_msg = stderr or stdout.replace("EXIT:0", "").replace("EXIT:1", "")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Custom install failed: {error_msg[-500:]}",
+            )
+        return {"message": f"'{request.package_name}' installed successfully"}
+
+    # ---- Standard package-manager path ----
     # Sanitize package name(s) — supports space-separated bundles
     pkg = request.package_name
     pkg_parts = pkg.split()
@@ -2725,6 +2754,31 @@ async def check_installed_packages(
         # Unknown manager — mark all as unknown/false
         for pkg in clean_packages:
             installed[pkg] = False
+
+    return PackageCheckResponse(installed=installed)
+
+
+@router.post("/{connection_id}/packages/check-custom", response_model=PackageCheckResponse)
+async def check_custom_packages(
+    connection_id: str,
+    request: CustomCheckRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Check if custom-installed tools are present via arbitrary check commands."""
+    await _verify_connection(connection_id, current_user)
+
+    # Whitelist allowed check commands
+    allowed_prefixes = ("which ", "command -v ")
+    installed: dict[str, bool] = {}
+
+    for item in request.checks:
+        if not any(item.check_cmd.startswith(p) for p in allowed_prefixes):
+            installed[item.name] = False
+            continue
+        cmd = f"{item.check_cmd} >/dev/null 2>&1 && echo FOUND || echo NOTFOUND"
+        result = await ssh_proxy.run_command(connection_id, cmd, timeout=5)
+        stdout = result.get("stdout", "").strip()
+        installed[item.name] = "FOUND" in stdout
 
     return PackageCheckResponse(installed=installed)
 

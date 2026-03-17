@@ -7,7 +7,7 @@ import SettingsTab from '../tabs/SettingsTab';
 import FileEditor from '../editor/FileEditor';
 import FilePreview from '../editor/FilePreview';
 import TerminalContainer, { getTerminalInstance } from '../terminal/TerminalContainer';
-import { TerminalToolbar } from '../terminal/TerminalToolbar';
+import { TerminalAIWrapper } from '../terminal/TerminalAIWrapper';
 import { MobileHotkeyBar } from '../terminal/MobileHotkeyBar';
 import SplitChrome from './SplitContainer';
 import type { ConnectionConfig } from '../terminal/TerminalContainer';
@@ -235,7 +235,7 @@ const MainContent: React.FC = () => {
                       : undefined
                   }
                 />
-                <TerminalToolbar tabId={tab.id} />
+                <TerminalAIWrapper tabId={tab.id} />
               </div>
             )}
 

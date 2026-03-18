@@ -1,13 +1,16 @@
 """JWT authentication middleware and dependencies."""
 
+import asyncio
+import hashlib
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from collections import OrderedDict
 
 import jwt
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from backend.config import config
 from backend.database import async_session_factory
@@ -21,37 +24,169 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 ALGORITHM = "HS256"
 
 # ---------------------------------------------------------------------------
-# In-memory token blocklist (for server-side logout / revocation)
+# Persistent token blocklist (database-backed with in-memory LRU cache)
 # ---------------------------------------------------------------------------
-# Maps token string -> expiry timestamp (UTC epoch).  Tokens are purged on
-# each insertion once they've naturally expired, keeping memory bounded.
+# The canonical store is the ``revoked_tokens`` database table so that
+# revocations survive server restarts and are shared across workers.
+# A small in-memory LRU cache avoids a DB round-trip on every request.
 
-_token_blocklist: dict[str, float] = {}
+_CACHE_MAX_SIZE = 2048
+_blocklist_cache: OrderedDict[str, float] = OrderedDict()
+
+
+def _hash_token(token: str) -> str:
+    """SHA-256 hash of a raw JWT for storage / lookup."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _cache_put(token_hash: str, exp: float) -> None:
+    """Add an entry to the in-memory LRU cache."""
+    _blocklist_cache[token_hash] = exp
+    if len(_blocklist_cache) > _CACHE_MAX_SIZE:
+        _blocklist_cache.popitem(last=False)
+
+
+def _cache_contains(token_hash: str) -> bool:
+    """Check the in-memory cache.  Returns True if found and not yet expired."""
+    exp = _blocklist_cache.get(token_hash)
+    if exp is None:
+        return False
+    if exp < time.time():
+        # Naturally expired — evict from cache
+        _blocklist_cache.pop(token_hash, None)
+        return False
+    # Move to end (most-recently-used)
+    _blocklist_cache.move_to_end(token_hash)
+    return True
 
 
 def add_to_token_blocklist(token: str, exp: int | float) -> None:
-    """Add a token to the blocklist so it is rejected by verify_token.
+    """Revoke a token by persisting its hash to the database.
+
+    Also adds the entry to the in-memory cache so subsequent checks in
+    the same worker are fast.
 
     Args:
         token: The raw JWT string.
         exp: The ``exp`` claim (UTC epoch seconds).
     """
-    _purge_expired_tokens()
-    _token_blocklist[token] = float(exp)
-    logger.debug("Token added to blocklist (blocklist size: %d)", len(_token_blocklist))
+    token_hash = _hash_token(token)
+    expires_at = datetime.fromtimestamp(float(exp), tz=timezone.utc)
+
+    # Update in-memory cache immediately (synchronous fast path)
+    _cache_put(token_hash, float(exp))
+
+    # Persist to database asynchronously.  We fire-and-forget here because
+    # the caller (route handler) is itself async but we want the public API
+    # of this function to stay synchronous for backward compatibility.
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_persist_revocation(token_hash, expires_at))
+    except RuntimeError:
+        # No running event loop — skip DB persistence (e.g. during tests)
+        logger.warning("No event loop — token revocation not persisted to DB")
+
+
+async def _persist_revocation(token_hash: str, expires_at: datetime) -> None:
+    """Write a revoked-token row to the database."""
+    from backend.models.revoked_token import RevokedToken
+
+    try:
+        async with async_session_factory() as db:
+            existing = await db.execute(
+                select(RevokedToken).where(RevokedToken.token_hash == token_hash)
+            )
+            if existing.scalar_one_or_none() is None:
+                db.add(RevokedToken(token_hash=token_hash, expires_at=expires_at))
+                await db.commit()
+        logger.debug("Token revocation persisted (hash=%s…)", token_hash[:12])
+    except Exception as e:
+        logger.error("Failed to persist token revocation: %s", e)
 
 
 def is_token_blocklisted(token: str) -> bool:
-    """Check whether a token has been revoked."""
-    return token in _token_blocklist
+    """Check whether a token has been revoked (cache then DB)."""
+    token_hash = _hash_token(token)
+
+    # Fast path: in-memory cache hit
+    if _cache_contains(token_hash):
+        return True
+
+    # Slow path: query the database.  Because verify_token is synchronous
+    # we run the DB check in a new thread via asyncio.  If there's no
+    # running event loop, fall back to cache-only.
+    try:
+        loop = asyncio.get_running_loop()
+        # We cannot await inside a sync function, so schedule a task and
+        # check a future.  However, for the common case the cache is warm
+        # and we never reach here.  For the cold-start / first-request case,
+        # we do a blocking check.
+        import concurrent.futures
+        future = asyncio.run_coroutine_threadsafe(_check_db_blocklist(token_hash), loop)
+        try:
+            found = future.result(timeout=1.0)
+        except (concurrent.futures.TimeoutError, Exception):
+            return False
+        if found:
+            _cache_put(token_hash, found)
+            return True
+    except RuntimeError:
+        pass
+
+    return False
 
 
-def _purge_expired_tokens() -> None:
-    """Remove tokens that have naturally expired (housekeeping)."""
+async def _check_db_blocklist(token_hash: str) -> float | None:
+    """Query the revoked_tokens table.  Returns the expiry epoch or None."""
+    from backend.models.revoked_token import RevokedToken
+
+    try:
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(RevokedToken.expires_at).where(
+                    RevokedToken.token_hash == token_hash
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is not None:
+                return row.timestamp()
+    except Exception as e:
+        logger.error("DB blocklist check failed: %s", e)
+    return None
+
+
+async def purge_expired_revocations() -> int:
+    """Delete revoked_tokens rows that have naturally expired.
+
+    Call this periodically (e.g. in the app lifespan or a background task)
+    to keep the table small.  Returns the number of rows deleted.
+    """
+    from backend.models.revoked_token import RevokedToken
+
+    try:
+        async with async_session_factory() as db:
+            result = await db.execute(
+                delete(RevokedToken).where(
+                    RevokedToken.expires_at < datetime.now(timezone.utc)
+                )
+            )
+            await db.commit()
+            count = result.rowcount  # type: ignore[union-attr]
+            if count:
+                logger.info("Purged %d expired token revocations", count)
+            return count or 0
+    except Exception as e:
+        logger.error("Failed to purge expired revocations: %s", e)
+        return 0
+
+
+# Also purge stale entries from the in-memory cache periodically
+def _purge_cache() -> None:
+    """Remove expired entries from the in-memory cache."""
     now = time.time()
-    expired = [t for t, exp in _token_blocklist.items() if exp < now]
-    for t in expired:
-        del _token_blocklist[t]
+    expired = [h for h, exp in _blocklist_cache.items() if exp < now]
+    for h in expired:
+        _blocklist_cache.pop(h, None)
 
 
 # ---------------------------------------------------------------------------

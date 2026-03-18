@@ -22,6 +22,7 @@ from backend.schemas.auth import (
     ChangePasswordRequest,
     ChangePasswordResponse,
     LoginRequest,
+    LogoutRequest,
     RefreshRequest,
     RegisterRequest,
     TokenResponse,
@@ -202,6 +203,11 @@ async def refresh(body: RefreshRequest):
     if not user.is_active:
         raise HTTPException(status_code=401, detail="Account is disabled")
 
+    # Blocklist the old refresh token to prevent replay attacks.
+    old_exp = payload.get("exp")
+    if old_exp:
+        add_to_token_blocklist(body.refresh_token, old_exp)
+
     access_token = create_access_token(
         user_id=str(user.id),
         username=user.username,
@@ -333,9 +339,10 @@ async def change_password(
 async def logout(
     request: Request,
     current_user: User = Depends(get_current_user),
+    body: LogoutRequest | None = None,
 ):
-    """Invalidate the current access token server-side."""
-    # Extract the raw token from the Authorization header
+    """Invalidate the current access token and optional refresh token."""
+    # Blocklist the access token from the Authorization header
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
@@ -343,4 +350,15 @@ async def logout(
         exp = payload.get("exp")
         if exp:
             add_to_token_blocklist(token, exp)
+
+    # Blocklist the refresh token if the client sent it
+    if body and body.refresh_token:
+        try:
+            r_payload = verify_token(body.refresh_token, allow_refresh=True)
+            r_exp = r_payload.get("exp")
+            if r_exp:
+                add_to_token_blocklist(body.refresh_token, r_exp)
+        except HTTPException:
+            pass  # Token already expired or invalid — nothing to blocklist
+
     return None

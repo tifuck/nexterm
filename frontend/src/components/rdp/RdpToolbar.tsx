@@ -5,9 +5,11 @@ import {
   MoreVertical, Shield, AppWindow, Camera,
   ArrowLeftRight, XCircle, ClipboardPaste, ClipboardCopy,
   Shrink, Expand, StretchHorizontal, WandSparkles,
+  LogOut,
 } from 'lucide-react';
 import { getGuacEntry, applyScaleMode } from './RdpViewer';
 import type { ScaleMode } from './RdpViewer';
+import { useTabStore } from '@/store/tabStore';
 
 // ---------------------------------------------------------------------------
 // X11 keysyms used for special key combos
@@ -51,7 +53,11 @@ export const RdpToolbar: React.FC<RdpToolbarProps> = ({ tabId, protocol }) => {
   const [scaleMode, setScaleMode] = useState<ScaleMode>(() => {
     return (localStorage.getItem(`rdp_scale_${tabId}`) as ScaleMode) || 'fit';
   });
+  const [isFsBarVisible, setIsFsBarVisible] = useState(false);
   const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fsBarHideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fsBarShowTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ---- Responsive ----
   useEffect(() => {
@@ -62,15 +68,29 @@ export const RdpToolbar: React.FC<RdpToolbarProps> = ({ tabId, protocol }) => {
   }, []);
 
   // ---- Visibility ----
-  const showToolbar = useCallback(() => {
+  const showToolbar = useCallback((delay = 0) => {
+    if (showTimeoutRef.current) {
+      clearTimeout(showTimeoutRef.current);
+      showTimeoutRef.current = null;
+    }
     if (hideTimeoutRef.current) {
       clearTimeout(hideTimeoutRef.current);
       hideTimeoutRef.current = null;
     }
-    setIsVisible(true);
+    if (delay > 0) {
+      showTimeoutRef.current = setTimeout(() => {
+        setIsVisible(true);
+      }, delay);
+    } else {
+      setIsVisible(true);
+    }
   }, []);
 
   const hideToolbar = useCallback(() => {
+    if (showTimeoutRef.current) {
+      clearTimeout(showTimeoutRef.current);
+      showTimeoutRef.current = null;
+    }
     hideTimeoutRef.current = setTimeout(() => {
       setIsVisible(false);
     }, 300);
@@ -78,6 +98,35 @@ export const RdpToolbar: React.FC<RdpToolbarProps> = ({ tabId, protocol }) => {
 
   const toggleToolbar = useCallback(() => {
     setIsVisible((v) => !v);
+  }, []);
+
+  // ---- Fullscreen center bar visibility ----
+  const showFsBar = useCallback((delay = 0) => {
+    if (fsBarShowTimeoutRef.current) {
+      clearTimeout(fsBarShowTimeoutRef.current);
+      fsBarShowTimeoutRef.current = null;
+    }
+    if (fsBarHideTimeoutRef.current) {
+      clearTimeout(fsBarHideTimeoutRef.current);
+      fsBarHideTimeoutRef.current = null;
+    }
+    if (delay > 0) {
+      fsBarShowTimeoutRef.current = setTimeout(() => {
+        setIsFsBarVisible(true);
+      }, delay);
+    } else {
+      setIsFsBarVisible(true);
+    }
+  }, []);
+
+  const hideFsBar = useCallback(() => {
+    if (fsBarShowTimeoutRef.current) {
+      clearTimeout(fsBarShowTimeoutRef.current);
+      fsBarShowTimeoutRef.current = null;
+    }
+    fsBarHideTimeoutRef.current = setTimeout(() => {
+      setIsFsBarVisible(false);
+    }, 300);
   }, []);
 
   // ---- Key combo helpers ----
@@ -207,6 +256,12 @@ export const RdpToolbar: React.FC<RdpToolbarProps> = ({ tabId, protocol }) => {
     }
   }, [tabId]);
 
+  // ---- Disconnect ----
+
+  const handleDisconnect = useCallback(() => {
+    useTabStore.getState().closeTab(tabId);
+  }, [tabId]);
+
   // ---- Fullscreen ----
 
   const handleToggleFullscreen = useCallback(() => {
@@ -223,6 +278,10 @@ export const RdpToolbar: React.FC<RdpToolbarProps> = ({ tabId, protocol }) => {
   useEffect(() => {
     const onFullscreenChange = () => {
       setIsFullscreen(!!document.fullscreenElement);
+      // Hide fs bar when leaving fullscreen
+      if (!document.fullscreenElement) {
+        setIsFsBarVisible(false);
+      }
     };
     document.addEventListener('fullscreenchange', onFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
@@ -232,17 +291,17 @@ export const RdpToolbar: React.FC<RdpToolbarProps> = ({ tabId, protocol }) => {
 
   return (
     <>
-      {/* Desktop: enlarged hover trigger zone - covers top-right corner */}
-      {!isMobile && (
+      {/* Desktop: enlarged hover trigger zone - covers top-right corner (hidden in fullscreen) */}
+      {!isMobile && !isFullscreen && (
         <div
           className="absolute top-0 right-0 w-48 h-12 z-10"
-          onMouseEnter={showToolbar}
+          onMouseEnter={() => showToolbar(1000)}
           onMouseLeave={hideToolbar}
         />
       )}
 
       {/* Mobile: always-visible toggle button */}
-      {isMobile && (
+      {isMobile && !isFullscreen && (
         <button
           onClick={toggleToolbar}
           className="absolute top-1.5 right-1.5 z-30 p-1.5 rounded-md transition-colors"
@@ -252,10 +311,10 @@ export const RdpToolbar: React.FC<RdpToolbarProps> = ({ tabId, protocol }) => {
         </button>
       )}
 
-      {/* Toolbar */}
-      <div
+      {/* Toolbar (hidden in fullscreen — replaced by center bar) */}
+      {!isFullscreen && <div
         className={`absolute ${isMobile ? 'top-9' : 'top-2'} right-2 z-20 flex flex-col items-end gap-1`}
-        onMouseEnter={isMobile ? undefined : showToolbar}
+        onMouseEnter={isMobile ? undefined : () => showToolbar(0)}
         onMouseLeave={isMobile ? undefined : hideToolbar}
       >
         <div
@@ -303,7 +362,61 @@ export const RdpToolbar: React.FC<RdpToolbarProps> = ({ tabId, protocol }) => {
             onClick={handleToggleFullscreen}
           />
         </div>
-      </div>
+      </div>}
+
+      {/* Fullscreen center bar — only shown in fullscreen mode */}
+      {isFullscreen && (
+        <>
+          {/* Invisible hover trigger zone — top center strip */}
+          <div
+            className="absolute top-0 left-1/2 -translate-x-1/2 w-80 h-8 z-40"
+            onMouseEnter={() => showFsBar(1000)}
+            onMouseLeave={hideFsBar}
+          />
+
+          {/* Floating center bar */}
+          <div
+            className={`absolute top-2 left-1/2 -translate-x-1/2 z-50 transition-all duration-200 ${
+              isFsBarVisible ? 'opacity-100 translate-y-0' : 'opacity-0 -translate-y-1 pointer-events-none'
+            }`}
+            onMouseEnter={() => showFsBar(0)}
+            onMouseLeave={hideFsBar}
+          >
+            <div
+              className="flex items-center gap-0.5 rounded-2xl px-2 py-1"
+              style={{ backgroundColor: 'rgba(15, 20, 25, 0.5)', backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.08)' }}
+            >
+              {/* Disconnect */}
+              <ToolbarButton icon={<LogOut size={14} />} title="Disconnect (exit RDP)" onClick={handleDisconnect} />
+
+              <div className="w-px h-4 mx-0.5" style={{ backgroundColor: 'rgba(255,255,255,0.1)' }} />
+
+              {/* Ctrl+Alt+Del */}
+              <ToolbarButton icon={<Shield size={14} />} title="Ctrl+Alt+Del" onClick={handleCtrlAltDel} />
+
+              <div className="w-px h-4 mx-0.5" style={{ backgroundColor: 'rgba(255,255,255,0.1)' }} />
+
+              {/* Scale modes */}
+              <ToolbarButton icon={<Shrink size={14} />} title="Fit (contain)" onClick={() => handleSetScaleMode('fit')} active={scaleMode === 'fit'} />
+              <ToolbarButton icon={<Expand size={14} />} title="Fill (cover)" onClick={() => handleSetScaleMode('fill')} active={scaleMode === 'fill'} />
+              <ToolbarButton icon={<StretchHorizontal size={14} />} title="Stretch" onClick={() => handleSetScaleMode('stretch')} active={scaleMode === 'stretch'} />
+              <ToolbarButton icon={<WandSparkles size={14} />} title="Smart (auto)" onClick={() => handleSetScaleMode('smart')} active={scaleMode === 'smart'} />
+
+              <div className="w-px h-4 mx-0.5" style={{ backgroundColor: 'rgba(255,255,255,0.1)' }} />
+
+              {/* Zoom */}
+              <ToolbarButton icon={<ZoomIn size={14} />} title="Zoom In" onClick={handleZoomIn} />
+              <ToolbarButton icon={<ZoomOut size={14} />} title="Zoom Out" onClick={handleZoomOut} />
+              <ToolbarButton icon={<RotateCcw size={14} />} title="Reset Zoom" onClick={handleZoomReset} />
+
+              <div className="w-px h-4 mx-0.5" style={{ backgroundColor: 'rgba(255,255,255,0.1)' }} />
+
+              {/* Exit fullscreen */}
+              <ToolbarButton icon={<Minimize2 size={14} />} title="Exit Fullscreen" onClick={handleToggleFullscreen} />
+            </div>
+          </div>
+        </>
+      )}
     </>
   );
 };

@@ -167,17 +167,20 @@ export async function apiDelete<T = any>(path: string): Promise<T> {
   return request<T>('DELETE', path);
 }
 
+export interface UploadProgressEvent {
+  loaded: number;
+  total: number;
+  percent: number;
+}
+
 export async function apiUpload<T = any>(
   path: string,
   file: File,
   params?: Record<string, string>,
   retried = false,
+  onProgress?: (event: UploadProgressEvent) => void,
 ): Promise<T> {
   const token = getToken();
-  const headers: Record<string, string> = {};
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
 
   if (params) {
     const qs = new URLSearchParams(params);
@@ -188,6 +191,76 @@ export async function apiUpload<T = any>(
   const formData = new FormData();
   formData.append('file', file);
 
+  // Use XMLHttpRequest when a progress callback is provided so we can
+  // report upload progress.  Fall back to fetch when not needed.
+  if (onProgress) {
+    return new Promise<T>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${BASE_URL}${path}`);
+      if (token) {
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      }
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          onProgress({
+            loaded: e.loaded,
+            total: e.total,
+            percent: Math.round((e.loaded / e.total) * 100),
+          });
+        }
+      });
+
+      xhr.addEventListener('load', async () => {
+        if (xhr.status === 401 && !retried) {
+          const refreshed = await tryRefreshToken();
+          if (refreshed) {
+            try {
+              const result = await apiUpload<T>(path, file, undefined, true, onProgress);
+              resolve(result);
+            } catch (err) {
+              reject(err);
+            }
+            return;
+          }
+          localStorage.removeItem('token');
+          localStorage.removeItem('refresh_token');
+          window.location.href = '/login';
+          reject(new Error('Authentication expired'));
+          return;
+        }
+
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText));
+          } catch {
+            resolve(xhr.responseText as unknown as T);
+          }
+        } else {
+          let errorMessage = `Upload failed: ${xhr.status}`;
+          try {
+            const errorData = JSON.parse(xhr.responseText);
+            errorMessage = errorData.detail || errorData.message || errorMessage;
+          } catch {
+            // couldn't parse error body
+          }
+          reject(new Error(errorMessage));
+        }
+      });
+
+      xhr.addEventListener('error', () => reject(new Error('Upload failed: network error')));
+      xhr.addEventListener('abort', () => reject(new Error('Upload cancelled')));
+
+      xhr.send(formData);
+    });
+  }
+
+  // No progress callback — use simpler fetch API
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
   const response = await fetch(`${BASE_URL}${path}`, {
     method: 'POST',
     headers,
@@ -197,7 +270,7 @@ export async function apiUpload<T = any>(
   if (response.status === 401 && !retried) {
     const refreshed = await tryRefreshToken();
     if (refreshed) {
-      return apiUpload<T>(path, file, params, true);
+      return apiUpload<T>(path, file, params, true, onProgress);
     }
     localStorage.removeItem('token');
     localStorage.removeItem('refresh_token');

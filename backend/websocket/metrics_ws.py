@@ -71,7 +71,10 @@ async def metrics_websocket_handler(
                 msg = json.loads(raw)
                 msg_type = msg.get("type", "")
                 
-                if msg_type == "auth" and not user_id:
+                if msg_type == "auth":
+                    if user_id:
+                        await websocket.send_json({"type": "error", "message": "Already authenticated"})
+                        continue
                     try:
                         payload = verify_token(msg.get("token", ""))
                         user_id = payload.get("sub")
@@ -84,9 +87,13 @@ async def metrics_websocket_handler(
                     conn = await ssh_proxy.get_connection(conn_id)
                     if conn and conn.user_id == user_id:
                         connection_id = conn_id
-                        # Cancel existing task
+                        # Cancel existing task and wait for it to finish
                         if metrics_task and not metrics_task.done():
                             metrics_task.cancel()
+                            try:
+                                await asyncio.wait_for(metrics_task, timeout=2)
+                            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                                pass
                         metrics_task = asyncio.create_task(
                             _collect_metrics(websocket, connection_id)
                         )
@@ -96,6 +103,10 @@ async def metrics_websocket_handler(
                 elif msg_type == "unsubscribe":
                     if metrics_task and not metrics_task.done():
                         metrics_task.cancel()
+                        try:
+                            await asyncio.wait_for(metrics_task, timeout=2)
+                        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                            pass
                     connection_id = None
                 
                 elif msg_type == "ping":
@@ -108,6 +119,10 @@ async def metrics_websocket_handler(
     finally:
         if metrics_task and not metrics_task.done():
             metrics_task.cancel()
+            try:
+                await asyncio.wait_for(metrics_task, timeout=2)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
 
 
 METRICS_SCRIPT = r"""
@@ -289,6 +304,8 @@ async def _collect_metrics(websocket: WebSocket, connection_id: str):
                         await websocket.send_json({"type": "metrics", "data": data})
                     else:
                         await websocket.send_json({"type": "error", "message": data["error"]})
+            except WebSocketDisconnect:
+                break
             except Exception as e:
                 logger.debug(f"Metrics collection error: {e}")
             

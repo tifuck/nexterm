@@ -6,12 +6,12 @@ from pydantic import BaseModel, Field
 
 class ImportedSession(BaseModel):
     """A single parsed session from an import file."""
-    name: str
-    session_type: str = "ssh"
-    host: str
-    port: int = 22
-    username: Optional[str] = None
-    folder_path: Optional[str] = None  # e.g. "Production/Web Servers"
+    name: str = Field(..., min_length=1, max_length=255)
+    session_type: str = Field(default="ssh", max_length=10)
+    host: str = Field(..., min_length=1, max_length=255)
+    port: int = Field(default=22, ge=1, le=65535)
+    username: Optional[str] = Field(default=None, max_length=255)
+    folder_path: Optional[str] = Field(default=None, max_length=1024)  # e.g. "Production/Web Servers"
 
 
 class ImportResult(BaseModel):

@@ -189,6 +189,6 @@ def decrypt_sensitive(stored: str | None) -> str | None:
         except Exception:
             logger.error("Failed to decrypt credential value (neither Fernet nor legacy base64)")
             return None
-    except Exception:
-        logger.error("Unexpected error decrypting credential value")
+    except Exception as e:
+        logger.error("Unexpected error decrypting credential value: %s: %s", type(e).__name__, e)
         return None

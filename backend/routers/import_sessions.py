@@ -45,6 +45,12 @@ async def preview_import(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    if len(sessions) > MAX_IMPORT_SESSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File contains {len(sessions)} sessions, maximum is {MAX_IMPORT_SESSIONS}",
+        )
+
     return ImportPreview(
         format_detected=fmt,
         sessions=sessions,
@@ -73,6 +79,12 @@ async def import_sessions(
         parsed_sessions, warnings, fmt = parse_sessions(filename, content)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    if len(parsed_sessions) > MAX_IMPORT_SESSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File contains {len(parsed_sessions)} sessions, maximum is {MAX_IMPORT_SESSIONS}",
+        )
 
     if not parsed_sessions:
         return ImportResult(warnings=warnings)
@@ -174,9 +186,18 @@ async def import_sessions(
     )
 
 
+MAX_IMPORT_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_IMPORT_SESSIONS = 1000
+
+
 async def _read_upload(file: UploadFile) -> str:
     """Read and decode an uploaded file."""
-    raw = await file.read()
+    raw = await file.read(MAX_IMPORT_FILE_SIZE + 1)
+    if len(raw) > MAX_IMPORT_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Import file too large. Maximum size is {MAX_IMPORT_FILE_SIZE // (1024 * 1024)} MB",
+        )
 
     # Try UTF-8 first, fall back to latin-1 (covers Windows-1252/CP1252)
     for encoding in ("utf-8", "latin-1"):

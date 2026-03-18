@@ -278,8 +278,11 @@ async def ssh_websocket_handler(
 
             msg_type = msg.get("type", "")
 
-            # Auth message
+            # Auth message — only allowed before a connection is established.
             if msg_type == "auth":
+                if connection_id:
+                    await websocket.send_json({"type": "error", "message": "Already connected, re-authentication not allowed"})
+                    continue
                 try:
                     payload = verify_token(msg.get("token", ""))
                     user_id = payload.get("sub")
@@ -640,6 +643,10 @@ async def ssh_websocket_handler(
                     queue, subscription_id = await ssh_proxy.subscribe(connection_id)
                     if forward_task and not forward_task.done():
                         forward_task.cancel()
+                        try:
+                            await asyncio.wait_for(forward_task, timeout=2)
+                        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                            pass
                     forward_task = asyncio.create_task(
                         _forward_ssh_to_ws(queue, websocket, connection_id, ssh_proxy)
                     )
@@ -695,9 +702,13 @@ async def ssh_websocket_handler(
     except Exception as e:
         logger.error(f"SSH WebSocket error: {e}")
     finally:
-        # Cancel the forwarding task.
+        # Cancel the forwarding task and wait for it to finish.
         if forward_task and not forward_task.done():
             forward_task.cancel()
+            try:
+                await asyncio.wait_for(forward_task, timeout=2)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
 
         # Unsubscribe this specific WebSocket's subscription from IPC
         # streaming but keep the SSH session alive for potential

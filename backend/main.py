@@ -1,4 +1,5 @@
 """Main FastAPI application entry point."""
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -79,10 +80,25 @@ async def lifespan(app: FastAPI):
         logger.info("guacd enabled at %s:%d (RDP/VNC support active)", config.guacd_host, config.guacd_port)
     else:
         logger.info("guacd disabled — RDP/VNC connections will be unavailable")
-    
+
+    # Background task: periodically purge expired token revocations from DB.
+    from backend.middleware.auth import purge_expired_revocations
+
+    async def _purge_loop() -> None:
+        while True:
+            await asyncio.sleep(3600)  # every hour
+            await purge_expired_revocations()
+
+    purge_task = asyncio.create_task(_purge_loop())
+
     yield
     
     # Shutdown
+    purge_task.cancel()
+    try:
+        await purge_task
+    except asyncio.CancelledError:
+        pass
     await ssh_proxy.close()
     await close_db()
     logger.info(f"{config.app_name} stopped")

@@ -21,7 +21,7 @@ import {
   Music,
   FileType,
 } from 'lucide-react';
-import { apiGet, apiDelete, apiPost, apiUpload } from '@/api/client';
+import { apiGet, apiDelete, apiPost, apiUpload, UploadProgressEvent } from '@/api/client';
 import { useTabStore } from '@/store/tabStore';
 import { useSidebarStore } from '@/store/sidebarStore';
 import { useToastStore } from '@/store/toastStore';
@@ -553,6 +553,8 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
   const [error, setError] = useState<string | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{ file: string; percent: number } | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<{ file: string; percent: number } | null>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
   const addToast = useToastStore((s) => s.addToast);
 
@@ -748,18 +750,42 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
   const handleDownload = useCallback((path: string, filename: string) => {
     const token = localStorage.getItem('token');
     const url = `/api/sftp/${connectionId}/download?path=${encodeURIComponent(path)}`;
-    // Create a temporary link with auth
-    const a = document.createElement('a');
-    // We need to fetch with auth header, then trigger download
+
+    setDownloadProgress({ file: filename, percent: 0 });
+
     fetch(url, {
       headers: { Authorization: `Bearer ${token}` },
     })
-      .then((res) => {
+      .then(async (res) => {
         if (!res.ok) throw new Error('Download failed');
+
+        // Use ReadableStream to track download progress when Content-Length is available.
+        const contentLength = res.headers.get('Content-Length');
+        if (contentLength && res.body) {
+          const total = parseInt(contentLength, 10);
+          const reader = res.body.getReader();
+          const chunks: ArrayBuffer[] = [];
+          let loaded = 0;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+            loaded += value.length;
+            const percent = total > 0 ? Math.round((loaded / total) * 100) : 0;
+            setDownloadProgress({ file: filename, percent });
+          }
+
+          const blob = new Blob(chunks);
+          return blob;
+        }
+
+        // Fallback: no Content-Length header
         return res.blob();
       })
       .then((blob) => {
         const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
         a.href = blobUrl;
         a.download = filename;
         document.body.appendChild(a);
@@ -769,6 +795,9 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
       })
       .catch((err) => {
         addToast(err instanceof Error ? err.message : 'Download failed', 'error');
+      })
+      .finally(() => {
+        setDownloadProgress(null);
       });
   }, [connectionId, addToast]);
 
@@ -808,10 +837,15 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
 
       for (const file of files) {
         try {
+          setUploadProgress({ file: file.name, percent: 0 });
           await apiUpload(
             `/api/sftp/${connectionId}/upload`,
             file,
-            { path: currentPathRef.current }
+            { path: currentPathRef.current },
+            false,
+            (event: UploadProgressEvent) => {
+              setUploadProgress({ file: file.name, percent: event.percent });
+            },
           );
           successCount++;
         } catch {
@@ -820,6 +854,7 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
       }
 
       setIsUploading(false);
+      setUploadProgress(null);
 
       if (successCount > 0) {
         addToast(`Uploaded ${successCount} file${successCount > 1 ? 's' : ''}`, 'success');
@@ -1009,12 +1044,30 @@ export const SftpBrowser: React.FC<SftpBrowserProps> = ({ connectionId }) => {
         </div>
       )}
 
-      {/* Upload progress overlay */}
-      {isUploading && (
+      {/* Upload/download progress overlay */}
+      {(isUploading || downloadProgress) && (
         <div className="absolute inset-0 bg-black/30 z-20 flex items-center justify-center rounded">
-          <div className="flex flex-col items-center gap-2">
-            <Loader2 size={24} className="text-[var(--accent)] animate-spin" />
-            <span className="text-xs text-[var(--text-primary)] font-medium">Uploading...</span>
+          <div className="flex flex-col items-center gap-2 bg-[var(--bg-primary)] px-6 py-4 rounded-lg shadow-lg min-w-[200px]">
+            <Loader2 size={20} className="text-[var(--accent)] animate-spin" />
+            <span className="text-xs text-[var(--text-primary)] font-medium">
+              {downloadProgress ? 'Downloading...' : 'Uploading...'}
+            </span>
+            {(uploadProgress || downloadProgress) && (
+              <>
+                <span className="text-[10px] text-[var(--text-muted)] truncate max-w-[180px]">
+                  {(uploadProgress || downloadProgress)!.file}
+                </span>
+                <div className="w-full bg-[var(--bg-secondary)] rounded-full h-1.5 mt-1">
+                  <div
+                    className="bg-[var(--accent)] h-1.5 rounded-full transition-all duration-200"
+                    style={{ width: `${(uploadProgress || downloadProgress)!.percent}%` }}
+                  />
+                </div>
+                <span className="text-[10px] text-[var(--text-muted)]">
+                  {(uploadProgress || downloadProgress)!.percent}%
+                </span>
+              </>
+            )}
           </div>
         </div>
       )}

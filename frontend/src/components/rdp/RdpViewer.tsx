@@ -691,10 +691,10 @@ export const RdpViewer: React.FC<RdpViewerProps> = ({
         </div>
       )}
 
-      {/* Guacamole display container */}
+      {/* Guacamole display container — z-0 keeps it below toolbar overlays */}
       <div
         ref={containerRef}
-        className="w-full h-full flex items-center justify-center"
+        className="relative z-0 w-full h-full flex items-center justify-center"
         style={{ cursor: isConnected ? 'none' : 'default' }}
       />
 

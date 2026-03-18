@@ -107,8 +107,15 @@ async def import_mobaxterm(
     db: AsyncSession = Depends(get_db),
 ):
     """Import sessions from MobaXterm .mxtsessions file."""
+    MAX_IMPORT_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
     try:
-        content = await file.read()
+        content = await file.read(MAX_IMPORT_FILE_SIZE + 1)
+        if len(content) > MAX_IMPORT_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Import file too large. Maximum size is {MAX_IMPORT_FILE_SIZE // (1024 * 1024)} MB",
+            )
         text = content.decode("utf-8", errors="replace")
         
         parsed_sessions = parse_mobaxterm_sessions(text)

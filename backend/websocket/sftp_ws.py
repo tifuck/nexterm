@@ -61,7 +61,10 @@ async def sftp_progress_handler(
                 raw = await websocket.receive_text()
                 msg = json.loads(raw)
                 
-                if msg.get("type") == "auth" and not user_id:
+                if msg.get("type") == "auth":
+                    if user_id:
+                        await websocket.send_json({"type": "error", "message": "Already authenticated"})
+                        continue
                     try:
                         payload = verify_token(msg.get("token", ""))
                         user_id = payload.get("sub")
@@ -76,3 +79,5 @@ async def sftp_progress_handler(
                 break
     except Exception as e:
         logger.error(f"SFTP progress WS error: {e}")
+    finally:
+        logger.debug("SFTP progress WS closed for user %s", user_id)

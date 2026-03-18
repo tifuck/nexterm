@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   Search,
   X,
@@ -37,6 +37,9 @@ const Sidebar: React.FC = () => {
   const { isLoading, fetchSessions, fetchFolders, createFolder } = useSessionStore();
   const [showNewSession, setShowNewSession] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [searchExpanded, setSearchExpanded] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchContainerRef = useRef<HTMLDivElement>(null);
 
   const handleSessionCreated = useCallback(() => {
     setShowNewSession(false);
@@ -71,6 +74,27 @@ const Sidebar: React.FC = () => {
     fetchFolders().catch(() => {});
   }, [fetchSessions, fetchFolders]);
 
+  // Auto-focus search input when expanded
+  useEffect(() => {
+    if (searchExpanded && searchInputRef.current) {
+      searchInputRef.current.focus();
+    }
+  }, [searchExpanded]);
+
+  // Click-outside to collapse search (only if query is empty)
+  useEffect(() => {
+    if (!searchExpanded) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (searchContainerRef.current && !searchContainerRef.current.contains(e.target as Node)) {
+        if (!searchQuery) {
+          setSearchExpanded(false);
+        }
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [searchExpanded, searchQuery]);
+
   return (
     <div
       className="flex flex-col h-full bg-[var(--bg-secondary)] shrink-0 overflow-hidden"
@@ -78,47 +102,73 @@ const Sidebar: React.FC = () => {
     >
       {/* Sessions panel — always mounted, hidden via display */}
       <div className="flex flex-col flex-1 min-h-0" style={{ display: activePanel === 'sessions' ? 'flex' : 'none' }}>
-        {/* Search + New Session */}
-        <div className="flex items-center gap-1 p-2 border-b border-[var(--border)] shrink-0">
-          <div className="flex items-center flex-1 gap-1.5 px-2 py-1 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] focus-within:border-[var(--accent)] transition-colors">
-            <Search size={13} className="text-[var(--text-muted)] shrink-0" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search sessions..."
-              className="flex-1 bg-transparent text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none"
-            />
-            {searchQuery && (
+        {/* Search + Action Buttons */}
+        <div className="flex items-center gap-0.5 px-2 border-b border-[var(--border)] shrink-0 min-h-[28px]">
+          {searchExpanded ? (
+            /* Expanded: full-width search input */
+            <div
+              ref={searchContainerRef}
+              className="flex items-center flex-1 gap-1.5 px-2 py-0.5 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] focus-within:border-[var(--accent)] transition-colors"
+            >
+              <Search size={13} className="text-[var(--text-muted)] shrink-0" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    setSearchQuery('');
+                    setSearchExpanded(false);
+                  }
+                }}
+                placeholder="Search sessions..."
+                className="flex-1 bg-transparent text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] outline-none min-w-0"
+              />
               <button
-                onClick={() => setSearchQuery('')}
-                className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  setSearchQuery('');
+                  setSearchExpanded(false);
+                }}
+                className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors shrink-0"
               >
                 <X size={12} />
               </button>
-            )}
-          </div>
-          <button
-            onClick={handleNewFolder}
-            className="flex items-center justify-center w-7 h-7 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors shrink-0 active:scale-90"
-            title="New folder"
-          >
-            <FolderPlus size={14} />
-          </button>
-          <button
-            onClick={() => setShowImport(true)}
-            className="flex items-center justify-center w-7 h-7 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors shrink-0 active:scale-90"
-            title="Import sessions"
-          >
-            <Upload size={14} />
-          </button>
-          <button
-            onClick={() => setShowNewSession(true)}
-            className="flex items-center justify-center w-7 h-7 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors shrink-0 active:scale-90"
-            title="New session"
-          >
-            <Plus size={15} />
-          </button>
+            </div>
+          ) : (
+            /* Collapsed: icon buttons only */
+            <>
+              <button
+                onClick={() => setSearchExpanded(true)}
+                className="flex items-center justify-center w-7 h-7 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors shrink-0 active:scale-90"
+                title="Search sessions"
+              >
+                <Search size={14} />
+              </button>
+              <button
+                onClick={handleNewFolder}
+                className="flex items-center justify-center w-7 h-7 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors shrink-0 active:scale-90"
+                title="New folder"
+              >
+                <FolderPlus size={14} />
+              </button>
+              <button
+                onClick={() => setShowImport(true)}
+                className="flex items-center justify-center w-7 h-7 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors shrink-0 active:scale-90"
+                title="Import sessions"
+              >
+                <Upload size={14} />
+              </button>
+              <button
+                onClick={() => setShowNewSession(true)}
+                className="flex items-center justify-center w-7 h-7 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors shrink-0 active:scale-90"
+                title="New session"
+              >
+                <Plus size={15} />
+              </button>
+            </>
+          )}
         </div>
 
         {/* Session browser */}

@@ -150,14 +150,27 @@ class SFTPService:
 
         return content
 
-    async def write_file(self, connection_id: str, path: str, content: bytes) -> None:
+    async def write_file(
+        self,
+        connection_id: str,
+        path: str,
+        content: bytes,
+        max_size: int = DEFAULT_MAX_FILE_SIZE,
+    ) -> None:
         """Write content to a remote file.
 
         Args:
             connection_id: The SFTP session identifier.
             path: Remote file path.
             content: Bytes to write.
+            max_size: Maximum allowed content size in bytes.
         """
+        if len(content) > max_size:
+            raise ValueError(
+                f"Content size {len(content)} exceeds maximum allowed "
+                f"size of {max_size} bytes"
+            )
+
         client = self._get_client(connection_id)
 
         async with client.open(path, "wb") as f:

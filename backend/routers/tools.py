@@ -2586,11 +2586,37 @@ async def package_action(
     if request.custom_command:
         if request.action != "install":
             raise HTTPException(status_code=400, detail="Custom commands only support install action")
-        # Whitelist: only allow commands starting with known safe prefixes
+        # Whitelist: only allow commands starting with known safe prefixes.
+        # After the prefix, sanitize the arguments to prevent injection.
+        import shlex
         allowed_prefixes = ("curl -fsSL ", "npm install ", "npx ")
-        if not any(request.custom_command.startswith(p) for p in allowed_prefixes):
+        matched_prefix = None
+        for p in allowed_prefixes:
+            if request.custom_command.startswith(p):
+                matched_prefix = p
+                break
+        if not matched_prefix:
             raise HTTPException(status_code=400, detail="Custom command not allowed")
-        cmd = f"{request.custom_command} 2>&1; echo EXIT:$?"
+        raw_args = request.custom_command[len(matched_prefix):]
+        # For curl, allow piping to bash (common pattern: curl -fsSL url | bash)
+        if matched_prefix == "curl -fsSL ":
+            pipe_parts = raw_args.split(" | ", 1)
+            safe_url = shlex.quote(pipe_parts[0].strip())
+            if len(pipe_parts) > 1:
+                pipe_target = pipe_parts[1].strip()
+                if pipe_target not in ("bash", "sh", "sudo bash", "sudo sh"):
+                    raise HTTPException(status_code=400, detail="Custom command pipe target not allowed")
+                cmd = f"curl -fsSL {safe_url} | {pipe_target} 2>&1; echo EXIT:$?"
+            else:
+                cmd = f"curl -fsSL {safe_url} 2>&1; echo EXIT:$?"
+        else:
+            # npm install / npx — quote each argument
+            try:
+                args = shlex.split(raw_args)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid command arguments")
+            safe_args = " ".join(shlex.quote(a) for a in args)
+            cmd = f"{matched_prefix}{safe_args} 2>&1; echo EXIT:$?"
         result = await ssh_proxy.run_command(connection_id, cmd, timeout=180)
         stdout = result.get("stdout", "")
         stderr = result.get("stderr", "")
@@ -2771,11 +2797,23 @@ async def check_custom_packages(
     allowed_prefixes = ("which ", "command -v ")
     installed: dict[str, bool] = {}
 
+    import shlex
     for item in request.checks:
-        if not any(item.check_cmd.startswith(p) for p in allowed_prefixes):
+        matched_prefix = None
+        for p in allowed_prefixes:
+            if item.check_cmd.startswith(p):
+                matched_prefix = p
+                break
+        if not matched_prefix:
             installed[item.name] = False
             continue
-        cmd = f"{item.check_cmd} >/dev/null 2>&1 && echo FOUND || echo NOTFOUND"
+        # Extract the argument after the prefix and sanitize it
+        raw_arg = item.check_cmd[len(matched_prefix):].strip()
+        if not raw_arg or " " in raw_arg:
+            installed[item.name] = False
+            continue
+        safe_arg = shlex.quote(raw_arg)
+        cmd = f"{matched_prefix}{safe_arg} >/dev/null 2>&1 && echo FOUND || echo NOTFOUND"
         result = await ssh_proxy.run_command(connection_id, cmd, timeout=5)
         stdout = result.get("stdout", "").strip()
         installed[item.name] = "FOUND" in stdout

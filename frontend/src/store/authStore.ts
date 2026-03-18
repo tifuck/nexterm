@@ -191,8 +191,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   logout: () => {
     stopTokenRefresh();
-    // Invalidate the token server-side (best-effort, don't block on failure)
-    apiPost('/api/auth/logout').catch(() => {});
+    // Invalidate the access + refresh tokens server-side (best-effort)
+    const refreshToken = localStorage.getItem('refresh_token');
+    apiPost('/api/auth/logout', { refresh_token: refreshToken }).catch(() => {});
     localStorage.removeItem('token');
     localStorage.removeItem('refresh_token');
     clearKeyMaterial();

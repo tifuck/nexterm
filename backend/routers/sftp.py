@@ -40,9 +40,11 @@ async def get_home_directory(
         await ssh_proxy.sftp_open(connection_id)
         home = await ssh_proxy.sftp_home(connection_id)
         return {"path": home}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"SFTP home directory error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to get home directory")
 
 
 @router.get("/{connection_id}/ls")
@@ -58,9 +60,11 @@ async def list_directory(
         await ssh_proxy.sftp_open(connection_id)
         entries = await ssh_proxy.sftp_ls(connection_id, path)
         return {"path": path, "entries": entries}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"SFTP ls error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to list directory")
 
 
 @router.get("/{connection_id}/stat")
@@ -76,8 +80,11 @@ async def stat_file(
         await ssh_proxy.sftp_open(connection_id)
         info = await ssh_proxy.sftp_stat(connection_id, path)
         return info
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"SFTP stat error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get file info")
 
 
 @router.get("/{connection_id}/download")
@@ -98,10 +105,16 @@ async def download_file(
         return StreamingResponse(
             iter([content]),
             media_type="application/octet-stream",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(content)),
+            },
         )
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"SFTP download error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to download file")
 
 
 # ---------------------------------------------------------------------------
@@ -200,8 +213,10 @@ async def upload_file(
     """Upload a file via SFTP."""
     await _verify_connection(connection_id, current_user)
 
-    # Enforce a maximum upload size (100 MB) to prevent memory exhaustion.
-    MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
+    # Enforce a maximum upload size.  File content is base64-encoded when
+    # sent over the IPC channel (16 MB limit), so the effective maximum
+    # file size is ~10 MB after encoding overhead.
+    MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB
 
     try:
         await ssh_proxy.sftp_open(connection_id)
@@ -221,8 +236,11 @@ async def upload_file(
         dest_path = f"{path.rstrip('/')}/{filename}"
         await ssh_proxy.sftp_write(connection_id, dest_path, content)
         return {"message": "File uploaded", "path": dest_path, "size": len(content)}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"SFTP upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload file")
 
 
 @router.post("/{connection_id}/save")
@@ -243,8 +261,11 @@ async def save_file(
         content = body["content"].encode("utf-8")
         await ssh_proxy.sftp_write(connection_id, path, content)
         return {"message": "File saved", "path": path, "size": len(content)}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"SFTP save error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save file")
 
 
 @router.post("/{connection_id}/mkdir")
@@ -260,8 +281,11 @@ async def make_directory(
         await ssh_proxy.sftp_open(connection_id)
         await ssh_proxy.sftp_mkdir(connection_id, path)
         return {"message": "Directory created", "path": path}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"SFTP mkdir error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create directory")
 
 
 @router.post("/{connection_id}/rename")
@@ -280,8 +304,11 @@ async def rename_item(
         await ssh_proxy.sftp_open(connection_id)
         await ssh_proxy.sftp_rename(connection_id, body["old_path"], body["new_path"])
         return {"message": "Renamed", "old_path": body["old_path"], "new_path": body["new_path"]}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"SFTP rename error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to rename")
 
 
 @router.delete("/{connection_id}/rm")
@@ -297,8 +324,11 @@ async def remove_item(
         await ssh_proxy.sftp_open(connection_id)
         await ssh_proxy.sftp_remove(connection_id, path)
         return {"message": "Deleted", "path": path}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"SFTP delete error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete")
 
 
 @router.post("/{connection_id}/chmod")
@@ -318,5 +348,8 @@ async def change_permissions(
         mode = int(str(body["mode"]), 8) if isinstance(body["mode"], str) else body["mode"]
         await ssh_proxy.sftp_chmod(connection_id, body["path"], mode)
         return {"message": "Permissions changed", "path": body["path"], "mode": oct(mode)}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"SFTP chmod error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to change permissions")

@@ -6,12 +6,7 @@ import re
 from xml.etree.ElementTree import ParseError
 from typing import Optional
 
-try:
-    from defusedxml import ElementTree as ET
-except ImportError:
-    # defusedxml is the preferred choice for safe XML parsing.
-    # Fall back to stdlib with a secure parser that disables external entities.
-    import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET  # mandatory for safe XML parsing
 
 from backend.schemas.import_session import ImportedSession
 

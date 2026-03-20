@@ -7,12 +7,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import WebSocket, WebSocketDisconnect, Query
+from fastapi import WebSocket, WebSocketDisconnect
 from sqlalchemy import select, and_
 
 from backend.config import config
 from backend.database import async_session_factory
-from backend.middleware.auth import verify_token
+from backend.middleware.auth import get_user_from_token
 from backend.models.known_host import KnownHost
 from backend.models.session import SavedSession
 from backend.services.ssh_proxy import ssh_proxy
@@ -187,7 +187,6 @@ async def _attempt_connect(
 
 async def ssh_websocket_handler(
     websocket: WebSocket,
-    token: str = Query(default=None, deprecated=True),
 ):
     """Handle SSH terminal WebSocket connections.
 
@@ -225,41 +224,26 @@ async def ssh_websocket_handler(
     cached_known_keys: list[dict] = []
 
     try:
-        # Authenticate via query token (deprecated) or first message
-        if token:
-            try:
-                payload = verify_token(token)
-                user_id = payload.get("sub")
-                username = payload.get("username")
-            except Exception:
-                await websocket.send_json({"type": "error", "message": "Invalid authentication token"})
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+            msg = json.loads(raw)
+            if msg.get("type") == "auth":
+                payload, user = await get_user_from_token(msg.get("token", ""))
+                user_id = str(user.id)
+                username = payload.get("username") or user.username
+                await websocket.send_json({"type": "authenticated", "username": username})
+            else:
+                await websocket.send_json({"type": "error", "message": "Authentication required as first message"})
                 await websocket.close(code=4001)
                 return
-
-        # If not authenticated via query param, enforce a 10-second auth
-        # timeout to prevent unauthenticated connections from holding
-        # server resources indefinitely.
-        if not user_id:
-            try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
-                msg = json.loads(raw)
-                if msg.get("type") == "auth":
-                    payload = verify_token(msg.get("token", ""))
-                    user_id = payload.get("sub")
-                    username = payload.get("username")
-                    await websocket.send_json({"type": "authenticated", "username": username})
-                else:
-                    await websocket.send_json({"type": "error", "message": "Authentication required as first message"})
-                    await websocket.close(code=4001)
-                    return
-            except asyncio.TimeoutError:
-                await websocket.send_json({"type": "error", "message": "Authentication timeout"})
-                await websocket.close(code=4001)
-                return
-            except Exception:
-                await websocket.send_json({"type": "error", "message": "Authentication failed"})
-                await websocket.close(code=4001)
-                return
+        except asyncio.TimeoutError:
+            await websocket.send_json({"type": "error", "message": "Authentication timeout"})
+            await websocket.close(code=4001)
+            return
+        except Exception:
+            await websocket.send_json({"type": "error", "message": "Authentication failed"})
+            await websocket.close(code=4001)
+            return
 
         # Main message loop
         while True:
@@ -284,9 +268,9 @@ async def ssh_websocket_handler(
                     await websocket.send_json({"type": "error", "message": "Already connected, re-authentication not allowed"})
                     continue
                 try:
-                    payload = verify_token(msg.get("token", ""))
-                    user_id = payload.get("sub")
-                    username = payload.get("username")
+                    payload, user = await get_user_from_token(msg.get("token", ""))
+                    user_id = str(user.id)
+                    username = payload.get("username") or user.username
                     await websocket.send_json({"type": "authenticated", "username": username})
                 except Exception:
                     await websocket.send_json({"type": "error", "message": "Authentication failed"})

@@ -20,6 +20,8 @@ import { PackageManager } from '../tools/PackageManager';
 import { DockerManager } from '../tools/DockerManager';
 import { WireGuardManager } from '../tools/WireGuardManager';
 import { CronManager } from '../tools/CronManager';
+import { JobCenter } from '../tools/JobCenter';
+import { AuditLogViewer } from '../tools/AuditLogViewer';
 
 const MOBILE_BREAKPOINT = 640; // matches Tailwind's 'sm'
 
@@ -136,6 +138,12 @@ const AppLayout: React.FC = () => {
       )}
       {toolsConnectionId && activeToolId === 'cron-manager' && (
         <CronManager connectionId={toolsConnectionId} />
+      )}
+      {toolsConnectionId && activeToolId === 'job-center' && (
+        <JobCenter connectionId={toolsConnectionId} />
+      )}
+      {toolsConnectionId && activeToolId === 'audit-log' && (
+        <AuditLogViewer connectionId={toolsConnectionId} />
       )}
     </div>
   );

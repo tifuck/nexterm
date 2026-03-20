@@ -18,7 +18,7 @@ type AIMode = null | 'command' | 'diagnose' | 'explain';
  * Manages AI interaction state (which panel is open, loading, results).
  */
 export const TerminalAIWrapper: React.FC<TerminalAIWrapperProps> = ({ tabId }) => {
-  const isFeatureEnabled = useAIStore((s) => s.isFeatureEnabled);
+  const isFeatureUsable = useAIStore((s) => s.isFeatureUsable);
 
   const [aiMode, setAIMode] = useState<AIMode>(null);
   const [aiContent, setAIContent] = useState<string | null>(null);
@@ -80,6 +80,49 @@ export const TerminalAIWrapper: React.FC<TerminalAIWrapperProps> = ({ tabId }) =
     return '';
   }, [tabId]);
 
+  const getRecentCommands = useCallback((limit = 8): string[] => {
+    const terminal = getTerminalInstance(tabId);
+    if (!terminal) return [];
+
+    const buffer = terminal.buffer.active;
+    const seen = new Set<string>();
+    const commands: string[] = [];
+    const start = Math.max(0, buffer.length - 300);
+
+    for (let i = buffer.length - 1; i >= start; i--) {
+      const line = buffer.getLine(i);
+      if (!line) continue;
+      const text = line.translateToString(true).trim();
+      const match = text.match(/(?:\$|#|>|%)\s+(.+)/);
+      if (!match) continue;
+      const command = match[1].trim();
+      if (!command || seen.has(command)) continue;
+      seen.add(command);
+      commands.push(command);
+      if (commands.length >= limit) break;
+    }
+
+    return commands.reverse();
+  }, [tabId]);
+
+  const getAIContext = useCallback((): string => {
+    const tab = useTabStore.getState().tabs.find((item) => item.id === tabId);
+    const parts: string[] = [];
+    parts.push(`Client OS: ${navigator.platform || 'unknown'}`);
+    if (tab?.type) {
+      parts.push(`Session type: ${tab.type}`);
+    }
+    if (tab?.meta?.host) {
+      const port = tab.meta.port ? `:${tab.meta.port}` : '';
+      parts.push(`Remote target: ${tab.meta.host}${port}`);
+    }
+    const lastCommand = getLastCommand();
+    if (lastCommand) {
+      parts.push(`Last command: ${lastCommand}`);
+    }
+    return parts.join('\n');
+  }, [tabId, getLastCommand]);
+
   // ---- AI Command ----
   const handleAICommand = useCallback(() => {
     if (aiMode === 'command') {
@@ -122,6 +165,7 @@ export const TerminalAIWrapper: React.FC<TerminalAIWrapperProps> = ({ tabId }) =
       const data = await apiPost<{ diagnosis: string }>('/api/ai/diagnose', {
         error_output: context,
         command: lastCmd || undefined,
+        context: getAIContext(),
       });
       setAIContent(data.diagnosis);
     } catch (err: unknown) {
@@ -164,9 +208,9 @@ export const TerminalAIWrapper: React.FC<TerminalAIWrapperProps> = ({ tabId }) =
   }, [aiMode, tabId, closeAI, getLastCommand]);
 
   // Feature availability
-  const cmdEnabled = isFeatureEnabled('command_generation');
-  const diagEnabled = isFeatureEnabled('error_diagnosis');
-  const explEnabled = isFeatureEnabled('command_explanation');
+  const cmdEnabled = isFeatureUsable('command_generation');
+  const diagEnabled = isFeatureUsable('error_diagnosis');
+  const explEnabled = isFeatureUsable('command_explanation');
 
   // Keyboard shortcuts (only active when this tab is focused)
   useEffect(() => {
@@ -220,6 +264,8 @@ export const TerminalAIWrapper: React.FC<TerminalAIWrapperProps> = ({ tabId }) =
         <AICommandPopup
           onInsert={handleInsertCommand}
           onClose={closeAI}
+          history={getRecentCommands(8)}
+          context={getAIContext()}
         />
       )}
 

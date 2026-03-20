@@ -8,13 +8,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import WebSocket, WebSocketDisconnect, Query
+from fastapi import WebSocket, WebSocketDisconnect
 from guacamole.client import GuacamoleClient
 from sqlalchemy import select
 
 from backend.config import config
 from backend.database import async_session_factory
-from backend.middleware.auth import verify_token
+from backend.middleware.auth import get_user_from_token
 from backend.models.session import SavedSession
 from backend.services.session_manager import session_manager
 
@@ -131,7 +131,6 @@ async def _ws_to_guacd(
 
 async def guacamole_websocket_handler(
     websocket: WebSocket,
-    token: str = Query(default=None, deprecated=True),
 ):
     """Handle RDP/VNC WebSocket connections via Apache Guacamole (guacd).
 
@@ -158,38 +157,25 @@ async def guacamole_websocket_handler(
     relay_task_w2g: asyncio.Task | None = None
 
     try:
-        # Authenticate via query token (deprecated)
-        if token:
-            try:
-                payload = verify_token(token)
-                user_id = payload.get("sub")
-                username = payload.get("username")
-            except Exception:
-                await websocket.send_json({"type": "error", "message": "Invalid authentication token"})
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+            msg = json.loads(raw)
+            if msg.get("type") == "auth":
+                payload, user = await get_user_from_token(msg.get("token", ""))
+                user_id = str(user.id)
+                username = payload.get("username") or user.username
+                await websocket.send_json({"type": "authenticated", "username": username})
+            else:
+                await websocket.send_json({"type": "error", "message": "Authentication required"})
                 await websocket.close(code=4001)
                 return
-
-        # Enforce auth timeout if not authenticated via query param
-        if not user_id:
-            try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
-                msg = json.loads(raw)
-                if msg.get("type") == "auth":
-                    payload = verify_token(msg.get("token", ""))
-                    user_id = payload.get("sub")
-                    username = payload.get("username")
-                    await websocket.send_json({"type": "authenticated", "username": username})
-                else:
-                    await websocket.send_json({"type": "error", "message": "Authentication required"})
-                    await websocket.close(code=4001)
-                    return
-            except asyncio.TimeoutError:
-                await websocket.close(code=4001)
-                return
-            except Exception:
-                await websocket.send_json({"type": "error", "message": "Authentication failed"})
-                await websocket.close(code=4001)
-                return
+        except asyncio.TimeoutError:
+            await websocket.close(code=4001)
+            return
+        except Exception:
+            await websocket.send_json({"type": "error", "message": "Authentication failed"})
+            await websocket.close(code=4001)
+            return
 
         # Phase 1: JSON message loop — wait for connect messages
         while True:
@@ -208,9 +194,9 @@ async def guacamole_websocket_handler(
             # Auth message (fallback if token not in query)
             if msg_type == "auth":
                 try:
-                    payload = verify_token(msg.get("token", ""))
-                    user_id = payload.get("sub")
-                    username = payload.get("username")
+                    payload, user = await get_user_from_token(msg.get("token", ""))
+                    user_id = str(user.id)
+                    username = payload.get("username") or user.username
                     await websocket.send_json({"type": "authenticated", "username": username})
                 except Exception:
                     await websocket.send_json({"type": "error", "message": "Authentication failed"})
@@ -312,8 +298,9 @@ async def guacamole_websocket_handler(
                         # NOTE: pyguacamole converts guacd arg names from
                         # hyphens to underscores before kwarg lookup, so
                         # these keys MUST use underscores, not hyphens.
-                        handshake_kwargs["security"] = "any"
-                        handshake_kwargs["ignore_cert"] = "true"
+                        handshake_kwargs["security"] = config.rdp_security_mode
+                        if config.rdp_ignore_cert:
+                            handshake_kwargs["ignore_cert"] = "true"
                         handshake_kwargs["disable_audio"] = "true"
                         handshake_kwargs["enable_wallpaper"] = "false"
                         handshake_kwargs["enable_theming"] = "true"

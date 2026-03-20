@@ -25,6 +25,7 @@ interface AIState {
   updateSettings: (data: {
     provider: string;
     api_key?: string;
+    clear_api_key?: boolean;
     model?: string;
     base_url?: string;
   }) => Promise<void>;
@@ -35,6 +36,24 @@ interface AIState {
 
   /** Check if a specific AI feature is available (global + user + per-feature). */
   isFeatureEnabled: (name: AIFeatureName) => boolean;
+  /** Check if feature is enabled and provider is fully configured. */
+  isFeatureUsable: (name: AIFeatureName) => boolean;
+}
+
+function isProviderConfigured(settings: AISettings): boolean {
+  if (settings.is_configured !== undefined) {
+    return settings.is_configured;
+  }
+
+  const provider = settings.provider;
+  if (!provider) return false;
+  if (provider === 'openai' || provider === 'anthropic') {
+    return settings.has_api_key;
+  }
+  if (provider === 'ollama') {
+    return true;
+  }
+  return false;
 }
 
 export const useAIStore = create<AIState>((set, get) => ({
@@ -43,6 +62,7 @@ export const useAIStore = create<AIState>((set, get) => ({
     model: '',
     base_url: '',
     has_api_key: false,
+    is_configured: false,
   },
   features: { ...DEFAULT_FEATURES },
   isLoading: false,
@@ -57,6 +77,7 @@ export const useAIStore = create<AIState>((set, get) => ({
           base_url: data.base_url || '',
           has_api_key: data.has_api_key || false,
           api_key_masked: data.api_key_masked,
+          is_configured: data.is_configured ?? false,
         },
       });
     } catch {
@@ -123,5 +144,10 @@ export const useAIStore = create<AIState>((set, get) => ({
     const { enabled, features } = get().features;
     if (!enabled) return false;
     return features[name] ?? true;
+  },
+
+  isFeatureUsable: (name) => {
+    if (!get().isFeatureEnabled(name)) return false;
+    return isProviderConfigured(get().settings);
   },
 }));

@@ -19,6 +19,7 @@ interface User {
   id: string;
   username: string;
   email: string | null;
+  role?: string;
   settings?: Record<string, unknown>;
 }
 
@@ -35,6 +36,7 @@ interface UserResponse {
   id: string;
   username: string;
   email: string | null;
+  role?: string;
   is_active: boolean;
   created_at: string | null;
   last_login: string | null;
@@ -47,6 +49,7 @@ function toUser(data: UserResponse): User {
     id: data.id,
     username: data.username,
     email: data.email,
+    role: data.role,
     settings: data.settings,
   };
 }
@@ -114,7 +117,7 @@ interface AuthState {
   /** The client-side E2EE encryption key, derived from the user's password. */
   cryptoKey: CryptoKey | null;
   login: (username: string, password: string, rememberMe?: boolean) => Promise<void>;
-  register: (username: string, email: string, password: string, passwordConfirm: string) => Promise<void>;
+  register: (username: string, email: string, password: string, passwordConfirm: string, website?: string) => Promise<void>;
   logout: () => void;
   refreshToken: () => Promise<void>;
   checkAuth: () => Promise<void>;
@@ -156,7 +159,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     }
   },
 
-  register: async (username: string, email: string, password: string, passwordConfirm: string) => {
+  register: async (username: string, email: string, password: string, passwordConfirm: string, website = '') => {
     set({ isLoading: true });
     try {
       // Register the user
@@ -165,6 +168,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
         email: email || null,
         password,
         password_confirm: passwordConfirm,
+        website,
       });
 
       // Auto-login after registration (derives the E2EE key)

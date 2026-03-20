@@ -1,4 +1,4 @@
-import React, { useEffect, useCallback, useRef } from 'react';
+import React, { useEffect, useCallback, useRef, useState } from 'react';
 import {
   X,
   Activity,
@@ -12,8 +12,11 @@ import {
   Container,
   Network,
   Clock,
+  History,
+  ClipboardCheck,
 } from 'lucide-react';
 import { useToolsStore, TOOLS, type ToolId } from '@/store/toolsStore';
+import { apiGet } from '@/api/client';
 
 const CATEGORY_LABELS: Record<string, string> = {
   monitoring: 'Monitoring',
@@ -35,17 +38,50 @@ const TOOL_ICONS: Record<ToolId, React.ReactNode> = {
   'docker-manager': <Container size={16} />,
   'wireguard-manager': <Network size={16} />,
   'cron-manager': <Clock size={16} />,
+  'job-center': <History size={16} />,
+  'audit-log': <ClipboardCheck size={16} />,
+};
+
+const TOOL_CAPABILITY_KEYS: Record<ToolId, string> = {
+  'system-dashboard': 'system',
+  'process-manager': 'processes',
+  'service-manager': 'services',
+  'log-viewer': 'logs',
+  'script-vault': 'scripts',
+  'security-center': 'security',
+  'firewall-manager': 'firewall',
+  'package-manager': 'packages',
+  'docker-manager': 'docker',
+  'wireguard-manager': 'wireguard',
+  'cron-manager': 'cron',
+  'job-center': 'jobs',
+  'audit-log': 'audit',
 };
 
 interface Props {
   connectionId: string;
 }
 
-export const ServerToolsPanel: React.FC<Props> = () => {
+export const ServerToolsPanel: React.FC<Props> = ({ connectionId }) => {
+  // Reserved for future connection-scoped capability checks.
+  void connectionId;
+
   const isPanelOpen = useToolsStore((s) => s.isPanelOpen);
   const closePanel = useToolsStore((s) => s.closePanel);
   const openTool = useToolsStore((s) => s.openTool);
   const panelRef = useRef<HTMLDivElement>(null);
+  const [capabilities, setCapabilities] = useState<Record<string, { read: boolean; execute: boolean; high_risk: boolean }>>({});
+
+  useEffect(() => {
+    if (!isPanelOpen) return;
+    apiGet('/api/tools/capabilities')
+      .then((data) => {
+        setCapabilities(data?.tools || {});
+      })
+      .catch(() => {
+        setCapabilities({});
+      });
+  }, [isPanelOpen]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent) => {
@@ -119,11 +155,18 @@ export const ServerToolsPanel: React.FC<Props> = () => {
                 <div className="px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                   {CATEGORY_LABELS[category]}
                 </div>
-                {categoryTools.map((tool) => (
+                {categoryTools.map((tool) => {
+                  const capKey = TOOL_CAPABILITY_KEYS[tool.id];
+                  const canRead = capabilities[capKey]?.read ?? true;
+                  return (
                   <button
                     key={tool.id}
-                    onClick={() => openTool(tool.id)}
-                    className="flex items-start gap-3 w-full px-4 py-2.5 text-left hover:bg-[var(--bg-hover)] transition-colors group"
+                    onClick={() => canRead && openTool(tool.id)}
+                    className={`flex items-start gap-3 w-full px-4 py-2.5 text-left transition-colors group ${
+                      canRead ? 'hover:bg-[var(--bg-hover)]' : 'opacity-45 cursor-not-allowed'
+                    }`}
+                    title={canRead ? tool.description : 'Disabled by server policy'}
+                    disabled={!canRead}
                   >
                     <span className="mt-0.5 text-[var(--text-muted)] group-hover:text-[var(--accent)] transition-colors shrink-0">
                       {TOOL_ICONS[tool.id]}
@@ -137,7 +180,8 @@ export const ServerToolsPanel: React.FC<Props> = () => {
                       </div>
                     </div>
                   </button>
-                ))}
+                  );
+                })}
               </div>
             );
           })}

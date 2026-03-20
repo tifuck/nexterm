@@ -4,6 +4,7 @@ export interface AISettings {
   base_url: string;
   has_api_key: boolean;
   api_key_masked?: string;
+  is_configured?: boolean;
 }
 
 export interface AIFeatures {

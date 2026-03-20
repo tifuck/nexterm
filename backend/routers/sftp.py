@@ -2,12 +2,11 @@
 import logging
 import mimetypes
 import os
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Query
+from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
-from backend.middleware.auth import get_current_user, verify_token
-from backend.database import async_session_factory
+from backend.middleware.auth import create_preview_token, get_current_user, verify_preview_token
 from backend.models.user import User
 from backend.services.ssh_proxy import ssh_proxy
 
@@ -16,6 +15,18 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/sftp", tags=["sftp"])
+
+
+class PreviewTokenRequest(BaseModel):
+    """Request body for issuing a short-lived preview token."""
+
+    path: str = Field(..., min_length=1)
+
+
+class PreviewTokenResponse(BaseModel):
+    """Response payload containing a short-lived preview token."""
+
+    preview_token: str
 
 
 async def _verify_connection(connection_id: str, current_user: User):
@@ -120,36 +131,33 @@ async def download_file(
 # ---------------------------------------------------------------------------
 # GET /preview -- serve a file inline for browser preview (images, audio, video, PDF)
 # ---------------------------------------------------------------------------
+@router.post("/{connection_id}/preview-token", response_model=PreviewTokenResponse)
+async def issue_preview_token(
+    connection_id: str,
+    body: PreviewTokenRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Issue a short-lived token for inline file preview."""
+    await _verify_connection(connection_id, current_user)
+    preview_token = create_preview_token(str(current_user.id), connection_id, body.path)
+    return PreviewTokenResponse(preview_token=preview_token)
+
+
 @router.get("/{connection_id}/preview")
 async def preview_file(
     connection_id: str,
-    request: Request,
     path: str = Query(description="File path to preview"),
-    token: str | None = Query(default=None, description="JWT token for inline auth"),
+    preview_token: str = Query(description="Short-lived preview token"),
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ):
     """Serve a file inline with the correct MIME type for browser preview."""
-    # Authenticate via query-param token (for <img>/<video>/<audio>/<iframe>)
-    # or via standard Authorization header.
-    jwt_token = token
-    if not jwt_token and credentials:
-        jwt_token = credentials.credentials
-    if not jwt_token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    if credentials is not None:
+        raise HTTPException(status_code=400, detail="Use a preview token for inline preview requests")
 
-    payload = verify_token(jwt_token)
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-
-    async with async_session_factory() as session:
-        result = await session.execute(select(User).where(User.id == user_id))
-        current_user = result.scalar_one_or_none()
-
-    if not current_user or not current_user.is_active:
-        raise HTTPException(status_code=401, detail="User not found or disabled")
-
-    await _verify_connection(connection_id, current_user)
+    payload = await verify_preview_token(preview_token, connection_id, path)
+    conn = await ssh_proxy.get_connection(connection_id)
+    if not conn or conn.user_id != payload.get("sub"):
+        raise HTTPException(status_code=404, detail="Connection not found")
 
     try:
         await ssh_proxy.sftp_open(connection_id)

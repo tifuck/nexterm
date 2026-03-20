@@ -167,8 +167,10 @@ def main():
                 "ssl_keyfile": key_file,
             }
         else:
-            print(f"[WARN] SSL cert/key not found at {cert_file}, {key_file}")
-            print("[WARN] Run install.sh or set auto_generate_cert: true in config.yaml")
+            print(f"[ERROR] HTTPS is enabled but SSL cert/key were not found at {cert_file}, {key_file}")
+            print("[ERROR] Run install.sh or set auto_generate_cert: true in config.yaml before starting")
+            _cleanup()
+            sys.exit(1)
     
     print(f"""
     ╔══════════════════════════════════════════════╗

@@ -1,11 +1,14 @@
 """In-memory IP-based rate limiting middleware."""
 
+import ipaddress
 import logging
 import time
 from collections import defaultdict
 from typing import NamedTuple
 
 from fastapi import HTTPException, Request
+
+from backend.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -19,19 +22,38 @@ class _Bucket(NamedTuple):
 _buckets: dict[str, list[float]] = defaultdict(list)
 
 
-def _client_ip(request: Request) -> str:
+def client_ip(request: Request) -> str:
     """Best-effort extraction of the real client IP.
 
     Respects X-Forwarded-For when present (reverse-proxy deployments).
     Falls back to the direct connecting address.
     """
+    direct_ip = request.client.host if request.client else "unknown"
     forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
+    if forwarded and _is_trusted_proxy(direct_ip):
         # First entry is the original client
         return forwarded.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
+    return direct_ip
+
+
+def _is_trusted_proxy(ip: str) -> bool:
+    """Return whether the direct peer is a configured trusted proxy."""
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+
+    for entry in config.trusted_proxies:
+        try:
+            if "/" in entry:
+                if address in ipaddress.ip_network(entry, strict=False):
+                    return True
+            elif address == ipaddress.ip_address(entry):
+                return True
+        except ValueError:
+            continue
+
+    return False
 
 
 def check_rate_limit(
@@ -50,7 +72,7 @@ def check_rate_limit(
         key_suffix: Optional suffix to namespace different limits
                     (e.g. "login" vs "register").
     """
-    ip = _client_ip(request)
+    ip = client_ip(request)
     key = f"{ip}:{key_suffix}" if key_suffix else ip
     now = time.monotonic()
     cutoff = now - window_seconds

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Image,
   Film,
@@ -40,6 +40,7 @@ const FilePreview: React.FC<FilePreviewProps> = ({ tab }) => {
 
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [url, setUrl] = useState<string | null>(null);
 
   // Find the parent SSH/telnet tab to get server info
   const parentTab = tabs.find(
@@ -59,15 +60,45 @@ const FilePreview: React.FC<FilePreviewProps> = ({ tab }) => {
     return serverName || userHost || '';
   }, [serverName, serverHost, serverPort, serverUser]);
 
-  const url = useMemo(() => getPreviewUrl(connectionId, filePath), [connectionId, filePath]);
+  useEffect(() => {
+    let cancelled = false;
 
-  const handleDownload = () => {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filePath.split('/').pop() || 'download';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const loadPreviewUrl = async () => {
+      setIsLoading(true);
+      setError(null);
+      try {
+        const previewUrl = await getPreviewUrl(connectionId, filePath);
+        if (!cancelled) {
+          setUrl(previewUrl);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setUrl(null);
+          setIsLoading(false);
+          setError(err instanceof Error ? err.message : 'Failed to load file preview');
+        }
+      }
+    };
+
+    void loadPreviewUrl();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connectionId, filePath]);
+
+  const handleDownload = async () => {
+    try {
+      const downloadUrl = url ?? await getPreviewUrl(connectionId, filePath);
+      const a = document.createElement('a');
+      a.href = downloadUrl;
+      a.download = filePath.split('/').pop() || 'download';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to download file preview');
+    }
   };
 
   const handleLoad = () => {
@@ -148,7 +179,7 @@ const FilePreview: React.FC<FilePreviewProps> = ({ tab }) => {
         )}
 
         {/* Image preview */}
-        {previewType === 'image' && !error && (
+        {previewType === 'image' && !error && url && (
           <div className="p-4 flex items-center justify-center w-full h-full"
             style={{ background: 'repeating-conic-gradient(var(--surface-800) 0% 25%, var(--surface-900) 0% 50%) 50% / 20px 20px' }}
           >
@@ -164,7 +195,7 @@ const FilePreview: React.FC<FilePreviewProps> = ({ tab }) => {
         )}
 
         {/* Audio preview */}
-        {previewType === 'audio' && !error && (
+        {previewType === 'audio' && !error && url && (
           <div className="flex flex-col items-center justify-center gap-6 p-8">
             <div className="w-24 h-24 rounded-full bg-[var(--bg-tertiary)] flex items-center justify-center">
               <Music size={40} className="text-green-400" />
@@ -184,7 +215,7 @@ const FilePreview: React.FC<FilePreviewProps> = ({ tab }) => {
         )}
 
         {/* Video preview */}
-        {previewType === 'video' && !error && (
+        {previewType === 'video' && !error && url && (
           <div className="w-full h-full flex items-center justify-center p-4 bg-black">
             <video
               controls
@@ -200,7 +231,7 @@ const FilePreview: React.FC<FilePreviewProps> = ({ tab }) => {
         )}
 
         {/* PDF preview */}
-        {previewType === 'pdf' && !error && (
+        {previewType === 'pdf' && !error && url && (
           <iframe
             src={url}
             title={fileName}

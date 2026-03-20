@@ -4,10 +4,17 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from backend.services.auth_security import normalize_email, normalize_username, validate_username
+
 
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=255)
     password: str = Field(..., min_length=1, max_length=1024)
+
+    @field_validator("username")
+    @classmethod
+    def clean_username(cls, v: str) -> str:
+        return normalize_username(v)
 
 
 def _validate_password_strength(password: str) -> str:
@@ -33,6 +40,17 @@ class RegisterRequest(BaseModel):
     email: Optional[str] = Field(None, max_length=255)
     password: str = Field(..., min_length=8, max_length=128)
     password_confirm: str = Field(..., min_length=8, max_length=128)
+    website: str = Field(default="", max_length=0)
+
+    @field_validator("username")
+    @classmethod
+    def username_format(cls, v: str) -> str:
+        return validate_username(v)
+
+    @field_validator("email")
+    @classmethod
+    def clean_email(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_email(v)
 
     @field_validator("password")
     @classmethod
@@ -88,6 +106,7 @@ class UserResponse(BaseModel):
     id: str
     username: str
     email: Optional[str] = None
+    role: str = "user"
     is_active: bool = True
     created_at: Optional[datetime] = None
     last_login: Optional[datetime] = None

@@ -4,8 +4,8 @@ import asyncio
 import hashlib
 import logging
 import time
-from datetime import datetime, timedelta, timezone
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 
 import jwt
 from fastapi import Depends, HTTPException, Request
@@ -104,7 +104,7 @@ async def _persist_revocation(token_hash: str, expires_at: datetime) -> None:
         logger.error("Failed to persist token revocation: %s", e)
 
 
-def is_token_blocklisted(token: str) -> bool:
+async def is_token_blocklisted(token: str) -> bool:
     """Check whether a token has been revoked (cache then DB)."""
     token_hash = _hash_token(token)
 
@@ -112,26 +112,10 @@ def is_token_blocklisted(token: str) -> bool:
     if _cache_contains(token_hash):
         return True
 
-    # Slow path: query the database.  Because verify_token is synchronous
-    # we run the DB check in a new thread via asyncio.  If there's no
-    # running event loop, fall back to cache-only.
-    try:
-        loop = asyncio.get_running_loop()
-        # We cannot await inside a sync function, so schedule a task and
-        # check a future.  However, for the common case the cache is warm
-        # and we never reach here.  For the cold-start / first-request case,
-        # we do a blocking check.
-        import concurrent.futures
-        future = asyncio.run_coroutine_threadsafe(_check_db_blocklist(token_hash), loop)
-        try:
-            found = future.result(timeout=1.0)
-        except (concurrent.futures.TimeoutError, Exception):
-            return False
-        if found:
-            _cache_put(token_hash, found)
-            return True
-    except RuntimeError:
-        pass
+    found = await _check_db_blocklist(token_hash)
+    if found:
+        _cache_put(token_hash, found)
+        return True
 
     return False
 
@@ -193,24 +177,26 @@ def _purge_cache() -> None:
 # Token creation
 # ---------------------------------------------------------------------------
 
-def create_access_token(user_id: str, username: str) -> str:
+def create_access_token(user_id: str, username: str, token_version: int) -> str:
     """Create a short-lived JWT access token."""
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "username": username,
+        "ver": token_version,
         "exp": now + timedelta(minutes=config.jwt_access_expire_minutes),
         "iat": now,
     }
     return jwt.encode(payload, config.secret_key, algorithm=ALGORITHM)
 
 
-def create_refresh_token(user_id: str) -> str:
+def create_refresh_token(user_id: str, token_version: int) -> str:
     """Create a long-lived JWT refresh token."""
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "type": "refresh",
+        "ver": token_version,
         "exp": now + timedelta(minutes=config.jwt_refresh_expire_days * 24 * 60),
         "iat": now,
     }
@@ -221,7 +207,7 @@ def create_refresh_token(user_id: str) -> str:
 # Token verification
 # ---------------------------------------------------------------------------
 
-def verify_token(token: str, *, allow_refresh: bool = False) -> dict:
+async def verify_token(token: str, *, allow_refresh: bool = False) -> dict:
     """Decode and validate a JWT. Returns the payload dict.
 
     By default, refresh tokens are rejected.  Pass ``allow_refresh=True``
@@ -230,7 +216,7 @@ def verify_token(token: str, *, allow_refresh: bool = False) -> dict:
     Raises HTTPException 401 on invalid or expired tokens.
     """
     # Check server-side blocklist (logout / revocation)
-    if is_token_blocklisted(token):
+    if await is_token_blocklisted(token):
         raise HTTPException(status_code=401, detail="Token has been revoked")
 
     try:
@@ -248,6 +234,58 @@ def verify_token(token: str, *, allow_refresh: bool = False) -> dict:
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def create_preview_token(user_id: str, connection_id: str, path: str) -> str:
+    """Create a short-lived token for inline file preview."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "type": "preview",
+        "connection_id": connection_id,
+        "path": path,
+        "exp": now + timedelta(minutes=15),
+        "iat": now,
+    }
+    return jwt.encode(payload, config.secret_key, algorithm=ALGORITHM)
+
+
+async def verify_preview_token(token: str, connection_id: str, path: str) -> dict:
+    """Validate a short-lived preview token for a specific file."""
+    payload = await verify_token(token)
+
+    if payload.get("type") != "preview":
+        raise HTTPException(status_code=401, detail="Invalid token type")
+    if payload.get("connection_id") != connection_id:
+        raise HTTPException(status_code=401, detail="Invalid preview token")
+    if payload.get("path") != path:
+        raise HTTPException(status_code=401, detail="Invalid preview token")
+
+    return payload
+
+
+async def get_user_from_token(token: str, *, allow_refresh: bool = False) -> tuple[dict, User]:
+    """Validate a token and return its payload plus the active user."""
+    payload = await verify_token(token, allow_refresh=allow_refresh)
+
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    async with async_session_factory() as session:
+        result = await session.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
+
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    if not user.is_active:
+        raise HTTPException(status_code=401, detail="User account is disabled")
+
+    if payload.get("ver", 0) != user.token_version:
+        raise HTTPException(status_code=401, detail="Session is no longer valid")
+
+    return payload, user
 
 
 # ---------------------------------------------------------------------------
@@ -277,22 +315,7 @@ async def get_current_user(
     if token is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    payload = verify_token(token)
-
-    user_id = payload.get("sub")
-    if user_id is None:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-
-    async with async_session_factory() as session:
-        result = await session.execute(select(User).where(User.id == user_id))
-        user = result.scalar_one_or_none()
-
-    if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
-
-    if not user.is_active:
-        raise HTTPException(status_code=401, detail="User account is disabled")
-
+    _, user = await get_user_from_token(token)
     return user
 
 
@@ -306,19 +329,8 @@ async def get_optional_user(
         return None
 
     try:
-        payload = verify_token(token)
+        _, user = await get_user_from_token(token)
     except HTTPException:
-        return None
-
-    user_id = payload.get("sub")
-    if user_id is None:
-        return None
-
-    async with async_session_factory() as session:
-        result = await session.execute(select(User).where(User.id == user_id))
-        user = result.scalar_one_or_none()
-
-    if user is None or not user.is_active:
         return None
 
     return user

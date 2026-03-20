@@ -742,9 +742,8 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
               {viewingConfig.qr_svg && (
                 <div className="flex justify-center">
                   <div
-                    className="bg-white p-3 rounded-lg"
+                    className="w-[240px] max-w-full bg-white p-3 rounded-lg overflow-hidden [&_svg]:block [&_svg]:w-full [&_svg]:h-auto"
                     dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(viewingConfig.qr_svg, { USE_PROFILES: { svg: true, svgFilters: true }, ADD_TAGS: ['svg', 'path', 'rect', 'circle', 'g', 'defs', 'use'], FORBID_ATTR: ['xlink:href', 'href'] }) }}
-                    style={{ maxWidth: 240 }}
                   />
                 </div>
               )}

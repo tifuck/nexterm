@@ -1,9 +1,12 @@
 """User model."""
+
 import secrets
 import uuid
 from datetime import datetime, timezone
+
 from sqlalchemy import String, Boolean, DateTime, Text, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
 from backend.database import Base
 
 
@@ -16,6 +19,7 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(80), unique=True, nullable=False, index=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default="user")
     # Per-user PBKDF2 salt for client-side E2EE key derivation (64 hex chars = 32 bytes)
     encryption_salt: Mapped[str] = mapped_column(
         String(64), nullable=False, default=lambda: secrets.token_hex(32)
@@ -26,6 +30,7 @@ class User(Base):
     failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_failed_login: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    token_version: Mapped[int] = mapped_column(Integer, default=0)
 
     # User preferences (JSON)
     settings_json: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -52,6 +57,8 @@ class User(Base):
     folders = relationship("Folder", back_populates="user", cascade="all, delete-orphan")
     api_keys = relationship("ApiKey", back_populates="user", cascade="all, delete-orphan")
     command_history = relationship("CommandHistory", back_populates="user", cascade="all, delete-orphan")
+    tool_jobs = relationship("ToolJob", back_populates="user", cascade="all, delete-orphan")
+    rollback_points = relationship("ToolRollbackPoint", back_populates="user", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<User {self.username}>"

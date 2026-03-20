@@ -13,6 +13,7 @@ const App: React.FC = () => {
   const { user, isLoading, checkAuth } = useAuthStore();
   const initTheme = useThemeStore((s) => s.initTheme);
   const fetchConfig = useConfigStore((s) => s.fetchConfig);
+  const registrationEnabled = useConfigStore((s) => s.registrationEnabled);
   const aiEnabled = useConfigStore((s) => s.aiEnabled);
   const fetchAI = useAIStore((s) => s.fetchAll);
   const location = useLocation();
@@ -66,7 +67,7 @@ const App: React.FC = () => {
     <>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
-        <Route path="/register" element={<RegisterPage />} />
+        <Route path="/register" element={registrationEnabled ? <RegisterPage /> : <Navigate to="/login" replace />} />
         <Route path="/*" element={<AppLayout />} />
       </Routes>
       <ToastContainer />

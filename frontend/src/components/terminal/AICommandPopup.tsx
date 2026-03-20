@@ -6,6 +6,7 @@ interface AICommandPopupProps {
   onInsert: (command: string) => void;
   onClose: () => void;
   history?: string[];
+  context?: string;
 }
 
 /**
@@ -13,7 +14,16 @@ interface AICommandPopupProps {
  * Phase 1: user types natural language prompt.
  * Phase 2: shows editable result with Insert/Copy/Dismiss.
  */
-export const AICommandPopup: React.FC<AICommandPopupProps> = ({ onInsert, onClose, history }) => {
+function normalizeCommand(result: string): string {
+  const trimmed = result.trim();
+  if (!trimmed.startsWith('```')) return trimmed;
+  const lines = trimmed.split('\n');
+  if (lines.length < 2) return trimmed.replace(/`/g, '').trim();
+  const body = lines.slice(1, lines[lines.length - 1].startsWith('```') ? -1 : undefined).join('\n');
+  return body.trim();
+}
+
+export const AICommandPopup: React.FC<AICommandPopupProps> = ({ onInsert, onClose, history, context }) => {
   const [prompt, setPrompt] = useState('');
   const [result, setResult] = useState<string | null>(null);
   const [editedResult, setEditedResult] = useState('');
@@ -43,8 +53,9 @@ export const AICommandPopup: React.FC<AICommandPopupProps> = ({ onInsert, onClos
       const data = await apiPost<{ command: string }>('/api/ai/command', {
         prompt: prompt.trim(),
         history: history?.slice(-5),
+        context,
       });
-      setResult(data.command);
+      setResult(normalizeCommand(data.command));
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to generate command';
       setError(message);

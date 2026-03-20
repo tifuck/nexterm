@@ -325,17 +325,15 @@ export function sendWsAuth(ws: WebSocket): void {
 }
 
 /**
- * Build a preview URL for inline file rendering in `<img>`, `<video>`, etc.
- *
- * HTML elements cannot set Authorization headers, so the JWT is passed as a
- * query parameter. This is a known trade-off — these URLs should not be
- * shared or bookmarked as the token will appear in the URL.
+ * Issue a short-lived preview URL for inline file rendering.
  */
-export function getPreviewUrl(connectionId: string, filePath: string): string {
-  const token = getToken();
-  const params = new URLSearchParams({ path: filePath });
-  if (token) {
-    params.append('token', token);
-  }
+export async function getPreviewUrl(connectionId: string, filePath: string): Promise<string> {
+  const data = await apiPost<{ preview_token: string }>(`/api/sftp/${connectionId}/preview-token`, {
+    path: filePath,
+  });
+  const params = new URLSearchParams({
+    path: filePath,
+    preview_token: data.preview_token,
+  });
   return `/api/sftp/${connectionId}/preview?${params.toString()}`;
 }

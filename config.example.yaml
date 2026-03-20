@@ -34,6 +34,24 @@ auth:
   jwt_refresh_token_expire_days: 7
   max_login_attempts: 5
   lockout_duration_minutes: 15
+  login_ip_limit_per_minute: 10
+  login_identifier_limit: 8
+  login_identifier_window_seconds: 900
+  login_block_seconds: 300
+  register_ip_limit: 5
+  register_ip_window_seconds: 3600
+  register_identifier_limit: 3
+  register_identifier_window_seconds: 86400
+  register_block_seconds: 86400
+  min_failure_delay_ms: 400
+
+tools:
+  enabled: true
+  mutations_enabled: true
+  high_risk_enabled: true
+  # false = users only see their own audit entries
+  # true  = all users can see global audit entries
+  audit_global_visibility: false
 
 database:
   # SQLite with WAL mode for concurrent access
@@ -59,6 +77,8 @@ guacd:
   enabled: false
   host: "localhost"
   port: 4822
+  rdp_security_mode: "nla"
+  rdp_ignore_cert: false
 
 ai:
   enabled: true

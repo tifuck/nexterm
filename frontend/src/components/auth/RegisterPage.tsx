@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, Navigate } from 'react-router-dom';
 import { Terminal, Eye, EyeOff, Loader2 } from 'lucide-react';
 import { useAuthStore } from '@/store/authStore';
 import { useConfigStore } from '@/store/configStore';
@@ -7,12 +7,18 @@ import { useConfigStore } from '@/store/configStore';
 const RegisterPage: React.FC = () => {
   const { register, isLoading } = useAuthStore();
   const appName = useConfigStore((s) => s.appName);
+  const registrationEnabled = useConfigStore((s) => s.registrationEnabled);
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [website, setWebsite] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
+
+  if (!registrationEnabled) {
+    return <Navigate to="/login" replace />;
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -22,6 +28,11 @@ const RegisterPage: React.FC = () => {
 
     if (password !== confirmPassword) {
       setError('Passwords do not match');
+      return;
+    }
+
+    if (!/^[A-Za-z0-9_.-]{3,64}$/.test(username.trim())) {
+      setError('Username must be 3-64 characters and use only letters, numbers, dots, dashes, or underscores');
       return;
     }
 
@@ -46,7 +57,7 @@ const RegisterPage: React.FC = () => {
     }
 
     try {
-      await register(username, email || '', password, confirmPassword);
+      await register(username.trim(), email.trim(), password, confirmPassword, website);
       // Navigation happens automatically via App.tsx auth guard
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Registration failed');
@@ -86,6 +97,16 @@ const RegisterPage: React.FC = () => {
           )}
 
           {/* Username */}
+          <input
+            type="text"
+            tabIndex={-1}
+            autoComplete="off"
+            value={website}
+            onChange={(e) => setWebsite(e.target.value)}
+            className="hidden"
+            aria-hidden="true"
+          />
+
           <div className="mb-3">
             <label className="block text-xs font-medium text-[var(--text-secondary)] mb-1.5">
               Username

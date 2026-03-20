@@ -9,7 +9,7 @@ A web-based remote access client supporting SSH, SFTP, RDP, VNC, Telnet, and FTP
 - **SFTP file browser** -- Browse, upload, download, and edit remote files
 - **Saved sessions** -- Organize connections in folders with encrypted credential storage
 - **Multi-user** -- User registration and API key authentication
-- **AI assistant** -- Optional AI integration (OpenAI / Anthropic) for command help
+- **AI assistant** -- Optional OpenAI / Anthropic / Ollama integration for command generation, error diagnosis, command explanation, and log analysis
 - **Server tools** -- Docker, firewall, service, process, and package management panels
 - **System metrics** -- Real-time CPU, memory, disk, and network monitoring via WebSocket
 - **Themes** -- Multiple terminal color schemes

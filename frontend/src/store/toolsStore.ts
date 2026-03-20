@@ -11,7 +11,9 @@ export type ToolId =
   | 'package-manager'
   | 'docker-manager'
   | 'wireguard-manager'
-  | 'cron-manager';
+  | 'cron-manager'
+  | 'job-center'
+  | 'audit-log';
 
 export interface ToolDefinition {
   id: ToolId;
@@ -86,6 +88,18 @@ export const TOOLS: ToolDefinition[] = [
     name: 'Cron Manager',
     description: 'View and manage scheduled tasks',
     category: 'automation',
+  },
+  {
+    id: 'job-center',
+    name: 'Job Center',
+    description: 'Track progress, retries, and run history',
+    category: 'monitoring',
+  },
+  {
+    id: 'audit-log',
+    name: 'Audit Log',
+    description: 'Immutable per-action security and tools audit trail',
+    category: 'security',
   },
 ];
 

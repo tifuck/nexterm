@@ -2,18 +2,59 @@
 import asyncio
 import json
 import logging
-from fastapi import WebSocket, WebSocketDisconnect, Query
+from fastapi import WebSocket, WebSocketDisconnect
+
 from backend.services.ssh_proxy import ssh_proxy
-from backend.middleware.auth import verify_token
+from backend.middleware.auth import get_user_from_token
 from backend.config import config
 from backend.routers.tools import _build_wg_install_script, _sanitize_shell, _sanitize_shell_inner, _parse_exit_code
+from backend.services.tool_audit import record_tool_audit
+from backend.services.tool_jobs import (
+    add_job_event,
+    cancel_job,
+    complete_job,
+    create_job,
+    fail_job,
+    is_cancel_requested,
+    set_job_running,
+    update_job_progress,
+)
+from backend.services.tool_permissions import is_action_allowed, normalize_role, resolve_ws_tool_action
 
 logger = logging.getLogger(__name__)
 
 
+async def _audit_ws_action(
+    *,
+    user_id: str | None,
+    username: str,
+    role: str,
+    action: str,
+    outcome: str,
+    details: dict | None = None,
+) -> None:
+    """Persist immutable audit events for websocket-originating tools actions."""
+    resolved = resolve_ws_tool_action(action)
+    if resolved is None:
+        return
+    await record_tool_audit(
+        user_id=user_id,
+        username=username,
+        user_role=role,
+        method="WS",
+        path=f"/ws/tools:{action}",
+        tool=resolved.tool,
+        action=resolved.action,
+        connection_id=details.get("connection_id") if details else None,
+        status_code=200,
+        outcome=outcome,
+        dry_run=False,
+        details=details,
+    )
+
+
 async def tools_websocket_handler(
     websocket: WebSocket,
-    token: str = Query(default=None, deprecated=True),
 ):
     """Handle server tools WebSocket connections.
 
@@ -36,42 +77,38 @@ async def tools_websocket_handler(
     await websocket.accept()
 
     user_id = None
+    username = "anonymous"
+    role = "user"
     dashboard_task = None
     log_tail_task = None
     wg_install_task = None
+    wg_job_id = None
     docker_install_task = None
+    docker_install_job_id = None
     docker_logs_task = None
     docker_pull_task = None
+    docker_pull_job_id = None
 
     try:
-        if token:
-            try:
-                payload = verify_token(token)
-                user_id = payload.get("sub")
-            except Exception:
-                await websocket.send_json({"type": "error", "message": "Invalid token"})
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+            msg = json.loads(raw)
+            if msg.get("type") == "auth":
+                _, user = await get_user_from_token(msg.get("token", ""))
+                user_id = str(user.id)
+                username = user.username
+                role = normalize_role(getattr(user, "role", None))
+                await websocket.send_json({"type": "authenticated"})
+            else:
+                await websocket.send_json({"type": "error", "message": "Authentication required"})
                 await websocket.close(code=4001)
                 return
-
-        # Enforce auth timeout if not authenticated via query param
-        if not user_id:
-            try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
-                msg = json.loads(raw)
-                if msg.get("type") == "auth":
-                    payload = verify_token(msg.get("token", ""))
-                    user_id = payload.get("sub")
-                    await websocket.send_json({"type": "authenticated"})
-                else:
-                    await websocket.send_json({"type": "error", "message": "Authentication required"})
-                    await websocket.close(code=4001)
-                    return
-            except asyncio.TimeoutError:
-                await websocket.close(code=4001)
-                return
-            except Exception:
-                await websocket.close(code=4001)
-                return
+        except asyncio.TimeoutError:
+            await websocket.close(code=4001)
+            return
+        except Exception:
+            await websocket.close(code=4001)
+            return
 
         while True:
             try:
@@ -81,11 +118,34 @@ async def tools_websocket_handler(
 
                 if msg_type == "auth" and not user_id:
                     try:
-                        payload = verify_token(msg.get("token", ""))
-                        user_id = payload.get("sub")
+                        _, user = await get_user_from_token(msg.get("token", ""))
+                        user_id = str(user.id)
+                        username = user.username
+                        role = normalize_role(getattr(user, "role", None))
                         await websocket.send_json({"type": "authenticated"})
                     except Exception:
                         await websocket.send_json({"type": "error", "message": "Auth failed"})
+                    continue
+
+                if not user_id:
+                    await websocket.send_json({"type": "error", "message": "Authentication required"})
+                    continue
+
+                resolved = resolve_ws_tool_action(msg_type)
+                if resolved and not is_action_allowed(role, resolved):
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "This action is disabled by server policy",
+                    })
+                    await _audit_ws_action(
+                        user_id=user_id,
+                        username=username,
+                        role=role,
+                        action=msg_type,
+                        outcome="forbidden",
+                        details={"connection_id": msg.get("connection_id")},
+                    )
+                    continue
 
                 elif msg_type == "subscribe_dashboard":
                     conn_id = msg.get("connection_id", "")
@@ -95,6 +155,14 @@ async def tools_websocket_handler(
                             dashboard_task.cancel()
                         dashboard_task = asyncio.create_task(
                             _collect_dashboard_metrics(websocket, conn_id)
+                        )
+                        await _audit_ws_action(
+                            user_id=user_id,
+                            username=username,
+                            role=role,
+                            action=msg_type,
+                            outcome="started",
+                            details={"connection_id": conn_id},
                         )
                     else:
                         await websocket.send_json({"type": "error", "message": "Connection not found"})
@@ -118,6 +186,14 @@ async def tools_websocket_handler(
                                 lines=msg.get("lines", 50),
                             )
                         )
+                        await _audit_ws_action(
+                            user_id=user_id,
+                            username=username,
+                            role=role,
+                            action=msg_type,
+                            outcome="started",
+                            details={"connection_id": conn_id},
+                        )
                     else:
                         await websocket.send_json({"type": "error", "message": "Connection not found"})
 
@@ -132,20 +208,54 @@ async def tools_websocket_handler(
                         if wg_install_task and not wg_install_task.done():
                             wg_install_task.cancel()
                         install_config = msg.get("config", {})
+                        job = await create_job(
+                            user_id=str(user_id),
+                            connection_id=conn_id,
+                            tool="wireguard",
+                            action="install",
+                            title="WireGuard install",
+                            details={"config": install_config},
+                            resumable=False,
+                        )
+                        wg_job_id = job["id"]
+                        await websocket.send_json({"type": "job_created", "job": job})
                         wg_install_task = asyncio.create_task(
-                            _stream_wg_install(websocket, conn_id, install_config)
+                            _stream_wg_install(
+                                websocket,
+                                conn_id,
+                                install_config,
+                                job_id=wg_job_id,
+                            )
+                        )
+                        await _audit_ws_action(
+                            user_id=user_id,
+                            username=username,
+                            role=role,
+                            action=msg_type,
+                            outcome="started",
+                            details={"connection_id": conn_id, "job_id": wg_job_id},
                         )
                     else:
                         await websocket.send_json({"type": "error", "message": "Connection not found"})
 
                 elif msg_type == "wireguard_install_kill":
                     if wg_install_task and not wg_install_task.done():
+                        if wg_job_id:
+                            await cancel_job(wg_job_id, "Cancelled via WebSocket")
                         wg_install_task.cancel()
                         await websocket.send_json({
                             "type": "wireguard_install_output",
                             "data": "Installation process killed by user.",
                             "status": "killed",
                         })
+                        await _audit_ws_action(
+                            user_id=user_id,
+                            username=username,
+                            role=role,
+                            action=msg_type,
+                            outcome="cancelled",
+                            details={"job_id": wg_job_id},
+                        )
 
                 # -- Docker install streaming --
                 elif msg_type == "docker_install":
@@ -154,20 +264,53 @@ async def tools_websocket_handler(
                     if conn and conn.user_id == user_id:
                         if docker_install_task and not docker_install_task.done():
                             docker_install_task.cancel()
+                        job = await create_job(
+                            user_id=str(user_id),
+                            connection_id=conn_id,
+                            tool="docker",
+                            action="install",
+                            title="Docker Engine install",
+                            details={},
+                            resumable=False,
+                        )
+                        docker_install_job_id = job["id"]
+                        await websocket.send_json({"type": "job_created", "job": job})
                         docker_install_task = asyncio.create_task(
-                            _stream_docker_install(websocket, conn_id)
+                            _stream_docker_install(
+                                websocket,
+                                conn_id,
+                                job_id=docker_install_job_id,
+                            )
+                        )
+                        await _audit_ws_action(
+                            user_id=user_id,
+                            username=username,
+                            role=role,
+                            action=msg_type,
+                            outcome="started",
+                            details={"connection_id": conn_id, "job_id": docker_install_job_id},
                         )
                     else:
                         await websocket.send_json({"type": "error", "message": "Connection not found"})
 
                 elif msg_type == "docker_install_kill":
                     if docker_install_task and not docker_install_task.done():
+                        if docker_install_job_id:
+                            await cancel_job(docker_install_job_id, "Cancelled via WebSocket")
                         docker_install_task.cancel()
                         await websocket.send_json({
                             "type": "docker_install_output",
                             "data": "Installation process killed by user.",
                             "status": "killed",
                         })
+                        await _audit_ws_action(
+                            user_id=user_id,
+                            username=username,
+                            role=role,
+                            action=msg_type,
+                            outcome="cancelled",
+                            details={"job_id": docker_install_job_id},
+                        )
 
                 # -- Docker container logs streaming --
                 elif msg_type == "docker_logs_stream":
@@ -202,20 +345,58 @@ async def tools_websocket_handler(
                     if conn and conn.user_id == user_id and image_name:
                         if docker_pull_task and not docker_pull_task.done():
                             docker_pull_task.cancel()
+                        job = await create_job(
+                            user_id=str(user_id),
+                            connection_id=conn_id,
+                            tool="docker",
+                            action="pull_image",
+                            title=f"Pull Docker image {image_name}",
+                            details={"image": image_name},
+                            resumable=True,
+                        )
+                        docker_pull_job_id = job["id"]
+                        await websocket.send_json({"type": "job_created", "job": job})
                         docker_pull_task = asyncio.create_task(
-                            _stream_docker_pull(websocket, conn_id, image_name)
+                            _stream_docker_pull(
+                                websocket,
+                                conn_id,
+                                image_name,
+                                job_id=docker_pull_job_id,
+                            )
+                        )
+                        await _audit_ws_action(
+                            user_id=user_id,
+                            username=username,
+                            role=role,
+                            action=msg_type,
+                            outcome="started",
+                            details={
+                                "connection_id": conn_id,
+                                "job_id": docker_pull_job_id,
+                                "image": image_name,
+                            },
                         )
                     else:
                         await websocket.send_json({"type": "error", "message": "Connection not found"})
 
                 elif msg_type == "docker_pull_stop":
                     if docker_pull_task and not docker_pull_task.done():
+                        if docker_pull_job_id:
+                            await cancel_job(docker_pull_job_id, "Pull cancelled via WebSocket")
                         docker_pull_task.cancel()
                         await websocket.send_json({
                             "type": "docker_pull_output",
                             "data": "Pull cancelled by user.",
                             "status": "killed",
                         })
+                        await _audit_ws_action(
+                            user_id=user_id,
+                            username=username,
+                            role=role,
+                            action=msg_type,
+                            outcome="cancelled",
+                            details={"job_id": docker_pull_job_id},
+                        )
 
                 elif msg_type == "ping":
                     await websocket.send_json({"type": "pong"})
@@ -230,12 +411,18 @@ async def tools_websocket_handler(
         if log_tail_task and not log_tail_task.done():
             log_tail_task.cancel()
         if wg_install_task and not wg_install_task.done():
+            if wg_job_id:
+                await cancel_job(wg_job_id, "WebSocket disconnected")
             wg_install_task.cancel()
         if docker_install_task and not docker_install_task.done():
+            if docker_install_job_id:
+                await cancel_job(docker_install_job_id, "WebSocket disconnected")
             docker_install_task.cancel()
         if docker_logs_task and not docker_logs_task.done():
             docker_logs_task.cancel()
         if docker_pull_task and not docker_pull_task.done():
+            if docker_pull_job_id:
+                await cancel_job(docker_pull_job_id, "WebSocket disconnected")
             docker_pull_task.cancel()
 
 
@@ -657,6 +844,7 @@ async def _stream_wg_install(
     websocket: WebSocket,
     connection_id: str,
     install_config: dict,
+    job_id: str | None = None,
 ):
     """Run WireGuard install script and stream output line-by-line.
 
@@ -670,6 +858,10 @@ async def _stream_wg_install(
     pid = ""
 
     try:
+        if job_id:
+            await set_job_running(job_id)
+            await update_job_progress(job_id, 5, "Preparing WireGuard installation")
+
         endpoint = _sanitize_shell_inner(install_config.get("endpoint", ""))
         port = int(install_config.get("port", 51820))
         dns = _sanitize_shell_inner(install_config.get("dns", "1.1.1.1, 1.0.0.1"))
@@ -678,6 +870,8 @@ async def _stream_wg_install(
         ipv6_addr = _sanitize_shell_inner(install_config.get("ipv6_addr", ""))
 
         if not endpoint:
+            if job_id:
+                await fail_job(job_id, "No endpoint specified")
             await websocket.send_json({
                 "type": "wireguard_install_output",
                 "data": "Error: No endpoint specified.",
@@ -690,6 +884,8 @@ async def _stream_wg_install(
             "data": "Preparing WireGuard installation...",
             "status": "running",
         })
+        if job_id:
+            await add_job_event(job_id, "log", "Preparing WireGuard installation...")
 
         # Build the install script
         script = _build_wg_install_script(
@@ -707,6 +903,8 @@ async def _stream_wg_install(
         setup_result = await ssh_proxy.run_command(connection_id, setup_cmd, timeout=5)
         setup_lines = setup_result.get("stdout", "").strip().split("\n")
         if len(setup_lines) < 2 or "error" in setup_result:
+            if job_id:
+                await fail_job(job_id, "Failed to create temporary files")
             await websocket.send_json({
                 "type": "wireguard_install_output",
                 "data": "Failed to create temp files for install.",
@@ -728,6 +926,8 @@ async def _stream_wg_install(
         pid = pid_result.get("stdout", "").strip().split("\n")[-1]
 
         if not pid.isdigit():
+            if job_id:
+                await fail_job(job_id, "Failed to start install process")
             await websocket.send_json({
                 "type": "wireguard_install_output",
                 "data": f"Failed to start install process.",
@@ -740,6 +940,8 @@ async def _stream_wg_install(
             "data": f"Install process started (PID {pid}), streaming output...",
             "status": "running",
         })
+        if job_id:
+            await update_job_progress(job_id, 20, "Install process started")
 
         # Poll the output file for new lines
         lines_read = 0
@@ -770,6 +972,9 @@ async def _stream_wg_install(
                         })
                 lines_read += len(new_lines)
                 consecutive_empty = 0
+                if job_id:
+                    progress = min(90, 20 + (lines_read // 4))
+                    await update_job_progress(job_id, progress)
             else:
                 consecutive_empty += 1
 
@@ -795,12 +1000,19 @@ async def _stream_wg_install(
                 full_output = full_result.get("stdout", "")
 
                 if "WG_INSTALL_SUCCESS" in full_output:
+                    if job_id:
+                        await complete_job(
+                            job_id,
+                            {"message": "WireGuard installation completed successfully"},
+                        )
                     await websocket.send_json({
                         "type": "wireguard_install_output",
                         "data": "WireGuard installation completed successfully!",
                         "status": "completed",
                     })
                 else:
+                    if job_id:
+                        await fail_job(job_id, "Installation finished but verification failed")
                     await websocket.send_json({
                         "type": "wireguard_install_output",
                         "data": "Installation process finished but verification failed.",
@@ -818,11 +1030,15 @@ async def _stream_wg_install(
             "data": "Installation timed out (no output for 5 minutes).",
             "status": "failed",
         })
+        if job_id:
+            await fail_job(job_id, "Installation timed out")
         kill_cmd = f"sudo kill {pid} 2>/dev/null; rm -f {tmpfile} {tmpscript} 2>/dev/null"
         await ssh_proxy.run_command(connection_id, kill_cmd, timeout=5)
 
     except asyncio.CancelledError:
         logger.info("WireGuard install task cancelled")
+        if job_id:
+            await cancel_job(job_id, "WireGuard install cancelled")
         # Try to kill background process
         if pid and pid.isdigit():
             try:
@@ -832,6 +1048,8 @@ async def _stream_wg_install(
                 pass
     except Exception as e:
         logger.error(f"WireGuard install streaming error: {e}")
+        if job_id:
+            await fail_job(job_id, f"Install error: {str(e)}")
         try:
             await websocket.send_json({
                 "type": "wireguard_install_output",
@@ -849,6 +1067,7 @@ async def _stream_wg_install(
 async def _stream_docker_install(
     websocket: WebSocket,
     connection_id: str,
+    job_id: str | None = None,
 ):
     """Stream Docker Engine install via official get.docker.com script.
 
@@ -892,11 +1111,17 @@ fi
 """
 
     try:
+        if job_id:
+            await set_job_running(job_id)
+            await update_job_progress(job_id, 5, "Preparing Docker installation")
+
         await websocket.send_json({
             "type": "docker_install_output",
             "data": "Preparing Docker installation...",
             "status": "running",
         })
+        if job_id:
+            await add_job_event(job_id, "log", "Preparing Docker installation...")
 
         # Create temp files
         setup_cmd = (
@@ -907,6 +1132,8 @@ fi
         setup_result = await ssh_proxy.run_command(connection_id, setup_cmd, timeout=5)
         setup_lines = setup_result.get("stdout", "").strip().split("\n")
         if len(setup_lines) < 2 or "error" in setup_result:
+            if job_id:
+                await fail_job(job_id, "Failed to create temporary files")
             await websocket.send_json({
                 "type": "docker_install_output",
                 "data": "Failed to create temp files for install.",
@@ -928,6 +1155,8 @@ fi
         pid = pid_result.get("stdout", "").strip().split("\n")[-1]
 
         if not pid.isdigit():
+            if job_id:
+                await fail_job(job_id, "Failed to start install process")
             await websocket.send_json({
                 "type": "docker_install_output",
                 "data": "Failed to start install process.",
@@ -940,6 +1169,8 @@ fi
             "data": f"Install process started (PID {pid}), streaming output...",
             "status": "running",
         })
+        if job_id:
+            await update_job_progress(job_id, 20, "Install process started")
 
         # Poll output file
         lines_read = 0
@@ -948,6 +1179,9 @@ fi
 
         while consecutive_empty < max_empty:
             await asyncio.sleep(1)
+
+            if job_id and await is_cancel_requested(job_id):
+                raise asyncio.CancelledError
 
             # Check process status
             check_cmd = f"kill -0 {pid} 2>/dev/null && echo RUNNING || echo DONE"
@@ -970,6 +1204,9 @@ fi
                         })
                 lines_read += len(new_lines)
                 consecutive_empty = 0
+                if job_id:
+                    progress = min(90, 20 + (lines_read // 4))
+                    await update_job_progress(job_id, progress)
             else:
                 consecutive_empty += 1
 
@@ -995,12 +1232,19 @@ fi
                 full_output = full_result.get("stdout", "")
 
                 if "DOCKER_INSTALL_SUCCESS" in full_output:
+                    if job_id:
+                        await complete_job(
+                            job_id,
+                            {"message": "Docker installation completed successfully"},
+                        )
                     await websocket.send_json({
                         "type": "docker_install_output",
                         "data": "Docker installation completed successfully!",
                         "status": "completed",
                     })
                 else:
+                    if job_id:
+                        await fail_job(job_id, "Install finished but verification failed")
                     await websocket.send_json({
                         "type": "docker_install_output",
                         "data": "Installation process finished but verification failed. Check output above for errors.",
@@ -1018,11 +1262,15 @@ fi
             "data": "Installation timed out (no output for 10 minutes).",
             "status": "failed",
         })
+        if job_id:
+            await fail_job(job_id, "Installation timed out")
         kill_cmd = f"sudo kill {pid} 2>/dev/null; rm -f {tmpfile} {tmpscript} 2>/dev/null"
         await ssh_proxy.run_command(connection_id, kill_cmd, timeout=5)
 
     except asyncio.CancelledError:
         logger.info("Docker install task cancelled")
+        if job_id:
+            await cancel_job(job_id, "Docker install cancelled")
         if pid and pid.isdigit():
             try:
                 kill_cmd = f"sudo kill {pid} 2>/dev/null; rm -f {tmpfile} {tmpscript} 2>/dev/null"
@@ -1031,6 +1279,8 @@ fi
                 pass
     except Exception as e:
         logger.error(f"Docker install streaming error: {e}")
+        if job_id:
+            await fail_job(job_id, f"Install error: {str(e)}")
         try:
             await websocket.send_json({
                 "type": "docker_install_output",
@@ -1185,6 +1435,7 @@ async def _stream_docker_pull(
     websocket: WebSocket,
     connection_id: str,
     image_name: str,
+    job_id: str | None = None,
 ):
     """Stream `docker pull` output line-by-line.
 
@@ -1196,11 +1447,17 @@ async def _stream_docker_pull(
     pid = ""
 
     try:
+        if job_id:
+            await set_job_running(job_id)
+            await update_job_progress(job_id, 5, f"Pulling image {image_name}")
+
         await websocket.send_json({
             "type": "docker_pull_output",
             "data": f"Pulling image: {image_name}...",
             "status": "running",
         })
+        if job_id:
+            await add_job_event(job_id, "log", f"Pulling image {image_name}")
 
         # Start pull in background
         setup_cmd = (
@@ -1212,6 +1469,8 @@ async def _stream_docker_pull(
         setup_lines = setup_result.get("stdout", "").strip().split("\n")
 
         if len(setup_lines) < 2:
+            if job_id:
+                await fail_job(job_id, "Failed to start pull process")
             await websocket.send_json({
                 "type": "docker_pull_output",
                 "data": "Failed to start pull process.",
@@ -1223,6 +1482,8 @@ async def _stream_docker_pull(
         tmpfile = setup_lines[1].strip()
 
         if not pid.isdigit():
+            if job_id:
+                await fail_job(job_id, "Failed to start docker pull process")
             await websocket.send_json({
                 "type": "docker_pull_output",
                 "data": "Failed to start docker pull process.",
@@ -1259,6 +1520,9 @@ async def _stream_docker_pull(
                         })
                 lines_read += len(new_lines)
                 consecutive_empty = 0
+                if job_id:
+                    progress = min(90, 15 + (lines_read // 5))
+                    await update_job_progress(job_id, progress)
             else:
                 consecutive_empty += 1
 
@@ -1287,12 +1551,19 @@ async def _stream_docker_pull(
 
                 # Docker pull prints "Status: Downloaded newer image" or "Status: Image is up to date"
                 if "Status: Downloaded" in full_output or "Status: Image is up to date" in full_output:
+                    if job_id:
+                        await complete_job(
+                            job_id,
+                            {"message": f"Successfully pulled {image_name}", "image": image_name},
+                        )
                     await websocket.send_json({
                         "type": "docker_pull_output",
                         "data": f"Successfully pulled {image_name}",
                         "status": "completed",
                     })
                 elif "Error" in full_output or "error" in full_output.lower():
+                    if job_id:
+                        await fail_job(job_id, f"Pull failed for {image_name}")
                     await websocket.send_json({
                         "type": "docker_pull_output",
                         "data": f"Pull failed for {image_name}. Check output above.",
@@ -1300,6 +1571,11 @@ async def _stream_docker_pull(
                     })
                 else:
                     # Ambiguous - but process finished
+                    if job_id:
+                        await complete_job(
+                            job_id,
+                            {"message": f"Pull process completed for {image_name}", "image": image_name},
+                        )
                     await websocket.send_json({
                         "type": "docker_pull_output",
                         "data": f"Pull process completed for {image_name}.",
@@ -1317,11 +1593,15 @@ async def _stream_docker_pull(
             "data": "Pull timed out (no output for 10 minutes).",
             "status": "failed",
         })
+        if job_id:
+            await fail_job(job_id, "Pull timed out")
         kill_cmd = f"kill {pid} 2>/dev/null; rm -f {tmpfile} 2>/dev/null"
         await ssh_proxy.run_command(connection_id, kill_cmd, timeout=5)
 
     except asyncio.CancelledError:
         logger.info(f"Docker pull task cancelled for {image_name}")
+        if job_id:
+            await cancel_job(job_id, f"Pull cancelled for {image_name}")
         if pid and pid.isdigit():
             try:
                 kill_cmd = f"kill {pid} 2>/dev/null; rm -f {tmpfile} 2>/dev/null"
@@ -1330,6 +1610,8 @@ async def _stream_docker_pull(
                 pass
     except Exception as e:
         logger.error(f"Docker pull streaming error: {e}")
+        if job_id:
+            await fail_job(job_id, f"Pull error: {str(e)}")
         try:
             await websocket.send_json({
                 "type": "docker_pull_output",

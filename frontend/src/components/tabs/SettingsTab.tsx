@@ -247,6 +247,7 @@ const AISettingsSection: React.FC = () => {
   const [baseUrl, setBaseUrl] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [editingKey, setEditingKey] = useState(false);
+  const [clearKey, setClearKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
@@ -264,6 +265,7 @@ const AISettingsSection: React.FC = () => {
       setBaseUrl(settings.base_url || '');
       setApiKey('');
       setEditingKey(false);
+      setClearKey(false);
     }
   }, [loaded, settings]);
 
@@ -272,11 +274,13 @@ const AISettingsSection: React.FC = () => {
     try {
       await updateSettings({
         provider,
-        api_key: editingKey ? apiKey : undefined,
+        api_key: editingKey ? apiKey.trim() : undefined,
+        clear_api_key: clearKey,
         model: model || undefined,
         base_url: baseUrl || undefined,
       });
       setEditingKey(false);
+      setClearKey(false);
       setApiKey('');
     } finally {
       setSaving(false);
@@ -307,11 +311,20 @@ const AISettingsSection: React.FC = () => {
   const needsApiKey = provider === 'openai' || provider === 'anthropic';
   const showBaseUrl = provider === 'ollama';
   const masterEnabled = features.enabled;
+  const hasExistingKey = settings.has_api_key && !clearKey;
+  const hasNewKey = editingKey && apiKey.trim().length > 0;
+  const providerConfigured = !!provider && (!needsApiKey || hasExistingKey || hasNewKey);
 
   return (
     <Section title="AI Assistant" icon={<Sparkles size={16} className="text-[var(--accent)]" />}>
       <Row label="Enable AI Features" description="Master switch for all AI features">
         <Toggle checked={masterEnabled} onChange={setMasterEnabled} />
+      </Row>
+
+      <Row label="Provider Status" description="Whether saved provider settings are ready">
+        <span className={`text-xs font-medium ${settings.is_configured ? 'text-emerald-400' : 'text-[var(--text-muted)]'}`}>
+          {settings.is_configured ? 'Configured' : 'Needs setup'}
+        </span>
       </Row>
 
       {masterEnabled && (
@@ -321,7 +334,12 @@ const AISettingsSection: React.FC = () => {
             <Row label="Provider" description="AI service provider">
               <select
                 value={provider}
-                onChange={(e) => { setProvider(e.target.value); setEditingKey(false); setApiKey(''); }}
+                onChange={(e) => {
+                  setProvider(e.target.value);
+                  setEditingKey(false);
+                  setClearKey(false);
+                  setApiKey('');
+                }}
                 className="px-3 py-1.5 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent)] transition-colors cursor-pointer"
               >
                 <option value="">Select provider...</option>
@@ -340,7 +358,10 @@ const AISettingsSection: React.FC = () => {
                         <input
                           type={showKey ? 'text' : 'password'}
                           value={apiKey}
-                          onChange={(e) => setApiKey(e.target.value)}
+                          onChange={(e) => {
+                            setApiKey(e.target.value);
+                            setClearKey(false);
+                          }}
                           placeholder="sk-..."
                           className="w-48 pl-2.5 pr-8 py-1.5 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent)] font-mono"
                         />
@@ -353,18 +374,41 @@ const AISettingsSection: React.FC = () => {
                       </div>
                     </div>
                   ) : (
-                    <span className="text-xs text-[var(--text-muted)] font-mono">
-                      {settings.has_api_key ? settings.api_key_masked : 'Not set'}
+                    <span className={`text-xs font-mono ${clearKey ? 'text-[var(--danger)]' : 'text-[var(--text-muted)]'}`}>
+                      {clearKey ? 'Will be cleared on save' : (settings.has_api_key ? settings.api_key_masked : 'Not set')}
                     </span>
                   )}
                   <button
-                    onClick={() => { setEditingKey(!editingKey); setApiKey(''); setShowKey(false); }}
+                    onClick={() => {
+                      setEditingKey(!editingKey);
+                      setApiKey('');
+                      setShowKey(false);
+                      setClearKey(false);
+                    }}
                     className="px-2 py-1 rounded bg-[var(--bg-tertiary)] border border-[var(--border)] text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent)] transition-colors"
                   >
                     {editingKey ? 'Cancel' : 'Change'}
                   </button>
+                  {settings.has_api_key && !editingKey && (
+                    <button
+                      onClick={() => setClearKey((v) => !v)}
+                      className={`px-2 py-1 rounded border text-[10px] transition-colors ${
+                        clearKey
+                          ? 'bg-[var(--danger)]/10 border-[var(--danger)]/40 text-[var(--danger)]'
+                          : 'bg-[var(--bg-tertiary)] border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--danger)]/40'
+                      }`}
+                    >
+                      {clearKey ? 'Undo Clear' : 'Clear'}
+                    </button>
+                  )}
                 </div>
               </Row>
+            )}
+
+            {needsApiKey && !providerConfigured && (
+              <p className="text-xs text-[var(--warning,#f59e0b)]">
+                This provider needs an API key before AI features can be used.
+              </p>
             )}
 
             <Row label="Model" description="Model name (leave blank for default)">
@@ -393,7 +437,7 @@ const AISettingsSection: React.FC = () => {
             <div className="flex justify-end">
               <button
                 onClick={handleSaveSettings}
-                disabled={saving || !provider}
+                disabled={saving || !providerConfigured}
                 className="px-4 py-1.5 rounded bg-[var(--accent)] text-white text-xs font-medium hover:opacity-90 transition-opacity disabled:opacity-40"
               >
                 {saving ? 'Saving...' : 'Save Provider Settings'}

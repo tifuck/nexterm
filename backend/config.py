@@ -179,6 +179,81 @@ class AppConfig:
     def lockout_duration_minutes(self) -> int:
         return self._env_int("LOCKOUT_DURATION_MINUTES") or self.get("auth.lockout_duration_minutes", 15)
 
+    @property
+    def login_ip_limit_per_minute(self) -> int:
+        return self._env_int("LOGIN_IP_LIMIT_PER_MINUTE") or self.get("auth.login_ip_limit_per_minute", 10)
+
+    @property
+    def login_identifier_limit(self) -> int:
+        return self._env_int("LOGIN_IDENTIFIER_LIMIT") or self.get("auth.login_identifier_limit", 8)
+
+    @property
+    def login_identifier_window_seconds(self) -> int:
+        return self._env_int("LOGIN_IDENTIFIER_WINDOW_SECONDS") or self.get(
+            "auth.login_identifier_window_seconds", 900
+        )
+
+    @property
+    def login_block_seconds(self) -> int:
+        return self._env_int("LOGIN_BLOCK_SECONDS") or self.get("auth.login_block_seconds", 300)
+
+    @property
+    def register_ip_limit(self) -> int:
+        return self._env_int("REGISTER_IP_LIMIT") or self.get("auth.register_ip_limit", 5)
+
+    @property
+    def register_ip_window_seconds(self) -> int:
+        return self._env_int("REGISTER_IP_WINDOW_SECONDS") or self.get(
+            "auth.register_ip_window_seconds", 3600
+        )
+
+    @property
+    def register_identifier_limit(self) -> int:
+        return self._env_int("REGISTER_IDENTIFIER_LIMIT") or self.get("auth.register_identifier_limit", 3)
+
+    @property
+    def register_identifier_window_seconds(self) -> int:
+        return self._env_int("REGISTER_IDENTIFIER_WINDOW_SECONDS") or self.get(
+            "auth.register_identifier_window_seconds", 86400
+        )
+
+    @property
+    def register_block_seconds(self) -> int:
+        return self._env_int("REGISTER_BLOCK_SECONDS") or self.get("auth.register_block_seconds", 86400)
+
+    @property
+    def auth_min_failure_delay_ms(self) -> int:
+        return self._env_int("AUTH_MIN_FAILURE_DELAY_MS") or self.get("auth.min_failure_delay_ms", 400)
+
+    # -- Tools policy -------------------------------------------------------
+    @property
+    def tools_enabled(self) -> bool:
+        env = self._env_bool("TOOLS_ENABLED")
+        if env is not None:
+            return env
+        return self.get("tools.enabled", True)
+
+    @property
+    def tools_mutations_enabled(self) -> bool:
+        env = self._env_bool("TOOLS_MUTATIONS_ENABLED")
+        if env is not None:
+            return env
+        return self.get("tools.mutations_enabled", True)
+
+    @property
+    def tools_high_risk_enabled(self) -> bool:
+        env = self._env_bool("TOOLS_HIGH_RISK_ENABLED")
+        if env is not None:
+            return env
+        return self.get("tools.high_risk_enabled", True)
+
+    @property
+    def tools_audit_global_visibility(self) -> bool:
+        env = self._env_bool("TOOLS_AUDIT_GLOBAL_VISIBILITY")
+        if env is not None:
+            return env
+        return self.get("tools.audit_global_visibility", False)
+
     # -- Database ----------------------------------------------------------
     @property
     def database_url(self) -> str:
@@ -254,6 +329,17 @@ class AppConfig:
     @property
     def guacd_port(self) -> int:
         return self._env_int("GUACD_PORT") or self.get("guacd.port", 4822)
+
+    @property
+    def rdp_security_mode(self) -> str:
+        return self._env("RDP_SECURITY_MODE") or self.get("guacd.rdp_security_mode", "nla")
+
+    @property
+    def rdp_ignore_cert(self) -> bool:
+        env = self._env_bool("RDP_IGNORE_CERT")
+        if env is not None:
+            return env
+        return self.get("guacd.rdp_ignore_cert", False)
 
     # -- AI ----------------------------------------------------------------
     @property

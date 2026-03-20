@@ -7,6 +7,7 @@ import { useConfigStore } from '@/store/configStore';
 const LoginPage: React.FC = () => {
   const { login, isLoading } = useAuthStore();
   const appName = useConfigStore((s) => s.appName);
+  const registrationEnabled = useConfigStore((s) => s.registrationEnabled);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -18,7 +19,7 @@ const LoginPage: React.FC = () => {
     if (!username || !password) return;
     setError(null);
     try {
-      await login(username, password, rememberMe);
+      await login(username.trim(), password, rememberMe);
       // Navigation happens automatically via App.tsx auth guard
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed');
@@ -121,15 +122,17 @@ const LoginPage: React.FC = () => {
           </button>
 
           {/* Register link */}
-          <p className="mt-4 text-center text-xs text-[var(--text-muted)]">
-            Don&apos;t have an account?{' '}
-            <Link
-              to="/register"
-              className="text-[var(--accent)] hover:underline font-medium"
-            >
-              Create one
-            </Link>
-          </p>
+          {registrationEnabled && (
+            <p className="mt-4 text-center text-xs text-[var(--text-muted)]">
+              Don&apos;t have an account?{' '}
+              <Link
+                to="/register"
+                className="text-[var(--accent)] hover:underline font-medium"
+              >
+                Create one
+              </Link>
+            </p>
+          )}
         </form>
       </div>
     </div>

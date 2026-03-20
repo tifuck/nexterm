@@ -29,7 +29,7 @@ interface Props {
 }
 
 export const LogViewer: React.FC<Props> = ({ connectionId }) => {
-  const logAnalysisEnabled = useAIStore((s) => s.isFeatureEnabled('log_analysis'));
+  const logAnalysisEnabled = useAIStore((s) => s.isFeatureUsable('log_analysis'));
   const [entries, setEntries] = useState<LogEntry[]>([]);
   const [availableUnits, setAvailableUnits] = useState<string[]>([]);
   const [selectedUnit, setSelectedUnit] = useState('');

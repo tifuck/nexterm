@@ -1,11 +1,13 @@
 """Authentication routes — login, register, refresh, and current-user info."""
 
+import logging
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import or_, select
+from sqlalchemy import func, select
 
 from backend.config import config
 from backend.database import async_session_factory
@@ -16,7 +18,6 @@ from backend.middleware.auth import (
     get_current_user,
     verify_token,
 )
-from backend.middleware.rate_limit import check_rate_limit
 from backend.models.user import User
 from backend.schemas.auth import (
     ChangePasswordRequest,
@@ -28,8 +29,16 @@ from backend.schemas.auth import (
     TokenResponse,
     UserResponse,
 )
+from backend.services.auth_security import (
+    ensure_min_failure_delay,
+    guard_login_request,
+    guard_registration_request,
+    normalize_email,
+    normalize_username,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +51,9 @@ def _check_password(plain: str, hashed: str) -> bool:
 
 # Explicit cost factor — prevents regression if library default ever changes.
 _BCRYPT_ROUNDS = 12
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(
+    b"not-the-right-password", bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)
+).decode("utf-8")
 
 
 def _hash_password(plain: str) -> str:
@@ -57,16 +69,20 @@ def _hash_password(plain: str) -> str:
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, request: Request):
     """Authenticate a user and return access + refresh tokens."""
-    # Rate-limit: 10 login attempts per minute per IP
-    check_rate_limit(request, max_requests=10, window_seconds=60, key_suffix="login")
+    started_at = time.perf_counter()
+    await guard_login_request(request, body.username)
+    normalized_username = normalize_username(body.username)
 
     async with async_session_factory() as session:
         result = await session.execute(
-            select(User).where(User.username == body.username)
+            select(User).where(func.lower(User.username) == normalized_username.lower())
         )
         user = result.scalar_one_or_none()
 
         if user is None:
+            _check_password(body.password, _DUMMY_PASSWORD_HASH)
+            await ensure_min_failure_delay(started_at)
+            logger.warning("Failed login for unknown user '%s'", normalized_username)
             raise HTTPException(status_code=401, detail="Invalid username or password")
 
         # Check account lockout (uses configurable values)
@@ -78,6 +94,8 @@ async def login(body: LoginRequest, request: Request):
                 locked = locked.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) < locked:
                 # Use the same generic error to prevent username enumeration
+                await ensure_min_failure_delay(started_at)
+                logger.warning("Blocked login for locked user '%s'", user.username)
                 raise HTTPException(
                     status_code=401,
                     detail="Invalid username or password",
@@ -89,6 +107,8 @@ async def login(body: LoginRequest, request: Request):
 
         if not user.is_active:
             # Use the same generic error to prevent username enumeration
+            await ensure_min_failure_delay(started_at)
+            logger.warning("Blocked login for inactive user '%s'", user.username)
             raise HTTPException(status_code=401, detail="Invalid username or password")
 
         if not _check_password(body.password, user.password_hash):
@@ -98,19 +118,28 @@ async def login(body: LoginRequest, request: Request):
             if user.failed_login_attempts >= max_attempts:
                 user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=lockout_minutes)
             await session.commit()
+            await ensure_min_failure_delay(started_at)
+            logger.warning("Failed login for user '%s'", user.username)
             raise HTTPException(status_code=401, detail="Invalid username or password")
 
         # Successful login — reset failures, update last_login
         user.failed_login_attempts = 0
         user.last_failed_login = None
+        user.locked_until = None
         user.last_login = datetime.now(timezone.utc)
         await session.commit()
+
+    logger.info("Successful login for user '%s'", user.username)
 
     access_token = create_access_token(
         user_id=str(user.id),
         username=user.username,
+        token_version=user.token_version,
     )
-    refresh_token = create_refresh_token(user_id=str(user.id))
+    refresh_token = create_refresh_token(
+        user_id=str(user.id),
+        token_version=user.token_version,
+    )
 
     return TokenResponse(
         access_token=access_token,
@@ -127,16 +156,17 @@ async def login(body: LoginRequest, request: Request):
 @router.post("/register", response_model=UserResponse, status_code=201)
 async def register(body: RegisterRequest, request: Request):
     """Register a new user account."""
-    # Rate-limit: 5 registrations per hour per IP
-    check_rate_limit(request, max_requests=5, window_seconds=3600, key_suffix="register")
-
     if not config.registration_enabled:
         raise HTTPException(status_code=403, detail="Registration is currently disabled")
+
+    await guard_registration_request(request, body.username, body.email)
+    normalized_username = normalize_username(body.username)
+    normalized_email = normalize_email(body.email)
 
     async with async_session_factory() as session:
         # Check username uniqueness (generic error to prevent enumeration)
         result = await session.execute(
-            select(User).where(User.username == body.username)
+            select(User).where(func.lower(User.username) == normalized_username.lower())
         )
         if result.scalar_one_or_none() is not None:
             raise HTTPException(
@@ -145,9 +175,9 @@ async def register(body: RegisterRequest, request: Request):
             )
 
         # Check email uniqueness (only if email is provided)
-        if body.email:
+        if normalized_email:
             result = await session.execute(
-                select(User).where(User.email == body.email)
+                select(User).where(func.lower(User.email) == normalized_email)
             )
             if result.scalar_one_or_none() is not None:
                 raise HTTPException(
@@ -156,20 +186,24 @@ async def register(body: RegisterRequest, request: Request):
                 )
 
         user = User(
-            username=body.username,
-            email=body.email,
+            username=normalized_username,
+            email=normalized_email,
             password_hash=_hash_password(body.password),
             encryption_salt=secrets.token_hex(32),
             is_active=True,
+            role="user",
         )
         session.add(user)
         await session.commit()
         await session.refresh(user)
 
+    logger.info("Registered new user '%s'", user.username)
+
     return UserResponse(
         id=str(user.id),
         username=user.username,
         email=user.email,
+        role=user.role,
         is_active=user.is_active,
         created_at=user.created_at,
         last_login=user.last_login,
@@ -184,7 +218,7 @@ async def register(body: RegisterRequest, request: Request):
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh(body: RefreshRequest):
     """Exchange a valid refresh token for a new access + refresh token pair."""
-    payload = verify_token(body.refresh_token, allow_refresh=True)
+    payload = await verify_token(body.refresh_token, allow_refresh=True)
 
     if payload.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Invalid token type")
@@ -203,6 +237,9 @@ async def refresh(body: RefreshRequest):
     if not user.is_active:
         raise HTTPException(status_code=401, detail="Account is disabled")
 
+    if payload.get("ver", 0) != user.token_version:
+        raise HTTPException(status_code=401, detail="Session is no longer valid")
+
     # Blocklist the old refresh token to prevent replay attacks.
     old_exp = payload.get("exp")
     if old_exp:
@@ -211,8 +248,12 @@ async def refresh(body: RefreshRequest):
     access_token = create_access_token(
         user_id=str(user.id),
         username=user.username,
+        token_version=user.token_version,
     )
-    new_refresh_token = create_refresh_token(user_id=str(user.id))
+    new_refresh_token = create_refresh_token(
+        user_id=str(user.id),
+        token_version=user.token_version,
+    )
 
     return TokenResponse(
         access_token=access_token,
@@ -242,6 +283,7 @@ async def get_me(current_user: User = Depends(get_current_user)):
         id=str(current_user.id),
         username=current_user.username,
         email=current_user.email,
+        role=current_user.role,
         is_active=current_user.is_active,
         created_at=current_user.created_at,
         last_login=current_user.last_login,
@@ -326,6 +368,7 @@ async def change_password(
 
         user.password_hash = _hash_password(body.new_password)
         user.encryption_salt = secrets.token_hex(32)
+        user.token_version += 1
         await session.commit()
 
     return ChangePasswordResponse(encryption_salt=user.encryption_salt)
@@ -346,7 +389,7 @@ async def logout(
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        payload = verify_token(token)
+        payload = await verify_token(token)
         exp = payload.get("exp")
         if exp:
             add_to_token_blocklist(token, exp)
@@ -354,7 +397,7 @@ async def logout(
     # Blocklist the refresh token if the client sent it
     if body and body.refresh_token:
         try:
-            r_payload = verify_token(body.refresh_token, allow_refresh=True)
+            r_payload = await verify_token(body.refresh_token, allow_refresh=True)
             r_exp = r_payload.get("exp")
             if r_exp:
                 add_to_token_blocklist(body.refresh_token, r_exp)

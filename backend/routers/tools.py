@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from backend.config import config
 from backend.middleware.auth import get_current_user
 from backend.models.user import User
+from backend.services.ai_service import call_ai, check_ai_feature, get_ai_client
 from backend.services.ssh_proxy import ssh_proxy
 from backend.schemas.tools import (
     ProcessListResponse,
@@ -787,6 +788,7 @@ async def analyze_logs(
 
     # Count errors and warnings in the log text
     log_text = request.log_text
+    total_lines = len([line for line in log_text.split("\n") if line.strip()])
     error_count = 0
     warning_count = 0
     for line in log_text.split("\n"):
@@ -796,26 +798,19 @@ async def analyze_logs(
         if any(w in lower for w in ["warn", "warning", "deprecated"]):
             warning_count += 1
 
-    # Try AI analysis
     try:
-        from backend.routers.ai import get_ai_client, call_ai, check_ai_feature
-
         await check_ai_feature(current_user, "log_analysis")
         settings = await get_ai_client(current_user)
 
-        system_prompt = """You are a Linux system administrator analyzing server logs. Provide:
-1. A concise summary of what's happening in these logs (2-3 sentences)
-2. Key insights as a JSON array of strings
+        system_prompt = """You are a Linux SRE analyzing server logs.
 
-Respond in this exact JSON format:
-{"summary": "...", "insights": ["insight 1", "insight 2", ...]}
+Return JSON only, with this exact schema:
+{"summary":"...","insights":["..."],"priority":"low|medium|high"}
 
-Focus on:
-- Root causes of errors
-- Patterns or recurring issues
-- Security concerns
-- Performance implications
-- Recommended actions"""
+Rules:
+- Summary: 2 concise sentences focused on impact and likely root cause
+- Insights: 2-6 concrete, actionable findings (not generic advice)
+- Prioritize security, availability, and performance signals"""
 
         user_prompt = f"Analyze these server logs:\n\n```\n{log_text[:10000]}\n```"
         if request.context:
@@ -823,34 +818,40 @@ Focus on:
 
         ai_response = await call_ai(settings, system_prompt, user_prompt)
 
-        # Try to parse structured response
+        ai_payload = ai_response.strip()
+        if ai_payload.startswith("```"):
+            ai_payload = ai_payload.strip("`")
+            if ai_payload.startswith("json"):
+                ai_payload = ai_payload[4:].strip()
+
         try:
-            ai_data = json.loads(ai_response)
-            return LogAnalyzeResponse(
-                summary=ai_data.get("summary", ai_response),
-                error_count=error_count,
-                warning_count=warning_count,
-                insights=ai_data.get("insights", []),
-            )
+            ai_data = json.loads(ai_payload)
         except json.JSONDecodeError:
-            return LogAnalyzeResponse(
-                summary=ai_response,
-                error_count=error_count,
-                warning_count=warning_count,
-                insights=[],
-            )
-    except HTTPException:
-        # AI not configured; return basic analysis
+            ai_data = {}
+
+        if isinstance(ai_data, dict):
+            insights_raw = ai_data.get("insights", [])
+            insights = [str(item).strip() for item in insights_raw if str(item).strip()][:6] if isinstance(insights_raw, list) else []
+            summary = str(ai_data.get("summary", "")).strip() or ai_response.strip()
+        else:
+            insights = []
+            summary = ai_response.strip()
+
         return LogAnalyzeResponse(
-            summary=f"Found {error_count} error(s) and {warning_count} warning(s) in {len(log_text.split(chr(10)))} log lines. Configure AI in Settings for deeper analysis.",
+            summary=summary,
             error_count=error_count,
             warning_count=warning_count,
-            insights=[],
+            insights=insights,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"AI log analysis error: {e}")
         return LogAnalyzeResponse(
-            summary=f"AI analysis failed: {str(e)}. Found {error_count} error(s) and {warning_count} warning(s).",
+            summary=(
+                f"Found {error_count} error(s) and {warning_count} warning(s) in {total_lines} log lines. "
+                "AI analysis is temporarily unavailable; review the most recent error lines first."
+            ),
             error_count=error_count,
             warning_count=warning_count,
             insights=[],
@@ -2816,7 +2817,7 @@ async def check_custom_packages(
         cmd = f"{matched_prefix}{safe_arg} >/dev/null 2>&1 && echo FOUND || echo NOTFOUND"
         result = await ssh_proxy.run_command(connection_id, cmd, timeout=5)
         stdout = result.get("stdout", "").strip()
-        installed[item.name] = "FOUND" in stdout
+        installed[item.name] = stdout == "FOUND"
 
     return PackageCheckResponse(installed=installed)
 

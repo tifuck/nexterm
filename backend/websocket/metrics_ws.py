@@ -2,9 +2,9 @@
 import asyncio
 import json
 import logging
-from fastapi import WebSocket, WebSocketDisconnect, Query
+from fastapi import WebSocket, WebSocketDisconnect
 from backend.services.ssh_proxy import ssh_proxy
-from backend.middleware.auth import verify_token
+from backend.middleware.auth import get_user_from_token
 from backend.config import config
 
 logger = logging.getLogger(__name__)
@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 async def metrics_websocket_handler(
     websocket: WebSocket,
-    token: str = Query(default=None, deprecated=True),
 ):
     """Handle system metrics WebSocket connections.
     
@@ -36,34 +35,23 @@ async def metrics_websocket_handler(
     metrics_task = None
     
     try:
-        if token:
-            try:
-                payload = verify_token(token)
-                user_id = payload.get("sub")
-            except Exception:
-                await websocket.send_json({"type": "error", "message": "Invalid token"})
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+            msg = json.loads(raw)
+            if msg.get("type") == "auth":
+                _, user = await get_user_from_token(msg.get("token", ""))
+                user_id = str(user.id)
+                await websocket.send_json({"type": "authenticated"})
+            else:
+                await websocket.send_json({"type": "error", "message": "Authentication required"})
                 await websocket.close(code=4001)
                 return
-
-        # Enforce auth timeout if not authenticated via query param
-        if not user_id:
-            try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
-                msg = json.loads(raw)
-                if msg.get("type") == "auth":
-                    payload = verify_token(msg.get("token", ""))
-                    user_id = payload.get("sub")
-                    await websocket.send_json({"type": "authenticated"})
-                else:
-                    await websocket.send_json({"type": "error", "message": "Authentication required"})
-                    await websocket.close(code=4001)
-                    return
-            except asyncio.TimeoutError:
-                await websocket.close(code=4001)
-                return
-            except Exception:
-                await websocket.close(code=4001)
-                return
+        except asyncio.TimeoutError:
+            await websocket.close(code=4001)
+            return
+        except Exception:
+            await websocket.close(code=4001)
+            return
 
         while True:
             try:
@@ -76,8 +64,8 @@ async def metrics_websocket_handler(
                         await websocket.send_json({"type": "error", "message": "Already authenticated"})
                         continue
                     try:
-                        payload = verify_token(msg.get("token", ""))
-                        user_id = payload.get("sub")
+                        _, user = await get_user_from_token(msg.get("token", ""))
+                        user_id = str(user.id)
                         await websocket.send_json({"type": "authenticated"})
                     except Exception:
                         await websocket.send_json({"type": "error", "message": "Auth failed"})

@@ -29,7 +29,9 @@ from backend.routers.ai import router as ai_router
 from backend.routers.api_keys import router as api_keys_router
 from backend.routers.command_history import router as history_router
 from backend.routers.tools import router as tools_router
+from backend.routers.tools_platform import router as tools_platform_router
 from backend.routers.known_hosts import router as known_hosts_router
+from backend.middleware.tools_guard import ToolsGuardMiddleware
 
 # Import WebSocket handlers
 from backend.websocket.ssh_ws import ssh_websocket_handler
@@ -69,6 +71,12 @@ async def lifespan(app: FastAPI):
     # Initialize database
     await init_db()
     logger.info("Database initialized")
+
+    from backend.services.auth_security import normalize_user_roles
+
+    normalized_roles = await normalize_user_roles()
+    if normalized_roles:
+        logger.info("Normalized %d user account roles to 'user'", normalized_roles)
     
     # Connect to the dedicated SSH manager process via IPC.
     # The SSH process is started by run.py before uvicorn launches.
@@ -81,13 +89,15 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("guacd disabled — RDP/VNC connections will be unavailable")
 
-    # Background task: periodically purge expired token revocations from DB.
+    # Background task: periodically purge expired token revocations and stale auth buckets.
     from backend.middleware.auth import purge_expired_revocations
+    from backend.services.auth_security import purge_stale_auth_rate_limits
 
     async def _purge_loop() -> None:
         while True:
             await asyncio.sleep(3600)  # every hour
             await purge_expired_revocations()
+            await purge_stale_auth_rate_limits()
 
     purge_task = asyncio.create_task(_purge_loop())
 
@@ -156,6 +166,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "Content-Security-Policy",
             (
                 "default-src 'self'; "
+                "base-uri 'self'; "
+                "object-src 'none'; "
+                "form-action 'self'; "
                 "script-src 'self'; "
                 "style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' data: blob:; "
@@ -173,6 +186,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(ToolsGuardMiddleware)
 
 
 # Register API routers
@@ -186,6 +200,7 @@ app.include_router(ai_router)
 app.include_router(api_keys_router)
 app.include_router(history_router)
 app.include_router(tools_router)
+app.include_router(tools_platform_router)
 app.include_router(known_hosts_router)
 
 # WebSocket endpoints

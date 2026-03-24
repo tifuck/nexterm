@@ -705,6 +705,7 @@ class WireGuardStatusResponse(BaseModel):
     installed: bool = False
     version: str = ""
     active: bool = False
+    warning: str = ""
     server_public_key: str = ""
     listen_port: str = ""
     address: str = ""

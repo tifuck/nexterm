@@ -3783,12 +3783,16 @@ fi
 
 # Check if already installed
 already="false"
-[ -e /etc/wireguard/wg0.conf ] && already="true"
+has_wg_binary="false"
+if command -v wg >/dev/null 2>&1 || command -v wg-quick >/dev/null 2>&1; then
+  has_wg_binary="true"
+fi
+[ -e /etc/wireguard/wg0.conf ] && [ "$has_wg_binary" = "true" ] && already="true"
 
 # Detect container / BoringTun need
 is_container="false"
 needs_boringtun="false"
-if systemd-detect-virt -cq 2>/dev/null; then
+if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -cq 2>/dev/null; then
   is_container="true"
   if ! grep -q "^wireguard " /proc/modules 2>/dev/null; then
     needs_boringtun="true"
@@ -3799,20 +3803,37 @@ if systemd-detect-virt -cq 2>/dev/null; then
   fi
 fi
 
-# Get public IP
-public_ip=$(wget -T 5 -t 1 -4qO- "http://ip1.dynupdate.no-ip.com/" 2>/dev/null || curl -m 5 -4Ls "http://ip1.dynupdate.no-ip.com/" 2>/dev/null || echo "")
+# Skip slow network lookups when WireGuard is already configured.
+if [ "$already" = "true" ]; then
+  printf "SUPPORTED:%s\n" "$supported"
+  printf "OS:%s\n" "$os_pretty"
+  printf "OS_VERSION:%s\n" "$os_version"
+  printf "ALREADY_INSTALLED:%s\n" "$already"
+  printf "PUBLIC_IP:%s\n" ""
+  printf "LOCAL_IPS:%s\n" ""
+  printf "HAS_IPV6:%s\n" "false"
+  printf "IPV6_ADDR:%s\n" ""
+  printf "IS_CONTAINER:%s\n" "$is_container"
+  printf "NEEDS_BORINGTUN:%s\n" "$needs_boringtun"
+  printf "REASON:%s\n" "$reason"
+  exit 0
+fi
 
 # Get local IPs
-local_ips=""
-for lip in $(ip -4 addr | grep inet | grep -vE "127(\.[0-9]{1,3}){3}" | cut -d "/" -f 1 | grep -oE "[0-9]{1,3}(\.[0-9]{1,3}){3}"); do
-  [ -n "$local_ips" ] && local_ips="${local_ips},"
-  local_ips="${local_ips}${lip}"
-done
+local_ips=$(ip -o -4 addr show scope global 2>/dev/null | awk "{print \$4}" | cut -d "/" -f 1 | tr "\n" "," | sed "s/,$//")
+
+# Get public IP
+public_ip=""
+if command -v curl >/dev/null 2>&1; then
+  public_ip=$(curl -4fsSL --connect-timeout 2 --max-time 3 https://api.ipify.org 2>/dev/null || true)
+elif command -v wget >/dev/null 2>&1; then
+  public_ip=$(wget -4qO- --timeout=3 --tries=1 https://api.ipify.org 2>/dev/null || true)
+fi
 
 # IPv6
 has_ipv6="false"
 ipv6_addr=""
-v6=$(ip -6 addr | grep "inet6 [23]" | cut -d "/" -f 1 | grep -oE "([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}" | head -1)
+v6=$(ip -o -6 addr show scope global 2>/dev/null | awk "{print \$4}" | cut -d "/" -f 1 | head -1)
 if [ -n "$v6" ]; then
   has_ipv6="true"
   ipv6_addr="$v6"
@@ -3834,7 +3855,12 @@ printf "REASON:%s\n" "$reason"
 
 WG_STATUS_SCRIPT = r"""
 bash -c '
-if ! command -v wg >/dev/null 2>&1 || [ ! -e /etc/wireguard/wg0.conf ]; then
+has_config="false"
+[ -e /etc/wireguard/wg0.conf ] && has_config="true"
+has_wg_binary="false"
+command -v wg >/dev/null 2>&1 && has_wg_binary="true"
+
+if [ "$has_config" != "true" ] || [ "$has_wg_binary" != "true" ]; then
   echo "INSTALLED:false"
   exit 0
 fi
@@ -3843,76 +3869,139 @@ ver=$(wg --version 2>/dev/null | awk "{print \$2}" || echo "unknown")
 echo "INSTALLED:true"
 echo "VERSION:${ver}"
 
-# Server interface info
-pubkey=$(sudo wg show wg0 public-key 2>/dev/null || echo "")
-listen=$(sudo wg show wg0 listen-port 2>/dev/null || echo "")
-addr=$(ip -4 addr show wg0 2>/dev/null | grep -oP "inet \K[0-9./]+" | head -1)
-[ -z "$addr" ] && addr=$(ip -6 addr show wg0 2>/dev/null | grep -oP "inet6 \K[0-9a-f:/]+" | head -1)
+warning=""
+wg_cmd=""
+if wg show all dump >/dev/null 2>&1; then
+  wg_cmd="wg"
+elif sudo -n wg show all dump >/dev/null 2>&1; then
+  wg_cmd="sudo -n wg"
+fi
 
-state=$(ip link show wg0 2>/dev/null | grep -oP "state \K\w+" || echo "DOWN")
+config_content=""
+if cat /etc/wireguard/wg0.conf >/dev/null 2>&1; then
+  config_content=$(cat /etc/wireguard/wg0.conf 2>/dev/null)
+elif sudo -n cat /etc/wireguard/wg0.conf >/dev/null 2>&1; then
+  config_content=$(sudo -n cat /etc/wireguard/wg0.conf 2>/dev/null)
+fi
+
+if [ -z "$wg_cmd" ] && [ -z "$config_content" ]; then
+  echo "STATUS_ERROR:WireGuard is installed, but this SSH user cannot read live wg data or /etc/wireguard/wg0.conf. Connect as root or allow passwordless sudo for wg and cat."
+  exit 0
+fi
+
+if [ -z "$wg_cmd" ]; then
+  warning="Live WireGuard statistics unavailable for this SSH user; connect as root or allow passwordless sudo for wg."
+fi
+if [ -z "$config_content" ]; then
+  [ -n "$warning" ] && warning="${warning} "
+  warning="${warning}WireGuard config is not readable; named clients and endpoint details may be incomplete."
+fi
+
+endpoint=""
+listen=""
+config_addr=""
+pubkey=""
+if [ -n "$config_content" ]; then
+  endpoint=$(printf "%s\n" "$config_content" | awk "/^# ENDPOINT / {print \$3; exit}")
+  listen=$(printf "%s\n" "$config_content" | awk -F "=" "/^[[:space:]]*ListenPort[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$/, \"\", \$2); print \$2; exit}")
+  config_addr=$(printf "%s\n" "$config_content" | awk -F "=" "/^[[:space:]]*Address[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$/, \"\", \$2); split(\$2, parts, /,[[:space:]]*/); print parts[1]; exit}")
+  server_privkey=$(printf "%s\n" "$config_content" | awk -F "=" "/^[[:space:]]*PrivateKey[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$/, \"\", \$2); print \$2; exit}")
+  if [ -n "$server_privkey" ]; then
+    pubkey=$(printf "%s\n" "$server_privkey" | wg pubkey 2>/dev/null || echo "")
+  fi
+fi
+
+# Server interface info
+addr=$(ip -o -4 addr show wg0 2>/dev/null | awk "{print \$4}" | cut -d "/" -f 1 | head -1)
+[ -z "$addr" ] && addr=$(ip -o -6 addr show wg0 2>/dev/null | awk "{print \$4}" | cut -d "/" -f 1 | head -1)
+[ -z "$addr" ] && addr="$config_addr"
+
+state=$(ip link show wg0 2>/dev/null | awk "{for (i = 1; i <= NF; i++) if (\$i == \"state\") {print \$(i + 1); exit}}")
 active="false"
 [ "$state" = "UP" ] || [ "$state" = "UNKNOWN" ] && active="true"
 
-# Get endpoint from config comment
-endpoint=$(grep "^# ENDPOINT" /etc/wireguard/wg0.conf 2>/dev/null | cut -d " " -f 3)
-
 # Public IP for display
-public_ip=$(wget -T 3 -t 1 -4qO- "http://ip1.dynupdate.no-ip.com/" 2>/dev/null || curl -m 3 -4Ls "http://ip1.dynupdate.no-ip.com/" 2>/dev/null || echo "")
-
-printf "SERVER_INFO:%s|%s|%s|%s|%s|%s\n" "$pubkey" "$listen" "$addr" "$active" "$endpoint" "$public_ip"
-
-# Parse named clients from config (BEGIN_PEER / END_PEER markers)
-# Also detect disabled clients (commented-out blocks)
-now=$(date +%s)
-current_name=""
-while IFS= read -r line; do
-  if echo "$line" | grep -q "^# BEGIN_PEER "; then
-    current_name=$(echo "$line" | sed "s/^# BEGIN_PEER //")
-    echo "CLIENT_START:${current_name}:enabled"
-  elif echo "$line" | grep -q "^# DISABLED_BEGIN_PEER "; then
-    current_name=$(echo "$line" | sed "s/^# DISABLED_BEGIN_PEER //")
-    echo "CLIENT_START:${current_name}:disabled"
-  elif echo "$line" | grep -q "^# END_PEER \|^# DISABLED_END_PEER "; then
-    echo "CLIENT_END"
-    current_name=""
+public_ip=""
+if [ -z "$endpoint" ]; then
+  if command -v curl >/dev/null 2>&1; then
+    public_ip=$(curl -4fsSL --connect-timeout 2 --max-time 3 https://api.ipify.org 2>/dev/null || true)
+  elif command -v wget >/dev/null 2>&1; then
+    public_ip=$(wget -4qO- --timeout=3 --tries=1 https://api.ipify.org 2>/dev/null || true)
   fi
-done < /etc/wireguard/wg0.conf
+fi
 
-# Get live peer stats from wg show dump
+declare -A peer_name_by_key
+if [ -n "$config_content" ]; then
+  current_name=""
+  while IFS= read -r line; do
+    case "$line" in
+      "# BEGIN_PEER "*)
+        current_name=${line#"# BEGIN_PEER "}
+        echo "CLIENT_START:${current_name}:enabled"
+        ;;
+      "# DISABLED_BEGIN_PEER "*)
+        current_name=${line#"# DISABLED_BEGIN_PEER "}
+        echo "CLIENT_START:${current_name}:disabled"
+        ;;
+      "PublicKey = "*)
+        if [ -n "$current_name" ]; then
+          current_public_key=${line#"PublicKey = "}
+          peer_name_by_key["$current_public_key"]="$current_name"
+        fi
+        ;;
+      "# END_PEER "*|"# DISABLED_END_PEER "*)
+        current_name=""
+        ;;
+    esac
+  done <<< "$config_content"
+fi
+
+now=$(date +%s)
 total_rx=0
 total_tx=0
-sudo wg show wg0 dump 2>/dev/null | tail -n +2 | while IFS="$(printf "\t")" read -r pk psk ep aip hs rx tx ka; do
-  hs_fmt=""
-  has_recent="false"
-  if [ "$hs" != "0" ] && [ -n "$hs" ]; then
-    hs_fmt=$(date -d "@$hs" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$hs" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$hs")
-    age=$((now - hs))
-    [ "$age" -lt 180 ] && has_recent="true"
+if [ -n "$wg_cmd" ]; then
+  dump_output=$($wg_cmd show wg0 dump 2>/dev/null || true)
+  if [ -n "$dump_output" ]; then
+    interface_line=$(printf "%s\n" "$dump_output" | awk "NR == 1 {print; exit}")
+    if [ -n "$interface_line" ]; then
+      IFS="$(printf "\t")" read -r _iface_private iface_pubkey iface_listen _iface_fwmark <<EOF
+$interface_line
+EOF
+      [ -z "$pubkey" ] && pubkey="$iface_pubkey"
+      [ -z "$listen" ] && listen="$iface_listen"
+    fi
+
+    while IFS="$(printf "\t")" read -r pk psk ep aip hs rx tx ka; do
+      [ -z "$pk" ] && continue
+      rx=${rx:-0}
+      tx=${tx:-0}
+      hs_fmt=""
+      has_recent="false"
+      if [ "$hs" != "0" ] && [ -n "$hs" ]; then
+        hs_fmt=$(date -d "@$hs" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$hs" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$hs")
+        age=$((now - hs))
+        [ "$age" -lt 180 ] && has_recent="true"
+      fi
+      rx_h=$(numfmt --to=iec "$rx" 2>/dev/null || echo "${rx}B")
+      tx_h=$(numfmt --to=iec "$tx" 2>/dev/null || echo "${tx}B")
+      ka_str=""
+      [ "$ka" != "off" ] && [ -n "$ka" ] && ka_str="${ka}s"
+      client_name="${peer_name_by_key[$pk]}"
+      [ -z "$client_name" ] && client_name="peer-${pk:0:8}"
+      total_rx=$((total_rx + rx))
+      total_tx=$((total_tx + tx))
+      printf "LIVE_PEER:%s|%s|%s|%s|%s|%s|%s|%s|%s\n" "$client_name" "$pk" "$ep" "$aip" "$hs_fmt" "$rx_h" "$tx_h" "$ka_str" "$has_recent"
+    done < <(printf "%s\n" "$dump_output" | awk "NR > 1 {print}")
   fi
-  rx_h=$(numfmt --to=iec "$rx" 2>/dev/null || echo "${rx}B")
-  tx_h=$(numfmt --to=iec "$tx" 2>/dev/null || echo "${tx}B")
-  ka_str=""
-  [ "$ka" != "off" ] && [ -n "$ka" ] && ka_str="${ka}s"
+fi
 
-  # Find client name for this public key
-  client_name=$(grep -B1 "PublicKey = " /etc/wireguard/wg0.conf 2>/dev/null | grep -B1 "$pk" | grep -oP "BEGIN_PEER \K.*" | head -1)
-  [ -z "$client_name" ] && client_name="unknown"
-
-  printf "LIVE_PEER:%s|%s|%s|%s|%s|%s|%s|%s|%s\n" "$client_name" "$pk" "$ep" "$aip" "$hs_fmt" "$rx_h" "$tx_h" "$ka_str" "$has_recent"
-done
-
-# Total transfer
-sudo wg show wg0 transfer 2>/dev/null | while IFS="$(printf "\t")" read -r pk rx tx; do
-  total_rx=$((total_rx + rx))
-  total_tx=$((total_tx + tx))
-done
-trx=$(sudo wg show wg0 transfer 2>/dev/null | awk -F"\t" "{s+=\$2} END {print s+0}")
-ttx=$(sudo wg show wg0 transfer 2>/dev/null | awk -F"\t" "{s+=\$3} END {print s+0}")
-trx_h=$(numfmt --to=iec "$trx" 2>/dev/null || echo "${trx}B")
-ttx_h=$(numfmt --to=iec "$ttx" 2>/dev/null || echo "${ttx}B")
+trx_h=$(numfmt --to=iec "$total_rx" 2>/dev/null || echo "${total_rx}B")
+ttx_h=$(numfmt --to=iec "$total_tx" 2>/dev/null || echo "${total_tx}B")
+printf "SERVER_INFO:%s|%s|%s|%s|%s|%s\n" "$pubkey" "$listen" "$addr" "$active" "$endpoint" "$public_ip"
 printf "TOTAL_TRANSFER:%s|%s\n" "$trx_h" "$ttx_h"
+[ -n "$warning" ] && printf "WARNING:%s\n" "$warning"
 echo "STATUS_END"
-' 2>/dev/null
+'
 """
 
 
@@ -4490,6 +4579,7 @@ async def get_wireguard_status(
 
     data: dict = {
         "installed": False, "version": "", "active": False,
+        "warning": "",
         "server_public_key": "", "listen_port": "", "address": "",
         "endpoint": "", "public_ip": "",
         "total_transfer_rx": "0", "total_transfer_tx": "0",
@@ -4517,11 +4607,16 @@ async def get_wireguard_status(
             data["active"] = parts[3] == "true" if len(parts) > 3 else False
             data["endpoint"] = parts[4] if len(parts) > 4 else ""
             data["public_ip"] = parts[5] if len(parts) > 5 else ""
+        elif line.startswith("WARNING:"):
+            data["warning"] = line.split(":", 1)[1]
         elif line.startswith("CLIENT_START:"):
             parts = line.split(":", 1)[1].split(":", 1)
             name = parts[0] if len(parts) > 0 else ""
             enabled = parts[1] != "disabled" if len(parts) > 1 else True
             client_configs.append({"name": name, "enabled": enabled})
+        elif line.startswith("STATUS_ERROR:"):
+            detail = line.split(":", 1)[1].strip() or "Failed to inspect WireGuard status"
+            raise HTTPException(status_code=400, detail=detail)
         elif line.startswith("LIVE_PEER:"):
             parts = line.split(":", 1)[1].split("|", 8)
             name = parts[0] if len(parts) > 0 else "unknown"
@@ -4543,9 +4638,31 @@ async def get_wireguard_status(
     # Merge config clients with live stats
     active_count = 0
     clients = []
+    matched_live_peers: set[str] = set()
     for cc in client_configs:
         name = cc["name"]
         live = live_peers.get(name, {})
+        has_recent = live.get("has_recent_handshake", False)
+        if has_recent:
+            active_count += 1
+        if live:
+            matched_live_peers.add(name)
+        clients.append(WireGuardClient(
+            name=name,
+            public_key=live.get("public_key", ""),
+            allowed_ips=live.get("allowed_ips", ""),
+            endpoint=live.get("endpoint", ""),
+            latest_handshake=live.get("latest_handshake", ""),
+            transfer_rx=live.get("transfer_rx", ""),
+            transfer_tx=live.get("transfer_tx", ""),
+            persistent_keepalive=live.get("persistent_keepalive", ""),
+            enabled=cc["enabled"],
+            has_recent_handshake=has_recent,
+        ))
+
+    for name, live in live_peers.items():
+        if name in matched_live_peers:
+            continue
         has_recent = live.get("has_recent_handshake", False)
         if has_recent:
             active_count += 1
@@ -4558,7 +4675,7 @@ async def get_wireguard_status(
             transfer_rx=live.get("transfer_rx", ""),
             transfer_tx=live.get("transfer_tx", ""),
             persistent_keepalive=live.get("persistent_keepalive", ""),
-            enabled=cc["enabled"],
+            enabled=True,
             has_recent_handshake=has_recent,
         ))
 
@@ -4579,7 +4696,7 @@ async def toggle_wireguard(
 
     state_result = await _run(
         connection_id,
-        "ip link show wg0 2>/dev/null | grep -oP 'state \\K\\w+'",
+        "ip link show wg0 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == \"state\") {print $(i+1); exit}}'",
         timeout=5,
     )
     current_state = state_result.get("stdout", "").strip()

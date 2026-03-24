@@ -35,6 +35,7 @@ export const ToolModal: React.FC<Props> = ({ title, icon, children }) => {
 
     const buttons = Array.from(modalRef.current.querySelectorAll('button')) as HTMLButtonElement[];
     const match = buttons.find((btn) => {
+      if (btn.getAttribute('data-modal-action') === 'refresh') return false;
       const titleText = (btn.getAttribute('title') || '').toLowerCase();
       const content = (btn.textContent || '').toLowerCase();
       return titleText.includes('refresh') || content.includes('refresh');
@@ -133,6 +134,7 @@ export const ToolModal: React.FC<Props> = ({ title, icon, children }) => {
           <h2 className="text-sm font-semibold text-[var(--text-primary)] flex-1">{title}</h2>
           <button
             onClick={triggerRefresh}
+            data-modal-action="refresh"
             className="p-1 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
             title="Refresh (R)"
           >
@@ -140,6 +142,7 @@ export const ToolModal: React.FC<Props> = ({ title, icon, children }) => {
           </button>
           <button
             onClick={triggerExport}
+            data-modal-action="export"
             className="p-1 rounded hover:bg-[var(--bg-tertiary)] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
             title="Export (E)"
           >

@@ -59,6 +59,7 @@ interface WireGuardStatus {
   installed: boolean;
   version: string;
   active: boolean;
+  warning: string;
   server_public_key: string;
   listen_port: string;
   address: string;
@@ -130,6 +131,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
   const [status, setStatus] = useState<WireGuardStatus | null>(null);
   const [installCheck, setInstallCheck] = useState<WireGuardInstallCheck | null>(null);
   const [loading, setLoading] = useState(false);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
   // Install flow
@@ -143,6 +145,8 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
   const [customDns, setCustomDns] = useState('');
   const installOutputRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const checkRequestIdRef = useRef(0);
+  const statusRequestIdRef = useRef(0);
 
   // Add client dialog
   const [showAddClient, setShowAddClient] = useState(false);
@@ -166,13 +170,20 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
   // -------------------------------------------------------------------
 
   const runCheck = useCallback(async () => {
+    const requestId = checkRequestIdRef.current + 1;
+    checkRequestIdRef.current = requestId;
+    statusRequestIdRef.current += 1;
     setView('loading');
+    setLoading(false);
+    setStatus(null);
+    setStatusError(null);
     try {
       const check: WireGuardInstallCheck = await apiGet(`/api/tools/${connectionId}/wireguard/check`);
+      if (requestId !== checkRequestIdRef.current) return;
       setInstallCheck(check);
 
       if (check.already_installed) {
-        // Go straight to dashboard
+        setLoading(true);
         setView('dashboard');
         return;
       }
@@ -191,6 +202,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
       }));
       setView('not_installed');
     } catch {
+      if (requestId !== checkRequestIdRef.current) return;
       addToast('Failed to check WireGuard status', 'error');
       setView('not_supported');
     }
@@ -200,27 +212,39 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
   // Dashboard data
   // -------------------------------------------------------------------
 
-  const fetchStatus = useCallback(async () => {
+  const fetchStatus = useCallback(async (options?: { resetStatus?: boolean }) => {
+    const requestId = statusRequestIdRef.current + 1;
+    statusRequestIdRef.current = requestId;
+    if (options?.resetStatus) {
+      setStatus(null);
+    }
+    setStatusError(null);
     setLoading(true);
     try {
       const data: WireGuardStatus = await apiGet(`/api/tools/${connectionId}/wireguard/status`);
+      if (requestId !== statusRequestIdRef.current) return;
       setStatus(data);
       if (!data.installed) {
+        setStatus(null);
         setView('not_installed');
-        runCheck();
         return;
       }
       setView('dashboard');
-    } catch {
-      addToast('Failed to fetch WireGuard status', 'error');
+    } catch (err: unknown) {
+      if (requestId !== statusRequestIdRef.current) return;
+      const message = err instanceof Error ? err.message : 'Failed to fetch WireGuard status';
+      setStatusError(message);
+      addToast(message, 'error');
     } finally {
-      setLoading(false);
+      if (requestId === statusRequestIdRef.current) {
+        setLoading(false);
+      }
     }
-  }, [connectionId, addToast, runCheck]);
+  }, [connectionId, addToast]);
 
   useEffect(() => {
     if (view === 'dashboard') {
-      fetchStatus();
+      void fetchStatus();
     }
   }, [view]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -268,6 +292,9 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
             ws.close();
             // Transition to dashboard after a brief delay
             setTimeout(() => {
+              setStatus(null);
+              setStatusError(null);
+              setLoading(true);
               setView('dashboard');
             }, 2000);
           } else if (msg.status === 'failed') {
@@ -327,7 +354,9 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
     try {
       const result = await apiPost(`/api/tools/${connectionId}/wireguard/toggle`, {});
       addToast(result.message || 'Interface toggled', 'success');
-      setTimeout(fetchStatus, 1500);
+      setTimeout(() => {
+        void fetchStatus();
+      }, 1500);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to toggle server';
       addToast(message, 'error');
@@ -368,7 +397,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
       setShowAddClient(false);
       setNewClientName('');
       setViewingConfig(result);
-      fetchStatus();
+      void fetchStatus();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to add client';
       addToast(message, 'error');
@@ -382,7 +411,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
     try {
       await apiPost(`/api/tools/${connectionId}/wireguard/clients/remove`, { name });
       addToast(`Client "${name}" removed`, 'success');
-      fetchStatus();
+      void fetchStatus();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to remove client';
       addToast(message, 'error');
@@ -396,7 +425,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
     try {
       await apiPost(`/api/tools/${connectionId}/wireguard/clients/toggle`, { name, action });
       addToast(`Client "${name}" ${action}d`, 'success');
-      fetchStatus();
+      void fetchStatus();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : `Failed to ${action} client`;
       addToast(message, 'error');
@@ -875,6 +904,28 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
 
       {/* Main dashboard content */}
       <div className="space-y-4">
+        {statusError && (
+          <div className="rounded-lg border border-[var(--danger)]/40 bg-[var(--danger)]/10 px-4 py-3 flex items-start justify-between gap-3">
+            <div>
+              <div className="text-xs font-semibold text-[var(--danger)] mb-1">Unable to load WireGuard status</div>
+              <div className="text-[11px] text-[var(--text-secondary)] break-words">{statusError}</div>
+            </div>
+            <button
+              onClick={() => void fetchStatus({ resetStatus: !status })}
+              className="shrink-0 px-3 py-1.5 rounded bg-[var(--bg-primary)] border border-[var(--border)] text-[10px] font-medium text-[var(--text-primary)] hover:border-[var(--accent)] transition-colors"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {status?.warning && (
+          <div className="rounded-lg border border-[var(--warning)]/40 bg-[var(--warning)]/10 px-4 py-3">
+            <div className="text-xs font-semibold text-[var(--warning)] mb-1">Partial WireGuard data</div>
+            <div className="text-[11px] text-[var(--text-secondary)] break-words">{status.warning}</div>
+          </div>
+        )}
+
         {/* Server Info Panel */}
         {status && (
           <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] overflow-hidden">
@@ -890,7 +941,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
                   }`}>
                     {status.active ? 'ACTIVE' : 'INACTIVE'}
                   </span>
-                  <span className="text-[10px] text-[var(--text-muted)]">v{status.version}</span>
+                  <span className="text-[10px] text-[var(--text-muted)]">{status.version ? `v${status.version}` : 'version unknown'}</span>
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -913,8 +964,10 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
                   {status.active ? 'Stop' : 'Start'}
                 </button>
                 <button
-                  onClick={fetchStatus}
+                  onClick={() => void fetchStatus()}
                   disabled={loading}
+                  data-tool-refresh
+                  title="Refresh status"
                   className="p-1.5 rounded bg-[var(--bg-primary)] border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--accent)] transition-colors disabled:opacity-50"
                 >
                   <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />
@@ -1041,6 +1094,19 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
           <div className="py-12 text-center text-[var(--text-muted)] text-xs flex items-center justify-center gap-2">
             <Loader2 size={14} className="animate-spin" />
             Loading WireGuard status...
+          </div>
+        )}
+
+        {!loading && !status && !statusError && (
+          <div className="py-12 text-center rounded border border-[var(--border)] bg-[var(--bg-secondary)]">
+            <div className="text-xs font-medium text-[var(--text-primary)] mb-1">WireGuard status is unavailable</div>
+            <div className="text-[10px] text-[var(--text-muted)] mb-3">Retry the status check or reopen the tool.</div>
+            <button
+              onClick={() => void fetchStatus({ resetStatus: true })}
+              className="px-3 py-1.5 rounded bg-[var(--accent)] text-white text-[10px] font-medium hover:bg-[var(--accent-hover)] transition-colors"
+            >
+              Retry Status Load
+            </button>
           </div>
         )}
       </div>

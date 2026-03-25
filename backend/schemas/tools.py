@@ -739,6 +739,7 @@ class WireGuardInstallRequest(BaseModel):
     endpoint: str = Field(..., min_length=1, max_length=255)
     port: int = Field(default=51820, ge=1, le=65535)
     dns: str = Field(default="1.1.1.1, 1.0.0.1", max_length=200)
+    mtu: int | None = Field(default=None, ge=1280, le=1420)
     first_client_name: str = Field(default="client", min_length=1, max_length=15, pattern=r"^[a-zA-Z0-9_-]+$")
     local_ip: str = Field(default="", max_length=50)
     ipv6_addr: str = Field(default="", max_length=100)
@@ -748,6 +749,7 @@ class WireGuardAddClient(BaseModel):
     """Request to add a named WireGuard client."""
     name: str = Field(..., min_length=1, max_length=15, pattern=r"^[a-zA-Z0-9_-]+$")
     dns: str = Field(default="1.1.1.1, 1.0.0.1", max_length=200)
+    mtu: int | None = Field(default=None, ge=1280, le=1420)
 
 
 class WireGuardClientConfig(BaseModel):

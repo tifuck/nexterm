@@ -4007,7 +4007,7 @@ echo "STATUS_END"
 
 def _build_wg_install_script(
     endpoint: str, port: int, dns: str, first_client: str,
-    local_ip: str, ipv6_addr: str,
+    local_ip: str, ipv6_addr: str, mtu: int | None = None,
 ) -> str:
     """Build a non-interactive WireGuard install script mirroring the Nyr installer."""
     # Sanitize for embedding inside double quotes within a bash -c '...' script
@@ -4016,6 +4016,7 @@ def _build_wg_install_script(
     first_client = _sanitize_shell_inner(first_client)
     local_ip = _sanitize_shell_inner(local_ip)
     ipv6_addr = _sanitize_shell_inner(ipv6_addr)
+    mtu_line = f"MTU = {mtu}\\n" if mtu is not None else ""
 
     return f"""bash -c '
 set -e
@@ -4201,7 +4202,7 @@ cat > "/etc/wireguard/clients/$client.conf" << CLIENTEOF
 [Interface]
 Address = 10.7.0.2/24${{ipv6_client}}
 DNS = $dns
-PrivateKey = $key
+{mtu_line}PrivateKey = $key
 
 [Peer]
 PublicKey = $server_pubkey
@@ -4298,10 +4299,11 @@ fi
 """
 
 
-def _build_wg_add_client_script(client_name: str, dns: str) -> str:
+def _build_wg_add_client_script(client_name: str, dns: str, mtu: int | None = None) -> str:
     """Build script to add a named WireGuard client."""
     client_name = _sanitize_shell_inner(client_name)
     dns = _sanitize_shell_inner(dns)
+    mtu_line = f"MTU = {mtu}\\n" if mtu is not None else ""
 
     return f"""bash -c '
 set -e
@@ -4361,7 +4363,7 @@ cat > "/etc/wireguard/clients/$client.conf" << CLIENTEOF
 [Interface]
 Address = 10.7.0.$octet/24${{ipv6_client}}
 DNS = $dns
-PrivateKey = $key
+{mtu_line}PrivateKey = $key
 
 [Peer]
 PublicKey = $server_pubkey
@@ -4770,7 +4772,7 @@ async def add_wireguard_client(
     if not _re.match(r'^[a-zA-Z0-9_-]+$', request.name):
         raise HTTPException(status_code=400, detail="Invalid client name")
 
-    script = _build_wg_add_client_script(request.name, request.dns)
+    script = _build_wg_add_client_script(request.name, request.dns, request.mtu)
     result = await _run(connection_id, script, timeout=30)
     stdout = result.get("stdout", "").strip()
 

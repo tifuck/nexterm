@@ -868,6 +868,8 @@ async def _stream_wg_install(
         first_client = _sanitize_shell_inner(install_config.get("first_client_name", "client"))
         local_ip = _sanitize_shell_inner(install_config.get("local_ip", ""))
         ipv6_addr = _sanitize_shell_inner(install_config.get("ipv6_addr", ""))
+        mtu = install_config.get("mtu")
+        mtu = int(mtu) if mtu not in (None, "") else None
 
         if not endpoint:
             if job_id:
@@ -875,6 +877,16 @@ async def _stream_wg_install(
             await websocket.send_json({
                 "type": "wireguard_install_output",
                 "data": "Error: No endpoint specified.",
+                "status": "failed",
+            })
+            return
+
+        if mtu is not None and not 1280 <= mtu <= 1420:
+            if job_id:
+                await fail_job(job_id, "MTU must be between 1280 and 1420")
+            await websocket.send_json({
+                "type": "wireguard_install_output",
+                "data": "Error: MTU must be between 1280 and 1420.",
                 "status": "failed",
             })
             return
@@ -891,7 +903,7 @@ async def _stream_wg_install(
         script = _build_wg_install_script(
             endpoint=endpoint, port=port, dns=dns,
             first_client=first_client, local_ip=local_ip,
-            ipv6_addr=ipv6_addr,
+            ipv6_addr=ipv6_addr, mtu=mtu,
         )
 
         # Create temp files for script and output log

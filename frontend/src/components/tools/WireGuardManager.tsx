@@ -97,6 +97,7 @@ interface InstallConfig {
   endpoint: string;
   port: number;
   dns: string;
+  mtu: number | null;
   first_client_name: string;
   local_ip: string;
   ipv6_addr: string;
@@ -126,6 +127,13 @@ interface Props {
 export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
   const addToast = useToastStore((s) => s.addToast);
 
+  const parseMtu = (value: string): number | null => {
+    if (!value.trim()) return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return null;
+    return Math.max(1280, Math.min(1420, Math.round(parsed)));
+  };
+
   // View state
   const [view, setView] = useState<ViewState>('loading');
   const [status, setStatus] = useState<WireGuardStatus | null>(null);
@@ -136,7 +144,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
 
   // Install flow
   const [installConfig, setInstallConfig] = useState<InstallConfig>({
-    endpoint: '', port: 51820, dns: '1.1.1.1, 1.0.0.1',
+    endpoint: '', port: 51820, dns: '1.1.1.1, 1.0.0.1', mtu: null,
     first_client_name: 'client', local_ip: '', ipv6_addr: '',
   });
   const [installOutput, setInstallOutput] = useState<string[]>([]);
@@ -152,6 +160,7 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
   const [showAddClient, setShowAddClient] = useState(false);
   const [newClientName, setNewClientName] = useState('');
   const [newClientDns, setNewClientDns] = useState('1.1.1.1, 1.0.0.1');
+  const [newClientMtu, setNewClientMtu] = useState<number | null>(null);
   const [addingClient, setAddingClient] = useState(false);
 
   // Client config viewer
@@ -392,10 +401,12 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
       const result: WireGuardClientConfig = await apiPost(`/api/tools/${connectionId}/wireguard/clients/add`, {
         name: newClientName.trim(),
         dns: newClientDns,
+        mtu: newClientMtu,
       });
       addToast(`Client "${newClientName}" created successfully`, 'success');
       setShowAddClient(false);
       setNewClientName('');
+      setNewClientMtu(null);
       setViewingConfig(result);
       void fetchStatus();
     } catch (err: unknown) {
@@ -615,6 +626,26 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
                 placeholder="client"
                 className="w-48 px-3 py-1.5 rounded bg-[var(--bg-primary)] border border-[var(--border)] text-xs font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
               />
+            </div>
+
+            {/* Client MTU */}
+            <div>
+              <label className="text-[10px] font-medium text-[var(--text-secondary)] block mb-1">
+                Client MTU (optional)
+              </label>
+              <input
+                type="number"
+                min={1280}
+                max={1420}
+                step={1}
+                value={installConfig.mtu ?? ''}
+                onChange={(e) => setInstallConfig((p) => ({ ...p, mtu: parseMtu(e.target.value) }))}
+                placeholder="1380"
+                className="w-32 px-3 py-1.5 rounded bg-[var(--bg-primary)] border border-[var(--border)] text-xs font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+              />
+              <div className="text-[9px] text-[var(--text-muted)] mt-0.5">
+                Leave blank for auto-detect. Use this mainly for Linux clients. MTU controls the largest packet size sent through the tunnel; lowering it to 1280-1380 can avoid fragmentation when SSH or other larger transfers stall.
+              </div>
             </div>
 
             {/* Local IP (if multiple) */}
@@ -878,6 +909,22 @@ export const WireGuardManager: React.FC<Props> = ({ connectionId }) => {
                   <option value="9.9.9.9, 149.112.112.112">Quad9</option>
                   <option value="94.140.14.14, 94.140.15.15">AdGuard</option>
                 </select>
+              </div>
+              <div>
+                <label className="text-[10px] font-medium text-[var(--text-secondary)] block mb-1">Client MTU (optional)</label>
+                <input
+                  type="number"
+                  min={1280}
+                  max={1420}
+                  step={1}
+                  value={newClientMtu ?? ''}
+                  onChange={(e) => setNewClientMtu(parseMtu(e.target.value))}
+                  placeholder="1380"
+                  className="w-full px-3 py-1.5 rounded bg-[var(--bg-secondary)] border border-[var(--border)] text-xs font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
+                />
+                <div className="text-[9px] text-[var(--text-muted)] mt-0.5">
+                  Use this mainly for Linux clients. MTU controls the largest packet size sent through the tunnel; lowering it can help if the tunnel connects but SSH or larger transfers stall.
+                </div>
               </div>
               <div className="flex items-center gap-2 pt-1">
                 <button
